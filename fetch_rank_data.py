@@ -443,11 +443,14 @@ def _fetch_one_manbo(drama_id: str, entry: dict, *, skip_danmaku: bool) -> None:
     entry["view_count"] = body.get("watchCount", 0)
     entry["favorite_count"] = body.get("favoriteCount", 0)
 
-    # pay_count: use memberListenCount for member dramas, payCount otherwise
+    # isVIP: whether the drama is a VIP (member) drama
     vip_free = int(body.get("vipFree") or 0)
+    entry["isVIP"] = vip_free == 1
+
+    # pay_count: use memberListenCount for member dramas, payCount otherwise
     pay_count = body.get("payCount", 0)
     member_listen = body.get("memberListenCount", 0)
-    if vip_free == 1 and not pay_count:
+    if vip_free == 1:
         entry["pay_count"] = member_listen
     else:
         entry["pay_count"] = pay_count
