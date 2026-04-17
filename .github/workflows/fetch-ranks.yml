@@ -7,6 +7,9 @@ on:
     - cron: '10 23 * * *'
   workflow_dispatch: # 允许在 GitHub 页面上手动触发
 
+permissions:
+  contents: write
+
 jobs:
   fetch:
     runs-on: ubuntu-latest
