@@ -35,7 +35,10 @@ htmlcov/
 
 # VS Code
 .vscode/
+.github/
 
 # OS files
 .DS_Store
 Thumbs.db
+prompt.txt
+prompt.md

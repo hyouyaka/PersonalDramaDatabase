@@ -21,6 +21,7 @@ MANBO_INFO_PATH = ROOT / "manbo-drama-info.json"
 MISSEVAN_COUNTS_PATH = ROOT / "missevan-watch-counts.json"
 MANBO_COUNTS_PATH = ROOT / "manbo-watch-counts.json"
 COMBINED_CVID_MAP_PATH = ROOT / "missevan&manbo-cvid-map.json"
+SERIES_INFO_PATH = ROOT / "drama-series-info.json"
 
 MISSEVAN_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",

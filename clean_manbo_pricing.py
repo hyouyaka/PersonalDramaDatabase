@@ -25,20 +25,23 @@ def classify_manbo_pricing(payload: dict) -> str:
     if not isinstance(sets, list) or not sets:
         return "keep"
 
-    if not all(
-        safe_int(item.get("price")) == 0
-        and safe_int(item.get("memberPrice")) == 0
-        and safe_int(item.get("vipFree")) == 0
-        for item in sets
-    ):
-        return "keep"
-
     top_price = safe_int(data.get("price"))
     top_member_price = safe_int(data.get("memberPrice"))
+
     if top_price == 0 and top_member_price == 0:
+        if safe_int(data.get("vipFree")) == 1:
+            return "keep"
         return "free"
+
     if top_price == 100 and top_member_price == 100:
-        return "100_redbean"
+        if all(
+            safe_int(item.get("price")) == 0
+            and safe_int(item.get("memberPrice")) == 0
+            and safe_int(item.get("vipFree")) == 0
+            for item in sets
+        ):
+            return "100_redbean"
+
     return "keep"
 
 

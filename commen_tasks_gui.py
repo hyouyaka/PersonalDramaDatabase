@@ -1116,6 +1116,24 @@ class OperationsPage(QWidget):
         render_layout.addWidget(rank_button, 2, 0)
         render_layout.addWidget(detail_button, 2, 1)
         left_layout.addWidget(render_box)
+
+        rank_data_box = QGroupBox("榜单数据")
+        rank_data_layout = QGridLayout(rank_data_box)
+        self.rank_platform_box = QComboBox()
+        self.rank_platform_box.addItems(["全部", "仅猫耳", "仅漫播"])
+        self.rank_skip_danmaku = QCheckBox("跳过弹幕")
+        self.rank_force = QCheckBox("强制刷新")
+        fetch_rank_button = QPushButton("抓取榜单数据")
+        only_danmaku_button = QPushButton("仅更新弹幕")
+        self.command_buttons.extend([fetch_rank_button, only_danmaku_button])
+        rank_data_layout.addWidget(QLabel("平台"), 0, 0)
+        rank_data_layout.addWidget(self.rank_platform_box, 0, 1)
+        rank_data_layout.addWidget(self.rank_skip_danmaku, 0, 2)
+        rank_data_layout.addWidget(self.rank_force, 0, 3)
+        rank_data_layout.addWidget(fetch_rank_button, 1, 0, 1, 2)
+        rank_data_layout.addWidget(only_danmaku_button, 1, 2, 1, 2)
+        rank_data_layout.setColumnStretch(1, 1)
+        left_layout.addWidget(rank_data_box)
         left_layout.addStretch(1)
 
         log_box = QGroupBox("日志")
@@ -1140,6 +1158,8 @@ class OperationsPage(QWidget):
         refresh_button.clicked.connect(self.run_refresh_watch_counts)
         clean_button.clicked.connect(self.run_clean_manbo)
         rebuild_button.clicked.connect(self.run_rebuild)
+        fetch_rank_button.clicked.connect(self.run_fetch_rank_data)
+        only_danmaku_button.clicked.connect(self.run_only_danmaku)
         rank_button.clicked.connect(self.run_rank_images)
         detail_button.clicked.connect(self.run_rank_detail_images)
         clear_button.clicked.connect(self.log_view.clear)
@@ -1195,6 +1215,30 @@ class OperationsPage(QWidget):
         if self.export_checkbox.isChecked():
             command.append("--export-workbook")
         self.run_command_requested.emit(command, "正在重建 SQLite")
+
+    def _rank_platform_args(self) -> list[str]:
+        index = self.rank_platform_box.currentIndex()
+        if index == 1:
+            return ["--missevan-only"]
+        if index == 2:
+            return ["--manbo-only"]
+        return []
+
+    def run_fetch_rank_data(self) -> None:
+        command = [PYTHON_EXE, "fetch_rank_data.py"]
+        command.extend(self._rank_platform_args())
+        if self.rank_skip_danmaku.isChecked():
+            command.append("--skip-danmaku")
+        if self.rank_force.isChecked():
+            command.append("--force")
+        self.run_command_requested.emit(command, "正在抓取榜单数据")
+
+    def run_only_danmaku(self) -> None:
+        command = [PYTHON_EXE, "fetch_rank_data.py", "--only-danmaku"]
+        command.extend(self._rank_platform_args())
+        if self.rank_force.isChecked():
+            command.append("--force")
+        self.run_command_requested.emit(command, "正在更新弹幕数据")
 
     def run_rank_images(self) -> None:
         missevan_date, manbo_date = self.require_dates()
@@ -1288,6 +1332,7 @@ class MainWindow(QMainWindow):
         env = process.processEnvironment()
         env.insert("PYTHONIOENCODING", "utf-8")
         env.insert("PYTHONUTF8", "1")
+        env.insert("PYTHONUNBUFFERED", "1")
         process.setProcessEnvironment(env)
         process.readyReadStandardOutput.connect(self.on_process_output)
         process.finished.connect(self.on_process_finished)

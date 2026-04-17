@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-04-13T06:13:28+00:00",
+  "updatedAt": "2026-04-17T02:11:33+00:00",
   "records": [
     {
       "dramaId": "1467142227078676553",
@@ -9099,9 +9099,451 @@
         "喻霁",
         "温常世"
       ],
-      "createTime": "",
+      "createTime": "2026.04",
       "seriesTitle": "不安于室",
-      "needpay": false
+      "needpay": true
+    },
+    {
+      "dramaId": "1676755829627289616",
+      "name": "玩物丧志",
+      "normalizedName": "玩物丧志",
+      "aliases": [],
+      "cover": "",
+      "author": "卡比丘",
+      "mainCvNames": [
+        "陈冠豪",
+        "家康"
+      ],
+      "catalog": 1,
+      "catalogName": "广播剧",
+      "type": 4,
+      "genre": "纯爱",
+      "mainCvIds": [
+        1823135113221,
+        2329490542651
+      ],
+      "mainCvNicknames": [
+        "陈冠豪『Wanna』",
+        "家康"
+      ],
+      "mainCvRoleNames": [
+        "林修承",
+        "陈幸"
+      ],
+      "createTime": "2022.05",
+      "needpay": false,
+      "seriesTitle": "玩物丧志"
+    },
+    {
+      "dramaId": "2179617708813844589",
+      "name": "精神康复指北·2025",
+      "normalizedName": "精神康复指北·2025",
+      "aliases": [],
+      "cover": "",
+      "author": "",
+      "mainCvNames": [
+        "羊仔",
+        ""
+      ],
+      "catalog": 1,
+      "catalogName": "广播剧",
+      "type": 4,
+      "genre": "纯爱",
+      "mainCvIds": [
+        1842233442307,
+        2632035020817
+      ],
+      "mainCvNicknames": [
+        "夏日的羊屁屁",
+        "东方暮笙"
+      ],
+      "mainCvRoleNames": [
+        "白泽",
+        "敖戊"
+      ],
+      "createTime": "2026.02",
+      "needpay": false,
+      "seriesTitle": "精神康复指北·2025"
+    },
+    {
+      "dramaId": "1685988437355659307",
+      "name": "美人丞相的千层套路",
+      "normalizedName": "美人丞相的千层套路",
+      "aliases": [],
+      "cover": "",
+      "author": "克拉有读 秋小天",
+      "mainCvNames": [
+        "-岑先生-",
+        "柳凄"
+      ],
+      "catalog": 1,
+      "catalogName": "广播剧",
+      "type": 4,
+      "genre": "纯爱",
+      "mainCvIds": [
+        1852875669507,
+        2372319866945
+      ],
+      "mainCvNicknames": [
+        "-岑先生-",
+        "柳凄"
+      ],
+      "mainCvRoleNames": [
+        "凤赢宸",
+        "傅鲸弘"
+      ],
+      "createTime": "2022.06",
+      "needpay": false,
+      "seriesTitle": "美人丞相的千层套路"
+    },
+    {
+      "dramaId": "1748428444271640613",
+      "name": "死对头要和我磕CP肿么破",
+      "normalizedName": "死对头要和我磕cp肿么破",
+      "aliases": [],
+      "cover": "",
+      "author": "著作权归",
+      "mainCvNames": [
+        "-岑先生-",
+        "续续点灯"
+      ],
+      "catalog": 1,
+      "catalogName": "广播剧",
+      "type": 4,
+      "genre": "纯爱",
+      "mainCvIds": [
+        1852875669507,
+        1855802433539
+      ],
+      "mainCvNicknames": [
+        "-岑先生-",
+        "续续点灯🐴💡🎧单向波形"
+      ],
+      "mainCvRoleNames": [
+        "肖野",
+        "陆擎"
+      ],
+      "createTime": "2022.12",
+      "needpay": false,
+      "seriesTitle": "死对头要和我磕CP肿么破"
+    },
+    {
+      "dramaId": "1531652893562634282",
+      "name": "娘娘腔",
+      "normalizedName": "娘娘腔",
+      "aliases": [],
+      "cover": "",
+      "author": "水千丞",
+      "mainCvNames": [
+        "用户1861361811459",
+        "甜甜的贾诩…"
+      ],
+      "catalog": 1,
+      "catalogName": "广播剧",
+      "type": 4,
+      "genre": "纯爱",
+      "mainCvIds": [
+        1861361811459,
+        1868226764802
+      ],
+      "mainCvNicknames": [
+        "用户1861361811459",
+        "甜甜的贾诩…"
+      ],
+      "mainCvRoleNames": [
+        "李程秀",
+        "邵群"
+      ],
+      "createTime": "2021.04",
+      "needpay": false,
+      "seriesTitle": "娘娘腔"
+    },
+    {
+      "dramaId": "2114219113676013652",
+      "name": "少爷归家广播短剧",
+      "normalizedName": "少爷归家广播短剧",
+      "aliases": [],
+      "cover": "",
+      "author": "月河",
+      "mainCvNames": [
+        "-岑先生-",
+        "倔强的小红"
+      ],
+      "catalog": 1,
+      "catalogName": "广播剧",
+      "type": 4,
+      "genre": "纯爱",
+      "mainCvIds": [
+        1852875669507,
+        1874953314306
+      ],
+      "mainCvNicknames": [
+        "-岑先生-",
+        "倔强的小红"
+      ],
+      "mainCvRoleNames": [
+        "苏淼",
+        "苏云霆"
+      ],
+      "createTime": "2026.02",
+      "needpay": true,
+      "seriesTitle": "少爷归家广播短剧"
+    },
+    {
+      "dramaId": "1834202763693654106",
+      "name": "梦入星河",
+      "normalizedName": "梦入星河",
+      "aliases": [],
+      "cover": "",
+      "author": "",
+      "mainCvNames": [
+        "浮梦若薇",
+        "",
+        "",
+        ""
+      ],
+      "catalog": 1,
+      "catalogName": "广播剧",
+      "type": 3,
+      "genre": "全年龄",
+      "mainCvIds": [
+        1951976140813,
+        1864528158722,
+        1902399397898,
+        1902415953970
+      ],
+      "mainCvNicknames": [
+        "浮梦若薇",
+        "杜冥鸦",
+        "_十四君_",
+        "季子樱"
+      ],
+      "mainCvRoleNames": [
+        "沈星河",
+        "宋清梦",
+        "沈之亦",
+        "林念之"
+      ],
+      "createTime": "2023.07",
+      "needpay": false,
+      "seriesTitle": "梦入星河"
+    },
+    {
+      "dramaId": "1878242245950308469",
+      "name": "观鹤笔记·第一季",
+      "normalizedName": "观鹤笔记·第一季",
+      "aliases": [],
+      "cover": "",
+      "author": "她与灯",
+      "mainCvNames": [
+        "陈家恒",
+        "赵秋融"
+      ],
+      "catalog": 1,
+      "catalogName": "广播剧",
+      "type": 6,
+      "genre": "言情",
+      "mainCvIds": [
+        3188136136744,
+        1849464455171
+      ],
+      "mainCvNicknames": [
+        "家恒🎧单向波形",
+        "赵秋融"
+      ],
+      "mainCvRoleNames": [
+        "邓瑛",
+        "杨婉"
+      ],
+      "createTime": "2023.12",
+      "needpay": true,
+      "seriesTitle": "观鹤笔记·第一季"
+    },
+    {
+      "dramaId": "2117301040473702473",
+      "name": "跛子",
+      "normalizedName": "跛子",
+      "aliases": [],
+      "cover": "",
+      "author": "黄金圣斗士",
+      "mainCvNames": [
+        "刘明月",
+        "郭浩然"
+      ],
+      "catalog": 1,
+      "catalogName": "广播剧",
+      "type": 4,
+      "genre": "纯爱",
+      "mainCvIds": [
+        1950456614977,
+        1849192595463
+      ],
+      "mainCvNicknames": [
+        "刘明月阿",
+        "郭浩然🔅729声工场"
+      ],
+      "mainCvRoleNames": [
+        "赵小宽",
+        "周梁"
+      ],
+      "createTime": "2025.09",
+      "needpay": false,
+      "seriesTitle": "跛子"
+    },
+    {
+      "dramaId": "2152882568188395742",
+      "name": "观鹤笔记·第二季",
+      "normalizedName": "观鹤笔记·第二季",
+      "aliases": [],
+      "cover": "",
+      "author": "她与灯",
+      "mainCvNames": [
+        "赵秋融",
+        "陈家恒"
+      ],
+      "catalog": 1,
+      "catalogName": "广播剧",
+      "type": 6,
+      "genre": "言情",
+      "mainCvIds": [
+        1849464455171,
+        3188136136744
+      ],
+      "mainCvNicknames": [
+        "赵秋融",
+        "家恒🎧单向波形"
+      ],
+      "mainCvRoleNames": [
+        "杨婉",
+        "邓瑛"
+      ],
+      "createTime": "2025.12",
+      "needpay": true,
+      "seriesTitle": "观鹤笔记·第二季"
+    },
+    {
+      "dramaId": "1541815834156990959",
+      "name": "这个Alpha为何那样？",
+      "normalizedName": "这个alpha为何那样？",
+      "aliases": [],
+      "cover": "",
+      "author": "三千风雪",
+      "mainCvNames": [
+        "小K很好",
+        "倒吊男"
+      ],
+      "catalog": 1,
+      "catalogName": "广播剧",
+      "type": 4,
+      "genre": "纯爱",
+      "mainCvIds": [
+        1979645612057,
+        1860072628229
+      ],
+      "mainCvNicknames": [
+        "小K很好",
+        "倒吊男🐈琅声雅集"
+      ],
+      "mainCvRoleNames": [
+        "段移",
+        "盛云泽"
+      ],
+      "createTime": "2021.05",
+      "needpay": false,
+      "seriesTitle": "这个Alpha为何那样？"
+    },
+    {
+      "dramaId": "1482457199987916894",
+      "name": "少汪几句·第一季",
+      "normalizedName": "少汪几句·第一季",
+      "aliases": [],
+      "cover": "",
+      "author": "冰块儿",
+      "mainCvNames": [
+        "正经太郎",
+        "君心不雨"
+      ],
+      "catalog": 1,
+      "catalogName": "广播剧",
+      "type": 4,
+      "genre": "纯爱",
+      "mainCvIds": [
+        1850129186819,
+        2115475075090
+      ],
+      "mainCvNicknames": [
+        "正经太郎№♪浮声绘梦",
+        "君心不雨"
+      ],
+      "mainCvRoleNames": [
+        "汪哲",
+        "蒋少琰"
+      ],
+      "createTime": "2020.12",
+      "needpay": false,
+      "seriesTitle": "少汪几句·第一季"
+    },
+    {
+      "dramaId": "1610319737894469722",
+      "name": "Remix混音人生",
+      "normalizedName": "remix混音人生",
+      "aliases": [],
+      "cover": "",
+      "author": "孙黯",
+      "mainCvNames": [
+        "机智少年Cifer🎧单向波形",
+        "轩ZONE"
+      ],
+      "catalog": 1,
+      "catalogName": "广播剧",
+      "type": 4,
+      "genre": "纯爱",
+      "mainCvIds": [
+        2683122741261,
+        1875609632770
+      ],
+      "mainCvNicknames": [
+        "机智少年Cifer🎧单向波形",
+        "轩ZONE"
+      ],
+      "mainCvRoleNames": [
+        "夏息",
+        "宫隽夜"
+      ],
+      "createTime": "2021.11",
+      "needpay": false,
+      "seriesTitle": "Remix混音人生"
+    },
+    {
+      "dramaId": "2191530234400997469",
+      "name": "安慰剂效应",
+      "normalizedName": "安慰剂效应",
+      "aliases": [],
+      "cover": "",
+      "author": "咸鱼定理",
+      "mainCvNames": [
+        "苏尚卿",
+        "杨天翔"
+      ],
+      "catalog": 1,
+      "catalogName": "广播剧",
+      "type": 4,
+      "genre": "纯爱",
+      "mainCvIds": [
+        1900878790676,
+        1898954522682
+      ],
+      "mainCvNicknames": [
+        "苏尚卿🔅729声工场",
+        "杨天翔"
+      ],
+      "mainCvRoleNames": [
+        "宋意",
+        "戴岚"
+      ],
+      "createTime": "2026.04",
+      "needpay": true,
+      "seriesTitle": "安慰剂效应"
     }
   ]
 }

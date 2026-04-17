@@ -13,12 +13,14 @@ from platform_sync import (
     MISSEVAN_CATALOG_NAME_BY_ID,
     MISSEVAN_COUNTS_PATH,
     MISSEVAN_INFO_PATH,
+    SERIES_INFO_PATH,
     SQLITE_PATH,
     iter_missevan_nodes,
     load_cache,
     load_json,
     normalize,
     normalize_match,
+    save_json,
 )
 
 
@@ -273,6 +275,23 @@ def build_rows() -> list[dict]:
     return rows
 
 
+def collect_series_info(rows: list[dict]) -> dict:
+    series: dict[str, dict] = {}
+    for row in rows:
+        drama_ids = [d for d in row["dramaids_text"].split(",") if d] if row["dramaids_text"] else []
+        if len(drama_ids) < 2:
+            continue
+        key = f"{row['platform']}:{row['title']}"
+        if key not in series:
+            series[key] = {
+                "series title": row["title"],
+                "platform": row["platform"],
+                "category": row["catalog_name"],
+                "dramaIds": drama_ids,
+            }
+    return series
+
+
 def rebuild_sqlite(*, export_workbook: bool = False) -> int:
     rows = build_rows()
     conn = sqlite3.connect(SQLITE_PATH)
@@ -331,6 +350,10 @@ def rebuild_sqlite(*, export_workbook: bool = False) -> int:
             conn.execute("INSERT INTO work_drama_ids(work_id, drama_id) VALUES (?, ?)", (work_id, drama_id))
     conn.commit()
     conn.close()
+
+    series_info = collect_series_info(rows)
+    save_json(SERIES_INFO_PATH, series_info)
+    print("Series info entries:", len(series_info))
 
     if export_workbook:
         from export_sqlite_to_workbook import build_workbook

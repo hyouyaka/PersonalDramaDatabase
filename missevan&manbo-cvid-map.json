@@ -5238,5 +5238,65 @@
     "source": "observed",
     "updatedAt": "2026-04-13T06:10:52+00:00",
     "notes": ""
+  },
+  "东方暮笙": {
+    "cvId": null,
+    "missevanCvId": null,
+    "manboCvId": 2632035020817,
+    "displayName": "东方暮笙",
+    "aliases": [],
+    "source": "observed",
+    "updatedAt": "2026-04-17T02:11:33+00:00",
+    "notes": ""
+  },
+  "杜冥鸦": {
+    "cvId": null,
+    "missevanCvId": null,
+    "manboCvId": 1864528158722,
+    "displayName": "杜冥鸦",
+    "aliases": [],
+    "source": "observed",
+    "updatedAt": "2026-04-17T02:11:33+00:00",
+    "notes": ""
+  },
+  "_十四君_": {
+    "cvId": null,
+    "missevanCvId": null,
+    "manboCvId": 1902399397898,
+    "displayName": "_十四君_",
+    "aliases": [],
+    "source": "observed",
+    "updatedAt": "2026-04-17T02:11:33+00:00",
+    "notes": ""
+  },
+  "季子樱": {
+    "cvId": null,
+    "missevanCvId": null,
+    "manboCvId": 1902415953970,
+    "displayName": "季子樱",
+    "aliases": [],
+    "source": "observed",
+    "updatedAt": "2026-04-17T02:11:33+00:00",
+    "notes": ""
+  },
+  "小野友树": {
+    "cvId": 278,
+    "missevanCvId": 278,
+    "manboCvId": null,
+    "displayName": "小野友树",
+    "aliases": [],
+    "source": "observed",
+    "updatedAt": "2026-04-17T02:13:51+00:00",
+    "notes": ""
+  },
+  "大冢刚央": {
+    "cvId": 7977,
+    "missevanCvId": 7977,
+    "manboCvId": null,
+    "displayName": "大冢刚央",
+    "aliases": [],
+    "source": "observed",
+    "updatedAt": "2026-04-17T02:13:51+00:00",
+    "notes": ""
   }
 }

@@ -113,6 +113,29 @@ def build_manbo_cv_name_map() -> dict[int, str]:
     return mapped
 
 
+def build_missevan_cv_name_map() -> dict[int, str]:
+    mapped: dict[int, str] = {}
+    for payload in load_combined_map().values():
+        msv_id = payload.get("missevanCvId") or payload.get("cvId")
+        display_name = normalize(payload.get("displayName"))
+        if msv_id in (None, ""):
+            continue
+        if not display_name:
+            continue
+        mapped.setdefault(int(msv_id), display_name)
+    return mapped
+
+
+_missevan_cv_name_map_cache: dict[int, str] | None = None
+
+
+def _get_missevan_cv_name_map() -> dict[int, str]:
+    global _missevan_cv_name_map_cache
+    if _missevan_cv_name_map_cache is None:
+        _missevan_cv_name_map_cache = build_missevan_cv_name_map()
+    return _missevan_cv_name_map_cache
+
+
 MANBO_AUTHOR_PATTERNS = [
     re.compile(r"(?:晋江文学城|长佩文学)\s*(?P<author>[^，。；：:、,.!?！？\r\n]{1,40}?)\s*原(?:著|作)"),
     re.compile(r"(?P<author>[^，。；：:、,.!?！？\r\n]{1,40}?)\s*原(?:著|作)"),
@@ -215,12 +238,12 @@ def _apply_missevan_maincv_override(drama_id: str, entries: list[dict], main_ent
     return overridden or main_entries
 
 
-def _missevan_cv_maps(main_entries: list[dict]) -> tuple[dict[str, str], dict[str, str]]:
+def _missevan_cv_maps(main_entries: list[dict], missevan_cv_name_map: dict[int, str] | None = None) -> tuple[dict[str, str], dict[str, str]]:
     cvroles: dict[str, str] = {}
     cvnames: dict[str, str] = {}
     for entry in main_entries:
         cv_id = str(entry["cv_id"])
-        cvnames[cv_id] = entry["display_name"]
+        cvnames[cv_id] = (missevan_cv_name_map or {}).get(int(entry["cv_id"]), entry["display_name"])
         if entry["role_name"]:
             cvroles[cv_id] = entry["role_name"]
     return cvroles, cvnames
@@ -232,7 +255,7 @@ def build_missevan_base_node(info: dict, drama_type: int | None) -> tuple[dict, 
     entries = build_missevan_cv_entries(info)
     main_entries = select_main_cv_entries(entries, int(drama_type or 0))
     main_entries = _apply_missevan_maincv_override(drama_id, entries, main_entries)
-    cvroles, cvnames = _missevan_cv_maps(main_entries)
+    cvroles, cvnames = _missevan_cv_maps(main_entries, _get_missevan_cv_name_map())
     return {
         "title": normalize(drama.get("name")),
         "dramaId": int(drama["id"]),
@@ -322,7 +345,7 @@ def apply_missevan_main_cv_entries(node: dict, drama_id: str, base_entries: list
     if not main_entries:
         return node
     final_entries = _apply_missevan_maincv_override(drama_id, base_entries, main_entries)
-    cvroles, cvnames = _missevan_cv_maps(final_entries)
+    cvroles, cvnames = _missevan_cv_maps(final_entries, _get_missevan_cv_name_map())
     updated_node = dict(node)
     updated_node["maincvs"] = [int(entry["cv_id"]) for entry in final_entries]
     updated_node["cvroles"] = cvroles
