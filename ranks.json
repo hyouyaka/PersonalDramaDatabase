@@ -1,12 +1,12 @@
 {
   "_meta": {
-    "updated_at": "2026-04-17T04:33:46.238717+00:00"
+    "updated_at": "2026-04-17T04:51:37.264627+00:00"
   },
   "missevan": {
     "ranks": {
       "new_daily": {
         "name": "新品日榜",
-        "fetched_at": "2026-04-17T04:17:29.079205+00:00",
+        "fetched_at": "2026-04-17T04:51:03.258996+00:00",
         "items": [
           93038,
           86815,
@@ -42,7 +42,7 @@
       },
       "new_weekly": {
         "name": "新品周榜",
-        "fetched_at": "2026-04-17T04:17:32.740469+00:00",
+        "fetched_at": "2026-04-17T04:51:07.082197+00:00",
         "items": [
           86815,
           93038,
@@ -78,7 +78,7 @@
       },
       "popular_weekly": {
         "name": "人气周榜",
-        "fetched_at": "2026-04-17T04:17:37.005688+00:00",
+        "fetched_at": "2026-04-17T04:51:10.572439+00:00",
         "items": [
           86815,
           93038,
@@ -114,7 +114,7 @@
       },
       "popular_monthly": {
         "name": "人气月榜",
-        "fetched_at": "2026-04-17T04:17:40.983578+00:00",
+        "fetched_at": "2026-04-17T04:51:14.872545+00:00",
         "items": [
           86815,
           85974,
@@ -150,7 +150,7 @@
       },
       "bestseller_weekly": {
         "name": "畅销周榜",
-        "fetched_at": "2026-04-17T04:17:45.434606+00:00",
+        "fetched_at": "2026-04-17T04:51:19.176472+00:00",
         "items": [
           86834,
           86815,
@@ -186,7 +186,7 @@
       },
       "bestseller_monthly": {
         "name": "畅销月榜",
-        "fetched_at": "2026-04-17T04:17:49.802932+00:00",
+        "fetched_at": "2026-04-17T04:51:23.054765+00:00",
         "items": [
           86815,
           86834,
@@ -222,256 +222,256 @@
       },
       "peak": {
         "name": "巅峰榜",
-        "fetched_at": "2026-04-17T04:17:53.859629+00:00",
+        "fetched_at": "2026-04-17T04:51:27.446019+00:00",
         "items": [
           {
             "name": "魔道祖师",
-            "view_count": 721048814,
+            "view_count": 721049969,
             "cover": "https://static.maoercdn.com/manage-assets/upload/2026/2/108a20bcf469221699b798b9cf5f4ecd.jpg"
           },
           {
             "name": "虚拟偶像声音综艺系列",
-            "view_count": 357242083,
+            "view_count": 357244338,
             "cover": "https://static.maoercdn.com/manage-assets/upload/2026/2/cd50fc6462d59347466dda83b09b759d.jpg"
           },
           {
             "name": "将进酒",
-            "view_count": 266215632,
+            "view_count": 266216696,
             "cover": "https://static.maoercdn.com/dramacoversmini/202402/03/0f25ad2f73ff53270c8c81691264df0d203419.jpg"
           },
           {
             "name": "天官赐福",
-            "view_count": 224473581,
+            "view_count": 224479177,
             "cover": "https://static.maoercdn.com/manage-assets/upload/2026/2/19c946c3c9e4b701cc2ddbdf01d3cccb.jpg"
           },
           {
             "name": "撒野",
-            "view_count": 207538794,
+            "view_count": 207538961,
             "cover": "https://static.maoercdn.com/manage-assets/upload/2026/2/946476302c8a0c9b7f0cefd690a55043.jpg"
           },
           {
             "name": "偷偷藏不住",
-            "view_count": 201160060,
+            "view_count": 201160337,
             "cover": "https://static.maoercdn.com/dramacoversmini/202101/30/e6ac00f9bee3b69979816abc6e146795185908.jpg"
           },
           {
             "name": "伪装学渣",
-            "view_count": 176497961,
+            "view_count": 176498286,
             "cover": "https://static.maoercdn.com/dramacoversmini/202401/09/d13aa713301df4966ae42b74a1251075183250.jpg"
           },
           {
             "name": "我喜欢你的信息素",
-            "view_count": 173516106,
+            "view_count": 173516722,
             "cover": "https://static.maoercdn.com/dramacoversmini/202310/20/9ce5bbe9f2433f1df847255d0854c61e113443.jpg"
           },
           {
             "name": "杀破狼",
-            "view_count": 167026814,
+            "view_count": 167027141,
             "cover": "https://static.maoercdn.com/dramacoversmini/202306/01/4d5ffed95b37aa5dffc60bc4b463a824143851.jpg"
           },
           {
             "name": "某某",
-            "view_count": 162069933,
+            "view_count": 162070305,
             "cover": "https://static.maoercdn.com/dramacoversmini/202309/20/b94037e0b6cbdab066c10d6bf080e1c7225309.jpg"
           },
           {
             "name": "二哈和他的白猫师尊广播剧（翼之声中文配音社团）",
-            "view_count": 160530093,
+            "view_count": 160530875,
             "cover": "https://static.maoercdn.com/dramacoversmini/202502/20/a8afcbfbcfa5878c81f0580eea182d7b173654.jpg"
           },
           {
             "name": "破云",
-            "view_count": 148096807,
+            "view_count": 148097156,
             "cover": "https://static.maoercdn.com/dramacoversmini/202208/23/093b3c4df124247608970127cc6af1ad222108.png"
           },
           {
             "name": "难哄",
-            "view_count": 145055139,
+            "view_count": 145055377,
             "cover": "https://static.maoercdn.com/dramacoversmini/202110/15/7977b7314b0139cc8c7c7b40877b71f6180040.jpg"
           },
           {
             "name": "AWM",
-            "view_count": 141592414,
+            "view_count": 141592772,
             "cover": "https://static.maoercdn.com/dramacoversmini/201906/21/b95f57f46e9689bec0b19c141560a67e171225.jpg"
           },
           {
             "name": "我在无限游戏里封神",
-            "view_count": 132563439,
+            "view_count": 132566537,
             "cover": "https://static.maoercdn.com/dramacoversmini/202305/07/429713243473481f425bd661ec4bf216161424.jpg"
           },
           {
             "name": "重生之将门毒后",
-            "view_count": 131176655,
+            "view_count": 131177698,
             "cover": "https://static.maoercdn.com/dramacoversmini/202112/24/2a67147747c63ff396b63c4c442af03e162350.jpg"
           },
           {
             "name": "营业悖论",
-            "view_count": 128380177,
+            "view_count": 128380539,
             "cover": "https://static.maoercdn.com/dramacoversmini/202106/06/1cd234dacadc86cd849e08fea443d9b8130013.jpg"
           },
           {
             "name": "FOG[电竞]",
-            "view_count": 125923383,
+            "view_count": 125923856,
             "cover": "https://static.maoercdn.com/dramacoversmini/202401/05/3e9f2d6b68eb008e9e18a3cf9c7d9ea4201543.jpg"
           },
           {
             "name": "吞海",
-            "view_count": 120977467,
+            "view_count": 120978924,
             "cover": "https://static.maoercdn.com/dramacoversmini/202407/11/269f2a15be26601d3b9b2608919e02bf141740.jpg"
           },
           {
             "name": "迪奥先生",
-            "view_count": 114796763,
+            "view_count": 114796882,
             "cover": "https://static.maoercdn.com/dramacoversmini/202310/13/9a0c9ac6d492f1f4d1c737f103ed42db205314.jpg"
           },
           {
             "name": "残次品",
-            "view_count": 108972984,
+            "view_count": 108973127,
             "cover": "https://static.maoercdn.com/dramacoversmini/202306/01/320e002ee91c66f2930fc8cfa58f829c150153.jpg"
           },
           {
             "name": "小蘑菇",
-            "view_count": 98056961,
+            "view_count": 98058597,
             "cover": "https://static.maoercdn.com/dramacoversmini/202310/26/4992f7c2cb751f8fada6d459c2ad61bd164052.jpg"
           },
           {
             "name": "1930来的先生",
-            "view_count": 97690423,
+            "view_count": 97690506,
             "cover": "https://static.maoercdn.com/dramacoversmini/202306/01/77ec663309cbe52883e406bceec3f2e8143554.jpg"
           },
           {
             "name": "我嗑了对家X我的CP",
-            "view_count": 93034359,
+            "view_count": 93035076,
             "cover": "https://static.maoercdn.com/dramacoversmini/202401/09/96a3ba3a6ecaf9dc15532062d2e17fbf184630.jpg"
           },
           {
             "name": "你的距离",
-            "view_count": 88981748,
+            "view_count": 88982137,
             "cover": "https://static.maoercdn.com/dramacoversmini/202402/04/c786840bd41e87142595432516af06bc161352.png"
           },
           {
             "name": "如果月亮不抱你",
-            "view_count": 82971488,
+            "view_count": 82971604,
             "cover": "https://static.maoercdn.com/dramacoversmini/202007/28/2fbb5f76fade142f4a58e54ccb473912135535.jpg"
           },
           {
             "name": "全球高考",
-            "view_count": 80461763,
+            "view_count": 80462300,
             "cover": "https://static.maoercdn.com/dramacoversmini/202401/16/ed0277497c52a665c698b64ae9046de6144652.jpg"
           },
           {
             "name": "放学等我",
-            "view_count": 79024109,
+            "view_count": 79024961,
             "cover": "https://static.maoercdn.com/dramacoversmini/202309/14/27da5bf1fb32009fdf5f084690eb0a3e120535.jpg"
           },
           {
             "name": "夫人你马甲又掉了",
-            "view_count": 77666870,
+            "view_count": 77667116,
             "cover": "https://static.maoercdn.com/dramacoversmini/202106/17/f5d9c408b5184bc7f072605587f934be150438.jpg"
           },
           {
             "name": "论以貌取人的下场",
-            "view_count": 71178929,
+            "view_count": 71179286,
             "cover": "https://static.maoercdn.com/dramacoversmini/202208/24/ec26161c3de5ab3733e3f005c1496f99224522.jpg"
           },
           {
             "name": "碎玉投珠",
-            "view_count": 70624006,
+            "view_count": 70624605,
             "cover": "https://static.maoercdn.com/dramacoversmini/202309/12/2a0321f3b5507122fe18abad82f5d2fb200224.jpg"
           },
           {
             "name": "娘娘腔（贾诩、苏莫离）",
-            "view_count": 68433365,
+            "view_count": 68433425,
             "cover": "https://static.maoercdn.com/dramacoversmini/202002/12/bd9622c22b7fc6fea3aa49812efcc9cc131936.jpg"
           },
           {
             "name": "落池",
-            "view_count": 67941489,
+            "view_count": 67941622,
             "cover": "https://static.maoercdn.com/dramacoversmini/202109/18/759d9bd2ecc153ab741ac4372b650136134658.png"
           },
           {
             "name": "判官",
-            "view_count": 63837043,
+            "view_count": 63837320,
             "cover": "https://static.maoercdn.com/dramacoversmini/202311/01/4abe77a51e42e870ff7b34c45e5175d7120500.jpg"
           },
           {
             "name": "台风眼",
-            "view_count": 62130887,
+            "view_count": 62131413,
             "cover": "https://static.maoercdn.com/dramacoversmini/202207/10/a1b1510f494c55c02f22217981499879155936.jpg"
           },
           {
             "name": "犯罪心理",
-            "view_count": 59560250,
+            "view_count": 59560451,
             "cover": "https://static.maoercdn.com/dramacoversmini/202401/09/6fd6568125a2057b3b4d8c62b75e8a2d184630.png"
           },
           {
             "name": "千秋",
-            "view_count": 53956125,
+            "view_count": 53956205,
             "cover": "https://static.maoercdn.com/dramacoversmini/202309/21/5d9099a6d23b3e54ad14dfa90ddfde2a115713.jpg"
           },
           {
             "name": "全职高手",
-            "view_count": 53472221,
+            "view_count": 53472454,
             "cover": "https://static.maoercdn.com/dramacoversmini/201906/21/d2ee3b306312e6358c429e00121ccca6165205.jpg"
           },
           {
             "name": "铜钱龛世",
-            "view_count": 53278077,
+            "view_count": 53278223,
             "cover": "https://static.maoercdn.com/dramacoversmini/201911/15/ed99da535e9606914fe46992e638b25d111402.jpg"
           },
           {
             "name": "彼得·潘与辛德瑞拉",
-            "view_count": 52360164,
+            "view_count": 52360183,
             "cover": "https://static.maoercdn.com/dramacoversmini/202310/16/dc2e1e4389ed4bed2d42b49cc3b0e169153032.webp"
           },
           {
             "name": "君有疾否广播剧",
-            "view_count": 50918703,
+            "view_count": 50918962,
             "cover": "https://static.maoercdn.com/dramacoversmini/202310/14/fdd0476cc578bfa62077d2321f51253c211635.jpg"
           },
           {
             "name": "当年万里觅封侯",
-            "view_count": 50518454,
+            "view_count": 50518545,
             "cover": "https://static.maoercdn.com/dramacoversmini/202309/19/11738723d216e851d9360bd99efaceb8164237.jpg"
           },
           {
             "name": "我只喜欢你的人设",
-            "view_count": 47101720,
+            "view_count": 47101944,
             "cover": "https://static.maoercdn.com/dramacoversmini/202401/04/91b44a20bd15e809e6ebf86b2fbb9623122424.jpg"
           },
           {
             "name": "可爱过敏原",
-            "view_count": 47098274,
+            "view_count": 47098425,
             "cover": "https://static.maoercdn.com/dramacoversmini/202310/13/b010fdcbb00b62ea72998f872799c40c191322.jpg"
           },
           {
             "name": "网恋翻车指南",
-            "view_count": 46254220,
+            "view_count": 46254411,
             "cover": "https://static.maoercdn.com/dramacoversmini/202310/16/7e93b1710107855f0eaf4a01f3f1c0bc174233.jpg"
           },
           {
             "name": "SCI谜案集",
-            "view_count": 45080078,
+            "view_count": 45080196,
             "cover": "https://static.maoercdn.com/dramacoversmini/201906/16/7f54f62e93f5f011f429f9f394f718f9115153.jpg"
           },
           {
             "name": "陈年烈苟",
-            "view_count": 42937569,
+            "view_count": 42937957,
             "cover": "https://static.maoercdn.com/dramacoversmini/202401/29/71c17e6cb4a93a51c085f85a22b61bbb182719.png"
           },
           {
             "name": "小行星",
-            "view_count": 42325052,
+            "view_count": 42325155,
             "cover": "https://static.maoercdn.com/dramacoversmini/202311/02/8c05a550af644dc6f8a8beb4b6456ece045318.jpg"
           },
           {
             "name": "奇洛李维斯回信",
-            "view_count": 42157099,
+            "view_count": 42161464,
             "cover": "https://static.maoercdn.com/dramacoversmini/202506/12/fbcb3f8cc4100035399a1eb05c44146e143406.png"
           },
           {
             "name": "错撩",
-            "view_count": 41555369,
+            "view_count": 41555490,
             "cover": "https://static.maoercdn.com/dramacoversmini/202208/22/c5d7bd123bb9db79234d80c8ae4e98a6225306.jpg"
           }
         ]
@@ -1533,7 +1533,7 @@
         "name": "热播榜",
         "rankId": 0,
         "unitName": "热度",
-        "fetched_at": "2026-04-17T04:32:04.869992+00:00",
+        "fetched_at": "2026-04-17T04:51:29.022587+00:00",
         "items": [
           {
             "dramaId": "2087206604062588962",
@@ -1621,7 +1621,7 @@
         "name": "票房榜总榜",
         "rankId": 7,
         "unitName": "票房值",
-        "fetched_at": "2026-04-17T04:32:05.886804+00:00",
+        "fetched_at": "2026-04-17T04:51:30.045372+00:00",
         "items": [
           {
             "dramaId": "2087206604062588962",
@@ -1709,7 +1709,7 @@
         "name": "票房榜会员剧榜",
         "rankId": 8,
         "unitName": "票房值",
-        "fetched_at": "2026-04-17T04:32:06.911105+00:00",
+        "fetched_at": "2026-04-17T04:51:31.108426+00:00",
         "items": [
           {
             "dramaId": "2180734748203155603",
@@ -1757,7 +1757,7 @@
         "name": "票房榜付费剧榜",
         "rankId": 9,
         "unitName": "票房值",
-        "fetched_at": "2026-04-17T04:32:07.893194+00:00",
+        "fetched_at": "2026-04-17T04:51:32.161880+00:00",
         "items": [
           {
             "dramaId": "2087206604062588962",
@@ -1805,7 +1805,7 @@
         "name": "钻石榜月榜",
         "rankId": 5,
         "unitName": "钻石",
-        "fetched_at": "2026-04-17T04:32:09.155631+00:00",
+        "fetched_at": "2026-04-17T04:51:33.438886+00:00",
         "items": [
           {
             "dramaId": "2191530234400997469",
@@ -1893,7 +1893,7 @@
         "name": "巅峰榜",
         "rankId": 4,
         "unitName": "播放量",
-        "fetched_at": "2026-04-17T04:32:10.783953+00:00",
+        "fetched_at": "2026-04-17T04:51:35.136598+00:00",
         "items": [
           {
             "dramaId": "1946295508834189409",

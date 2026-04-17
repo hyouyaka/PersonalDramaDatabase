@@ -115,6 +115,15 @@ def save_queue(queue: dict[str, list[str]]) -> None:
     print(f"[ok] updated queue: manbo={len(queue.get('manbo', []))}, missevan={len(queue.get('missevan', []))}")
 
 
+def upload_ranks(store: dict) -> None:
+    """Upload ranks store to Upstash under the 'ranks' key."""
+    payload = json.dumps(store, ensure_ascii=False)
+    result = upstash_request(["SET", "ranks", payload])
+    if result != "OK":
+        raise RuntimeError(f"Failed to upload ranks: {result!r}")
+    print(f"[ok] uploaded ranks to Upstash ({len(payload)} bytes)")
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -646,6 +655,10 @@ def main() -> None:
         only_danmaku_mode(store, force=args.force, do_missevan=do_missevan, do_manbo=do_manbo)
         store["_meta"]["updated_at"] = now_iso()
         save_json(RANKS_PATH, store)
+        try:
+            upload_ranks(store)
+        except Exception as exc:
+            print(f"  [upstash] WARN: failed to upload ranks: {exc}")
         print("=== Done (only-danmaku) ===")
         return
 
@@ -715,6 +728,14 @@ def main() -> None:
     # Final save
     store["_meta"]["updated_at"] = now_iso()
     save_json(RANKS_PATH, store)
+
+    # Upload to Upstash
+    print("=== Uploading ranks to Upstash ===")
+    try:
+        upload_ranks(store)
+    except Exception as exc:
+        print(f"  [upstash] WARN: failed to upload ranks: {exc}")
+
     print("=== Done ===")
 
 
