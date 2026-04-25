@@ -42,3 +42,6 @@ Thumbs.db
 prompt.txt
 prompt.md
 PersonalDramaDatabase_architecture.md
+
+# Local JSON data snapshots
+/*.json

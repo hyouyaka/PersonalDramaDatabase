@@ -48,6 +48,7 @@ def load_env_file(path: Path) -> None:
 HERE = Path(__file__).resolve().parent
 RANKS_PATH = HERE / "ranks.json"
 CACHE_WINDOW = timedelta(hours=12)
+RANK_HISTORY_RETENTION_DAYS = 90
 
 load_env_file(HERE / ".env")
 
@@ -72,6 +73,11 @@ MANBO_RANKS = {
     "diamond_monthly":   (5, "钻石榜月榜",    20,   "diamondValue"),
     "peak":              (4, "巅峰榜",       50,   "hotValue"),
 }
+
+MANBO_DANMAKU_PAGE_SIZE = 200
+MANBO_DANMAKU_PAGE_CONCURRENCY = 48
+MANBO_DANMAKU_DRAMA_CONCURRENCY = 1
+MANBO_DANMAKU_REQUEST_RETRIES = 3
 
 # ---------------------------------------------------------------------------
 # Upstash helpers (adapted from sync_new_drama_ids.py)
@@ -128,6 +134,149 @@ def upload_ranks(store: dict) -> None:
     print(f"[ok] uploaded ranks to Upstash ({len(payload)} bytes)")
 
 
+def _coerce_rank_item(item: object, position: int) -> dict:
+    row: dict[str, object] = {"position": position}
+    if isinstance(item, dict):
+        drama_id = item.get("dramaId") or item.get("drama_id")
+        drama_ids = item.get("dramaIds") or item.get("drama_ids")
+        title = item.get("name") or item.get("title")
+        if drama_id is not None:
+            row["drama_id"] = str(drama_id)
+        if drama_ids:
+            row["drama_ids"] = [str(value) for value in drama_ids]
+        if title:
+            row["title"] = str(title)
+            row["series_key"] = str(title)
+        for value_name in ("hotValue", "diamondValue", "view_count"):
+            if value_name in item:
+                row["rank_value"] = item.get(value_name)
+                row["rank_value_name"] = value_name
+                break
+        row["raw"] = item
+        return row
+    row["drama_id"] = str(item)
+    row["raw"] = item
+    return row
+
+
+def _build_rank_list_payload(store: dict, platform: str, history_date: str, generated_at: str) -> dict:
+    rank_payload: dict[str, object] = {}
+    for rank_key, rank in (store.get(platform, {}).get("ranks") or {}).items():
+        if platform == "missevan" and rank_key == "peak":
+            continue
+        items = rank.get("items") or []
+        rank_payload[rank_key] = {
+            "name": rank.get("name", rank_key),
+            "fetched_at": rank.get("fetched_at"),
+            "rankId": rank.get("rankId"),
+            "unitName": rank.get("unitName"),
+            "items": [
+                _coerce_rank_item(item, position)
+                for position, item in enumerate(items, 1)
+            ],
+        }
+    return {
+        "version": 1,
+        "date": history_date,
+        "platform": platform,
+        "generated_at": generated_at,
+        "ranks": rank_payload,
+    }
+
+
+def _build_metric_payload(store: dict, platform: str, history_date: str, generated_at: str) -> dict:
+    metric_fields = (
+        "name",
+        "view_count",
+        "danmaku_uid_count",
+        "favorite_count",
+        "subscription_num",
+        "reward_num",
+        "reward_total",
+        "pay_count",
+        "diamond_value",
+        "updated_at",
+        "fetched_at",
+    )
+    dramas: dict[str, dict] = {}
+    for drama_id, entry in (store.get(platform, {}).get("dramas") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        dramas[str(drama_id)] = {
+            field: entry.get(field)
+            for field in metric_fields
+            if field in entry
+        }
+    return {
+        "version": 1,
+        "date": history_date,
+        "platform": platform,
+        "generated_at": generated_at,
+        "dramas": dramas,
+    }
+
+
+def build_rank_history_payloads(store: dict, *, history_date: str | None = None, generated_at: str | None = None) -> dict[str, dict]:
+    generated = generated_at or now_iso()
+    if history_date is None:
+        history_date = generated[:10]
+    payloads: dict[str, dict] = {"ranks:latest": store}
+    for platform in ("missevan", "manbo"):
+        payloads[f"ranks:list:{history_date}:{platform}"] = _build_rank_list_payload(store, platform, history_date, generated)
+        payloads[f"ranks:metrics:{history_date}:{platform}"] = _build_metric_payload(store, platform, history_date, generated)
+    return payloads
+
+
+def update_rank_history_index(
+    current: dict | None,
+    history_date: str,
+    *,
+    now: str | None = None,
+    retention_days: int = RANK_HISTORY_RETENTION_DAYS,
+) -> tuple[dict, list[str]]:
+    dates = []
+    if isinstance(current, dict):
+        dates = [str(value) for value in (current.get("dates") or [])]
+    previous_dates = set(dates)
+    dates.append(history_date)
+    dates = sorted(set(dates))[-retention_days:]
+    pruned_dates = sorted(previous_dates - set(dates))
+    return {
+        "version": 1,
+        "dates": dates,
+        "updated_at": now or now_iso(),
+    }, pruned_dates
+
+
+def load_rank_history_index() -> dict:
+    raw = upstash_request(["GET", "ranks:index"])
+    if raw in (None, ""):
+        return {"version": 1, "dates": [], "updated_at": None}
+    if isinstance(raw, str):
+        return json.loads(raw)
+    if isinstance(raw, dict):
+        return raw
+    raise RuntimeError(f"Unsupported payload type for ranks:index: {type(raw).__name__}")
+
+
+def upload_rank_history(store: dict, *, retention_days: int = RANK_HISTORY_RETENTION_DAYS) -> None:
+    generated_at = now_iso()
+    history_date = generated_at[:10]
+    payloads = build_rank_history_payloads(store, history_date=history_date, generated_at=generated_at)
+    index, pruned_dates = update_rank_history_index(load_rank_history_index(), history_date, now=generated_at, retention_days=retention_days)
+    payloads["ranks:index"] = index
+    for key, value in payloads.items():
+        payload = json.dumps(value, ensure_ascii=False)
+        result = upstash_request(["SET", key, payload])
+        if result != "OK":
+            raise RuntimeError(f"Failed to upload {key}: {result!r}")
+    for old_date in pruned_dates:
+        for platform in ("missevan", "manbo"):
+            upstash_request(["DEL", f"ranks:list:{old_date}:{platform}"])
+            upstash_request(["DEL", f"ranks:metrics:{old_date}:{platform}"])
+    print(f"[ok] uploaded rank history shards to Upstash ({len(payloads)} keys, date={history_date})")
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -147,12 +296,54 @@ def is_stale(fetched_at: str | None, force: bool) -> bool:
         return True
 
 
+def safe_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def init_ranks_store() -> dict:
     return {
         "_meta": {"updated_at": now_iso()},
         "missevan": {"ranks": {}, "dramas": {}},
         "manbo": {"ranks": {}, "dramas": {}},
     }
+
+
+def _rank_item_drama_id(item: object) -> str | None:
+    if isinstance(item, dict):
+        value = item.get("dramaId") or item.get("drama_id") or item.get("id")
+    else:
+        value = item
+    if value in (None, ""):
+        return None
+    return str(value)
+
+
+def collect_missevan_danmaku_target_ids(store: dict) -> set[str]:
+    """Collect Missevan rank drama IDs whose paid danmaku UID counts should refresh."""
+    targets: set[str] = set()
+    ranks = store.get("missevan", {}).get("ranks") or {}
+    for rank_key, rank in ranks.items():
+        if rank_key == "peak":
+            continue
+        for item in rank.get("items") or []:
+            drama_id = _rank_item_drama_id(item)
+            if drama_id:
+                targets.add(drama_id)
+    return targets
+
+
+def collect_manbo_danmaku_target_ids(store: dict) -> set[str]:
+    """Collect Manbo hot-rank top 20 drama IDs for paid danmaku UID refresh."""
+    hot_rank = (store.get("manbo", {}).get("ranks") or {}).get("hot") or {}
+    targets: set[str] = set()
+    for item in (hot_rank.get("items") or [])[:20]:
+        drama_id = _rank_item_drama_id(item)
+        if drama_id:
+            targets.add(drama_id)
+    return targets
 
 
 # ---------------------------------------------------------------------------
@@ -164,9 +355,6 @@ def fetch_missevan_ranks(requester: MissevanRequester, store: dict) -> tuple[set
     all_ids: set[str] = set()
     danmaku_ids: set[str] = set()
     ranks = store["missevan"].setdefault("ranks", {})
-
-    # Ranks whose dramas should have danmaku collected
-    DANMAKU_RANKS = {"new_daily", "new_weekly"}
 
     # Standard ranks
     for key, (type_val, sub_type, name) in MISSEVAN_RANKS.items():
@@ -182,8 +370,7 @@ def fetch_missevan_ranks(requester: MissevanRequester, store: dict) -> tuple[set
         items = [item["id"] for item in items_raw if "id" in item]
         ranks[key] = {"name": name, "fetched_at": now_iso(), "items": items}
         all_ids.update(str(i) for i in items)
-        if key in DANMAKU_RANKS:
-            danmaku_ids.update(str(i) for i in items)
+        danmaku_ids.update(str(i) for i in items)
         print(f"  [missevan] {name}: {len(items)} items")
 
     # Peak rank
@@ -482,6 +669,312 @@ def _fetch_one_manbo(drama_id: str, entry: dict) -> None:
     entry["fetched_at"] = now_iso()
 
 
+def is_paid_manbo_episode(episode: dict) -> bool:
+    """Return True when a Manbo episode/set requires payment or membership."""
+    return (
+        safe_int(episode.get("payType") or episode.get("setPayType")) == 1
+        or safe_int(episode.get("vipFree")) == 1
+        or safe_int(episode.get("price")) > 0
+        or safe_int(episode.get("memberPrice") or episode.get("member_price")) > 0
+    )
+
+
+def _extract_manbo_set_id(episode: dict) -> str | None:
+    for key in (
+        "radioDramaSetIdStr",
+        "radioDramaSetId",
+        "dramaSetIdStr",
+        "dramaSetId",
+        "setId",
+        "sound_id",
+        "id",
+    ):
+        value = episode.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _extract_manbo_set_list(payload: dict) -> list[dict]:
+    for key in ("setRespList", "radioDramaSetRespList", "dramaSetRespList", "sets"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def fetch_manbo_paid_set_ids(
+    drama_id: str,
+    *,
+    request_json=request_manbo_json,
+) -> list[str]:
+    """Fetch Manbo drama detail and return paid episode/set IDs."""
+    detail_urls = [
+        f"https://www.kilamanbo.com/web_manbo/dramaDetail?dramaId={drama_id}",
+        f"https://api.kilamanbo.com/api/v530/radio/drama/detail?radioDramaId={drama_id}",
+    ]
+    for url in detail_urls:
+        data = request_json(url)
+        payload = data.get("data") or data.get("b") or {}
+        episodes = _extract_manbo_set_list(payload)
+        paid_ids = []
+        for episode in episodes:
+            set_id = _extract_manbo_set_id(episode)
+            if set_id and is_paid_manbo_episode(episode):
+                paid_ids.append(set_id)
+        if paid_ids or episodes:
+            return list(dict.fromkeys(paid_ids))
+    return []
+
+
+def fetch_manbo_danmaku_users(
+    set_id: str,
+    *,
+    request_json=request_manbo_json,
+    page_size: int = MANBO_DANMAKU_PAGE_SIZE,
+    page_concurrency: int = MANBO_DANMAKU_PAGE_CONCURRENCY,
+    retry_delay: float = 0.5,
+) -> set[str]:
+    """Fetch Manbo danmaku pages for one episode/set and return unique user eids."""
+    def fetch_page(page_no: int) -> tuple[int, set[str]]:
+        url = (
+            "https://www.kilamanbo.com/web_manbo/getDanmaKuPgList"
+            f"?pageSize={page_size}&dramaSetId={set_id}&pageNo={page_no}"
+        )
+        last_error: Exception | None = None
+        for attempt in range(1, MANBO_DANMAKU_REQUEST_RETRIES + 1):
+            try:
+                data = request_json(url)
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt >= MANBO_DANMAKU_REQUEST_RETRIES:
+                    raise
+                time.sleep(retry_delay * attempt)
+        else:
+            raise last_error or RuntimeError("failed to fetch Manbo danmaku page")
+        payload = data.get("data") or {}
+        entries = payload.get("list") if isinstance(payload, dict) else []
+        users = {
+            str(item.get("eid"))
+            for item in (entries or [])
+            if isinstance(item, dict) and item.get("eid") not in (None, "")
+        }
+        total = safe_int(payload.get("count") if isinstance(payload, dict) else 0, len(users))
+        return total, users
+
+    total_count, users = fetch_page(1)
+    total_pages = max(1, (total_count + page_size - 1) // page_size)
+    if total_pages <= 1:
+        return users
+
+    workers = max(1, min(page_concurrency, total_pages - 1))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(fetch_page, page_no) for page_no in range(2, total_pages + 1)]
+        for future in as_completed(futures):
+            _, page_users = future.result()
+            users.update(page_users)
+    return users
+
+
+def _request_manbo_danmaku_page(
+    set_id: str,
+    page_no: int,
+    *,
+    request_json=request_manbo_json,
+    page_size: int = MANBO_DANMAKU_PAGE_SIZE,
+    retry_delay: float = 0.5,
+) -> dict:
+    url = (
+        "https://www.kilamanbo.com/web_manbo/getDanmaKuPgList"
+        f"?pageSize={page_size}&dramaSetId={set_id}&pageNo={page_no}"
+    )
+    last_error: Exception | None = None
+    for attempt in range(1, MANBO_DANMAKU_REQUEST_RETRIES + 1):
+        try:
+            return request_json(url)
+        except Exception as exc:
+            last_error = exc
+            if attempt >= MANBO_DANMAKU_REQUEST_RETRIES:
+                raise
+            time.sleep(retry_delay * attempt)
+    raise last_error or RuntimeError("failed to fetch Manbo danmaku page")
+
+
+def _extract_manbo_danmaku_page(data: dict, *, page_size: int) -> tuple[int, int, set[str]]:
+    payload = data.get("data") or {}
+    entries = payload.get("list") if isinstance(payload, dict) else []
+    users = {
+        str(item.get("eid"))
+        for item in (entries or [])
+        if isinstance(item, dict) and item.get("eid") not in (None, "")
+    }
+    total_count = safe_int(payload.get("count") if isinstance(payload, dict) else 0, len(users))
+    total_pages = max(1, (total_count + page_size - 1) // page_size)
+    return total_count, total_pages, users
+
+
+def fetch_manbo_paid_danmaku_benchmark(
+    drama_id: str,
+    *,
+    title: str = "",
+    request_json=request_manbo_json,
+    paid_set_id_loader=fetch_manbo_paid_set_ids,
+    page_size: int = MANBO_DANMAKU_PAGE_SIZE,
+    page_concurrency: int = MANBO_DANMAKU_PAGE_CONCURRENCY,
+    retry_delay: float = 0.5,
+) -> dict:
+    """Fetch all paid Manbo danmaku pages through one bounded queue and globally dedupe eids."""
+    started = time.perf_counter()
+    paid_set_ids = paid_set_id_loader(drama_id, request_json=request_json)
+    users: set[str] = set()
+    failed_pages: list[dict[str, object]] = []
+    total_pages_by_set: dict[str, int] = {}
+    total_danmaku_by_set: dict[str, int] = {}
+
+    def fetch_and_extract(set_id: str, page_no: int) -> tuple[str, int, int, int, set[str]]:
+        data = _request_manbo_danmaku_page(
+            set_id,
+            page_no,
+            request_json=request_json,
+            page_size=page_size,
+            retry_delay=retry_delay,
+        )
+        total_count, total_pages, page_users = _extract_manbo_danmaku_page(data, page_size=page_size)
+        return set_id, page_no, total_count, total_pages, page_users
+
+    workers = max(1, min(page_concurrency, len(paid_set_ids) or 1))
+    first_page_results: list[tuple[str, int, int, int, set[str]]] = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_page = {
+            executor.submit(fetch_and_extract, set_id, 1): (set_id, 1)
+            for set_id in paid_set_ids
+        }
+        for future in as_completed(future_to_page):
+            set_id, page_no = future_to_page[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                failed_pages.append({"set_id": set_id, "page_no": page_no, "error": str(exc)})
+                continue
+            first_page_results.append(result)
+            _, _, total_count, total_pages, page_users = result
+            total_danmaku_by_set[set_id] = total_count
+            total_pages_by_set[set_id] = total_pages
+            users.update(page_users)
+
+    remaining_pages = [
+        (set_id, page_no)
+        for set_id, total_pages in total_pages_by_set.items()
+        for page_no in range(2, total_pages + 1)
+    ]
+    workers = max(1, min(page_concurrency, len(remaining_pages) or 1))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_page = {
+            executor.submit(fetch_and_extract, set_id, page_no): (set_id, page_no)
+            for set_id, page_no in remaining_pages
+        }
+        for future in as_completed(future_to_page):
+            set_id, page_no = future_to_page[future]
+            try:
+                _, _, _, _, page_users = future.result()
+            except Exception as exc:
+                failed_pages.append({"set_id": set_id, "page_no": page_no, "error": str(exc)})
+                continue
+            users.update(page_users)
+
+    elapsed_seconds = time.perf_counter() - started
+    return {
+        "drama_id": str(drama_id),
+        "title": title,
+        "paid_episode_count": len(paid_set_ids),
+        "total_pages": sum(total_pages_by_set.values()),
+        "unique_user_count": len(users),
+        "failed_page_count": len(failed_pages),
+        "failed_pages": failed_pages,
+        "page_size": page_size,
+        "page_concurrency": page_concurrency,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "elapsed": str(timedelta(seconds=elapsed_seconds)),
+        "total_danmaku": sum(total_danmaku_by_set.values()),
+    }
+
+
+def fetch_one_manbo_danmaku_count(
+    drama_id: str,
+    *,
+    request_json=request_manbo_json,
+) -> tuple[str, int, int]:
+    """Return (drama_id, paid_danmaku_uid_count, paid_episode_count) for one Manbo drama."""
+    result = fetch_manbo_paid_danmaku_benchmark(
+        drama_id,
+        request_json=request_json,
+        page_concurrency=MANBO_DANMAKU_PAGE_CONCURRENCY,
+    )
+    failed_pages = result.get("failed_pages") or []
+    if failed_pages:
+        raise RuntimeError(f"failed Manbo danmaku pages for {drama_id}: {failed_pages!r}")
+    return (
+        drama_id,
+        int(result.get("unique_user_count") or 0),
+        int(result.get("paid_episode_count") or 0),
+    )
+
+
+def fetch_manbo_danmaku_details(
+    drama_ids: set[str],
+    store: dict,
+    *,
+    force: bool,
+) -> None:
+    """Refresh paid danmaku UID counts for selected Manbo dramas."""
+    manbo_dramas = store["manbo"].setdefault("dramas", {})
+    targets = []
+    for drama_id in drama_ids:
+        entry = manbo_dramas.get(drama_id, {})
+        if (
+            force
+            or entry.get("danmaku_uid_count") is None
+            or entry.get("danmaku_paid_episode_count") is None
+        ):
+            targets.append(drama_id)
+
+    print(f"  [manbo] paid danmaku IDs: total={len(drama_ids)}, update={len(targets)}")
+    if not targets:
+        return
+
+    save_counter = 0
+    workers = max(1, min(MANBO_DANMAKU_DRAMA_CONCURRENCY, len(targets)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_drama = {
+            executor.submit(fetch_one_manbo_danmaku_count, drama_id): drama_id
+            for drama_id in sorted(targets)
+        }
+        completed = 0
+        for future in as_completed(future_to_drama):
+            drama_id = future_to_drama[future]
+            completed += 1
+            entry = manbo_dramas.get(drama_id, {})
+            try:
+                _, uid_count, paid_episode_count = future.result()
+                entry["danmaku_uid_count"] = uid_count
+                entry["danmaku_paid_episode_count"] = paid_episode_count
+                entry["fetched_at"] = now_iso()
+                print(
+                    f"  [manbo] ({completed}/{len(targets)}) drama {drama_id}: "
+                    f"{uid_count} paid danmaku IDs from {paid_episode_count} paid episodes"
+                )
+            except Exception as exc:
+                print(f"  [manbo] ({completed}/{len(targets)}) ERROR on {drama_id}: {exc}")
+            manbo_dramas[drama_id] = entry
+            save_counter += 1
+            if save_counter >= 5:
+                save_json(RANKS_PATH, store)
+                save_counter = 0
+    if save_counter > 0:
+        save_json(RANKS_PATH, store)
+
+
 # ---------------------------------------------------------------------------
 # Phase 6: Upstash CV lookup
 # ---------------------------------------------------------------------------
@@ -626,22 +1119,18 @@ def _load_upstash_json(key: str) -> dict | list | None:
 # --only-danmaku mode
 # ---------------------------------------------------------------------------
 
-def only_danmaku_mode(store: dict, *, force: bool, do_missevan: bool) -> None:
-    """Only update danmaku_uid_count for Missevan dramas (新品日榜+新品周榜) in ranks.json."""
+def only_danmaku_mode(store: dict, *, force: bool, do_missevan: bool, do_manbo: bool) -> None:
+    """Only update paid danmaku UID counts for rank-selected dramas in ranks.json."""
     requester = MissevanRequester()
 
     if do_missevan:
         missevan_dramas = store["missevan"].get("dramas") or {}
-        # Only process dramas from 新品日榜 and 新品周榜
-        missevan_ranks = store["missevan"].get("ranks") or {}
-        danmaku_eligible = set()
-        for rk in ("new_daily", "new_weekly"):
-            danmaku_eligible.update(str(i) for i in (missevan_ranks.get(rk, {}).get("items") or []))
+        danmaku_eligible = collect_missevan_danmaku_target_ids(store)
         targets = []
         for drama_id, entry in missevan_dramas.items():
             if drama_id in danmaku_eligible and (force or entry.get("danmaku_uid_count") is None):
                 targets.append(drama_id)
-        print(f"[only-danmaku] missevan: {len(targets)} dramas to update (from 新品日榜+新品周榜)")
+        print(f"[only-danmaku] missevan: {len(targets)} dramas to update (all ranks except 巅峰榜)")
         for idx, drama_id in enumerate(sorted(targets), 1):
             print(f"  [missevan] ({idx}/{len(targets)}) danmaku for drama {drama_id} ...")
             # Need episodes list from getdrama
@@ -662,6 +1151,11 @@ def only_danmaku_mode(store: dict, *, force: bool, do_missevan: bool) -> None:
                 print(f"  [missevan] ERROR: {exc}")
             save_json(RANKS_PATH, store)
 
+    if do_manbo:
+        danmaku_eligible = collect_manbo_danmaku_target_ids(store)
+        print(f"[only-danmaku] manbo: 热播榜前20 selected")
+        fetch_manbo_danmaku_details(danmaku_eligible, store, force=force)
+
 
 
 
@@ -675,10 +1169,31 @@ def main() -> None:
     danmaku_group.add_argument("--skip-danmaku", action="store_true", help="Skip danmaku UID counting")
     danmaku_group.add_argument("--only-danmaku", action="store_true", help="Only update danmaku UID counts for existing dramas")
     parser.add_argument("--force", action="store_true", help="Ignore 12h cache window, force refresh all")
+    parser.add_argument("--benchmark-manbo-danmaku", metavar="DRAMA_ID", help="Benchmark one Manbo drama with the unified paid danmaku page queue")
+    parser.add_argument("--benchmark-title", default="", help="Title to include in the Manbo benchmark output")
+    parser.add_argument("--benchmark-output", default="manbo_huixin_danmaku_benchmark.json", help="Path for Manbo benchmark JSON output")
+    parser.add_argument("--benchmark-page-concurrency", type=int, default=MANBO_DANMAKU_PAGE_CONCURRENCY, help="Global page concurrency for Manbo benchmark")
+    parser.add_argument("--benchmark-page-size", type=int, default=MANBO_DANMAKU_PAGE_SIZE, help="Page size for Manbo benchmark")
     platform_group = parser.add_mutually_exclusive_group()
     platform_group.add_argument("--missevan-only", action="store_true", help="Only process Missevan")
     platform_group.add_argument("--manbo-only", action="store_true", help="Only process Manbo")
     args = parser.parse_args()
+
+    if args.benchmark_manbo_danmaku:
+        print("=== Manbo paid danmaku benchmark ===")
+        result = fetch_manbo_paid_danmaku_benchmark(
+            str(args.benchmark_manbo_danmaku),
+            title=args.benchmark_title,
+            page_size=args.benchmark_page_size,
+            page_concurrency=args.benchmark_page_concurrency,
+        )
+        output_path = Path(args.benchmark_output)
+        if not output_path.is_absolute():
+            output_path = HERE / output_path
+        save_json(output_path, result)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        print(f"[ok] benchmark result saved to {output_path}")
+        return
 
     do_missevan = not args.manbo_only
     do_manbo = not args.missevan_only
@@ -698,7 +1213,7 @@ def main() -> None:
     # --only-danmaku mode: skip everything else
     if args.only_danmaku:
         print("=== Only-danmaku mode ===")
-        only_danmaku_mode(store, force=args.force, do_missevan=do_missevan)
+        only_danmaku_mode(store, force=args.force, do_missevan=do_missevan, do_manbo=do_manbo)
         store["_meta"]["updated_at"] = now_iso()
         save_json(RANKS_PATH, store)
         try:
@@ -766,6 +1281,14 @@ def main() -> None:
             manbo_to_update, store,
         )
 
+    if do_manbo and not args.skip_danmaku:
+        print("=== Phase 5b: Manbo paid danmaku IDs (热播榜前20) ===")
+        fetch_manbo_danmaku_details(
+            collect_manbo_danmaku_target_ids(store),
+            store,
+            force=args.force,
+        )
+
     # Phase 6: Upstash CV lookup
     print("=== Phase 6: Upstash CV lookup ===")
     try:
@@ -783,6 +1306,10 @@ def main() -> None:
         upload_ranks(store)
     except Exception as exc:
         print(f"  [upstash] WARN: failed to upload ranks: {exc}")
+    try:
+        upload_rank_history(store)
+    except Exception as exc:
+        print(f"  [upstash] WARN: failed to upload rank history shards: {exc}")
 
     print("=== Done ===")
 

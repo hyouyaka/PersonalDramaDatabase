@@ -8,12 +8,12 @@ on:
   workflow_dispatch: # 允许在 GitHub 页面上手动触发
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repository
@@ -33,16 +33,49 @@ jobs:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
 
+      - name: Hydrate local JSON data from Upstash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          import requests
+
+          url = os.environ["UPSTASH_REDIS_REST_URL"].rstrip("/")
+          token = os.environ["UPSTASH_REDIS_REST_TOKEN"]
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Content-Type": "application/json",
+          }
+          files = {
+              "manbo:info:v1": "manbo-drama-info.json",
+              "missevan:info:v1": "missevan-drama-info.json",
+          }
+          for key, filename in files.items():
+              response = requests.post(url, headers=headers, json=["GET", key], timeout=120)
+              response.raise_for_status()
+              payload = response.json()
+              if payload.get("error"):
+                  raise RuntimeError(payload["error"])
+              value = payload.get("result")
+              if not value:
+                  print(f"[skip] {key}: empty")
+                  continue
+              if isinstance(value, str):
+                  json.loads(value)
+                  text = value
+              else:
+                  text = json.dumps(value, ensure_ascii=False, indent=2)
+              Path(filename).write_text(text, encoding="utf-8")
+              print(f"[ok] wrote {filename} from {key}")
+          PY
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+
       - name: Run sync_new_drama_ids.py
         run: python sync_new_drama_ids.py
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-
-      - name: Commit updated JSON data
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add ranks.json manbo-drama-info.json manbo-watch-counts.json missevan-drama-info.json missevan-watch-counts.json 'missevan&manbo-cvid-map.json'
-          git diff --cached --quiet || git commit -m "chore: update rank and drama JSON data [skip ci]"
-          git push
