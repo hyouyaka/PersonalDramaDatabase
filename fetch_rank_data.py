@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import threading
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,7 +24,7 @@ from platform_sync import (
     MissevanRequester,
     load_json,
     request_manbo_json,
-    save_json,
+    save_json as _save_json,
 )
 
 # ---------------------------------------------------------------------------
@@ -49,6 +50,7 @@ HERE = Path(__file__).resolve().parent
 RANKS_PATH = HERE / "ranks.json"
 CACHE_WINDOW = timedelta(hours=12)
 RANK_HISTORY_RETENTION_DAYS = 90
+SAVE_LOCK = threading.Lock()
 
 load_env_file(HERE / ".env")
 
@@ -62,6 +64,11 @@ ONGOING_KEYS = {
     "missevan": "ongoing:missevan",
     "manbo": "ongoing:manbo",
 }
+
+
+def save_json(path: Path, data) -> None:
+    with SAVE_LOCK:
+        _save_json(path, data)
 
 # -- Missevan rank definitions (key -> (type, sub_type, display_name)) ------
 MISSEVAN_RANKS = {
@@ -1641,10 +1648,23 @@ def main() -> None:
 
     missevan_danmaku_ids: set[str] = set()
 
-    if do_missevan:
-        missevan_ids, missevan_danmaku_ids = fetch_missevan_ranks(requester, store)
-    if do_manbo:
-        manbo_ids = fetch_manbo_ranks(store)
+    if do_missevan and do_manbo:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {
+                executor.submit(fetch_missevan_ranks, requester, store): "missevan",
+                executor.submit(fetch_manbo_ranks, store): "manbo",
+            }
+            for future in as_completed(futures):
+                platform = futures[future]
+                if platform == "missevan":
+                    missevan_ids, missevan_danmaku_ids = future.result()
+                else:
+                    manbo_ids = future.result()
+    else:
+        if do_missevan:
+            missevan_ids, missevan_danmaku_ids = fetch_missevan_ranks(requester, store)
+        if do_manbo:
+            manbo_ids = fetch_manbo_ranks(store)
 
     ongoing_missevan_ids: set[str] = set()
     ongoing_manbo_ids: set[str] = set()
@@ -1690,8 +1710,9 @@ def main() -> None:
     print(f"  missevan: total={len(missevan_ids)}, skip={missevan_skipped}, update={len(missevan_to_update)}")
     print(f"  manbo:    total={len(manbo_ids)}, skip={manbo_skipped}, update={len(manbo_to_update)}")
 
-    # Phase 4: Missevan drama details
-    if do_missevan and missevan_to_update:
+    def update_missevan_details() -> None:
+        if not (do_missevan and missevan_to_update):
+            return
         print(f"=== Phase 4: Missevan drama details ({len(missevan_to_update)}) ===")
         fetch_missevan_drama_details(
             requester, missevan_to_update, store,
@@ -1699,20 +1720,32 @@ def main() -> None:
             danmaku_ids=missevan_danmaku_ids,
         )
 
-    # Phase 5: Manbo drama details
-    if do_manbo and manbo_to_update:
-        print(f"=== Phase 5: Manbo drama details ({len(manbo_to_update)}) ===")
-        fetch_manbo_drama_details(
-            manbo_to_update, store,
-            skip_danmaku=args.skip_danmaku,
-            danmaku_ids=manbo_danmaku_ids,
-        )
+    def update_manbo_details() -> None:
+        if do_manbo and manbo_to_update:
+            print(f"=== Phase 5: Manbo drama details ({len(manbo_to_update)}) ===")
+            fetch_manbo_drama_details(
+                manbo_to_update, store,
+                skip_danmaku=args.skip_danmaku,
+                danmaku_ids=manbo_danmaku_ids,
+            )
 
-    if do_manbo and not args.skip_danmaku:
-        manbo_backfill_ids = select_manbo_danmaku_backfill_ids(manbo_danmaku_ids, manbo_to_update)
-        if manbo_backfill_ids:
-            print(f"=== Phase 5b: Manbo paid danmaku backfill ({len(manbo_backfill_ids)}) ===")
-            fetch_manbo_danmaku_details(manbo_backfill_ids, store, force=args.force)
+        if do_manbo and not args.skip_danmaku:
+            manbo_backfill_ids = select_manbo_danmaku_backfill_ids(manbo_danmaku_ids, manbo_to_update)
+            if manbo_backfill_ids:
+                print(f"=== Phase 5b: Manbo paid danmaku backfill ({len(manbo_backfill_ids)}) ===")
+                fetch_manbo_danmaku_details(manbo_backfill_ids, store, force=args.force)
+
+    if do_missevan and do_manbo:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(update_missevan_details),
+                executor.submit(update_manbo_details),
+            ]
+            for future in as_completed(futures):
+                future.result()
+    else:
+        update_missevan_details()
+        update_manbo_details()
 
     # Phase 6: Upstash CV lookup
     print("=== Phase 6: Upstash CV lookup ===")
