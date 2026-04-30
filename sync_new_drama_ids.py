@@ -17,6 +17,12 @@ MANBO_INFO_KEY = "manbo:info:v1"
 MISSEVAN_INFO_KEY = "missevan:info:v1"
 
 
+def configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def load_env_file(path: Path) -> None:
     if not path.exists():
         return
@@ -186,6 +192,7 @@ def save_queue(queue: dict[str, list[str]]) -> None:
 
 
 def main() -> int:
+    configure_stdio()
     load_env_file(ROOT / ".env")
     queue = load_queue()
     manbo_ids = queue.get("manbo") or []
