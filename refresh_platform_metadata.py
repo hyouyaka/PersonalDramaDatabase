@@ -274,7 +274,16 @@ def build_missevan_base_node(info: dict, drama_type: int | None) -> tuple[dict, 
         "createTime": "",
         "author": normalize(drama.get("author")),
         "needpay": safe_int(drama.get("pay_type")) != 0 and safe_int(drama.get("price")) > 0,
+        "is_member": missevan_is_member_from_infos(info),
     }, entries
+
+
+def missevan_is_member_from_infos(drama_info: dict, sound_info: dict | None = None) -> bool:
+    drama = (drama_info or {}).get("drama") or {}
+    if drama.get("vip") not in (None, ""):
+        return safe_int(drama.get("vip")) == 1
+    sound_drama = ((sound_info or {}).get("drama") or {})
+    return safe_int(sound_drama.get("vip")) == 1
 
 
 def apply_missevan_preview_maincvs(node: dict, drama_id: str, base_entries: list[dict], preview_info: dict, use_preview_maincvs: bool) -> dict:
@@ -437,6 +446,7 @@ def refresh_missevan(*, target_drama_ids: set[str] | None = None, force: bool = 
             and node.get("maincvs") is not None
             and "author" in node
             and "needpay" in node
+            and "is_member" in node
             and (not update_counts or cached.get("view_count") is not None)
         ):
             skipped += 1
@@ -506,6 +516,7 @@ def refresh_missevan(*, target_drama_ids: set[str] | None = None, force: bool = 
             if not create_month:
                 create_month = pick_first_episode_month(episodes, title_key="name", time_key="create_time", milliseconds=False)
         updated_node, base_entries = build_missevan_base_node(info, drama_type)
+        updated_node["is_member"] = missevan_is_member_from_infos(info, sound_info)
         maincv_preview_sound_infos = preview_sound_infos if used_preview_sound else []
         preview_main_entries = merge_missevan_main_cv_entries(maincv_preview_sound_infos)
         should_fill_two_maincvs = int(drama_type or 0) in (4, 6)
@@ -638,7 +649,13 @@ def build_manbo_record(record: dict, payload: dict, manbo_cv_name_map: dict[int,
     drama_id = str(updated.get("dramaId") or record.get("dramaId") or "").strip()
     pricing_category = classify_manbo_pricing(payload or {})
     updated["needpay"] = drama_id in MANBO_PRICING_EXCLUSIONS or pricing_category not in {"free", "100_redbean"}
+    updated["vipFree"] = manbo_vip_free_from_payload(payload)
     return updated
+
+
+def manbo_vip_free_from_payload(payload: dict) -> int:
+    data = (payload or {}).get("data") or {}
+    return safe_int(data.get("vipFree"))
 
 
 def finalize_manbo_records(records: list[dict]) -> None:
@@ -679,6 +696,7 @@ def refresh_manbo(*, target_drama_ids: set[str] | None = None, force: bool = Tru
             and record.get("mainCvNames") is not None
             and "author" in record
             and "needpay" in record
+            and "vipFree" in record
             and cached.get("view_count") is not None
         ):
             skipped += 1
