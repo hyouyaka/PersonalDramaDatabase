@@ -5360,5 +5360,25 @@
     "source": "observed",
     "updatedAt": "2026-04-29T13:31:30+00:00",
     "notes": ""
+  },
+  "言倦": {
+    "cvId": 1175,
+    "missevanCvId": 1175,
+    "manboCvId": null,
+    "displayName": "言倦",
+    "aliases": [],
+    "source": "observed",
+    "updatedAt": "2026-05-01T05:41:54+00:00",
+    "notes": ""
+  },
+  "阿树": {
+    "cvId": 1936,
+    "missevanCvId": 1936,
+    "manboCvId": null,
+    "displayName": "阿树",
+    "aliases": [],
+    "source": "observed",
+    "updatedAt": "2026-05-01T05:41:54+00:00",
+    "notes": ""
   }
 }

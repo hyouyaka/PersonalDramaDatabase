@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -15,6 +16,11 @@ ROOT = Path(__file__).resolve().parent
 QUEUE_KEY = "new:dramaIDs"
 MANBO_INFO_KEY = "manbo:info:v1"
 MISSEVAN_INFO_KEY = "missevan:info:v1"
+INFO_UPLOAD_MIN_COUNTS = {
+    MISSEVAN_INFO_KEY: 100,
+    MANBO_INFO_KEY: 50,
+}
+ALLOW_SMALL_INFO_UPLOAD_ENV = "ALLOW_SMALL_INFO_UPLOAD"
 
 
 def configure_stdio() -> None:
@@ -104,10 +110,87 @@ def run_script(script_name: str, drama_ids: list[str]) -> None:
 
 def upload_json_file(key: str, path: Path) -> None:
     value = path.read_text(encoding="utf-8")
+    assert_info_upload_is_safe(key, value, path)
     result = upstash_request(["SET", key, value])
     if result != "OK":
         raise RuntimeError(f"Failed to upload {path.name} to {key}: {result!r}")
     print(f"[ok] uploaded {path.name} -> {key}")
+
+
+def count_info_payload(key: str, payload: object) -> int | None:
+    if key == MISSEVAN_INFO_KEY and isinstance(payload, dict):
+        return len(payload)
+    if key == MANBO_INFO_KEY and isinstance(payload, dict):
+        records = payload.get("records")
+        if isinstance(records, list):
+            return len(records)
+    return None
+
+
+def assert_info_upload_is_safe(key: str, value: str, path: Path) -> None:
+    minimum = INFO_UPLOAD_MIN_COUNTS.get(key)
+    if minimum is None or os.environ.get(ALLOW_SMALL_INFO_UPLOAD_ENV) == "1":
+        return
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Refusing to upload invalid JSON from {path.name} to {key}: {exc}") from exc
+    count = count_info_payload(key, payload)
+    if count is None:
+        raise RuntimeError(f"Refusing to upload {path.name} to {key}: unexpected info store shape.")
+    if count < minimum:
+        raise RuntimeError(
+            f"Refusing to upload {path.name} to {key}: only {count} records found, "
+            f"expected at least {minimum}. Set {ALLOW_SMALL_INFO_UPLOAD_ENV}=1 to override intentionally."
+        )
+
+
+def decode_remote_info_payload(key: str, raw: object) -> object:
+    if raw in (None, ""):
+        raise RuntimeError(f"Refusing to download {key}: remote value is empty.")
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Refusing to download {key}: remote value is invalid JSON: {exc}") from exc
+    return raw
+
+
+def assert_info_download_is_safe(key: str, payload: object) -> None:
+    minimum = INFO_UPLOAD_MIN_COUNTS.get(key)
+    count = count_info_payload(key, payload)
+    if count is None:
+        raise RuntimeError(f"Refusing to download {key}: unexpected info store shape.")
+    if minimum is not None and count < minimum:
+        raise RuntimeError(
+            f"Refusing to download {key}: only {count} records found, expected at least {minimum}."
+        )
+
+
+def backup_local_info_file(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+    backup_dir = ROOT / "recovery_backups"
+    backup_dir.mkdir(exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_path = backup_dir / f"{stamp}_{path.name}"
+    backup_path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    return backup_path
+
+
+def download_info_file(key: str, path: Path) -> None:
+    payload = decode_remote_info_payload(key, upstash_request(["GET", key]))
+    assert_info_download_is_safe(key, payload)
+    backup_path = backup_local_info_file(path)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    if backup_path is not None:
+        print(f"[backup] {path.name} -> {backup_path}")
+    print(f"[ok] downloaded {key} -> {path.name}")
+
+
+def download_info_files() -> None:
+    download_info_file(MANBO_INFO_KEY, MANBO_INFO_PATH)
+    download_info_file(MISSEVAN_INFO_KEY, MISSEVAN_INFO_PATH)
 
 
 def build_missevan_index(store: dict) -> dict[str, dict]:
@@ -205,6 +288,8 @@ def main() -> int:
     if not manbo_ids and not missevan_ids:
         print("No pending drama IDs in new:dramaIDs.")
         return 0
+
+    download_info_files()
 
     run_script("append_manbo_ids.py", manbo_ids)
     run_script("append_missevan_ids.py", missevan_ids)
