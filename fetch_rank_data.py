@@ -288,7 +288,7 @@ def merge_rank_partials(
         if source is None and isinstance(local_store, dict):
             source = local_store.get(platform)
         merged[platform] = platform_store(source)
-    return merged
+    return sanitize_rank_store(merged)
 
 
 def merge_remote_rank_partials(local_store: dict | None = None) -> dict:
@@ -362,16 +362,16 @@ def load_initial_rank_store() -> dict:
                 loaded_any = True
         if loaded_any:
             print("  [upstash] loaded initial ranks store from remote partials/metrics")
-            return remote
+            return sanitize_rank_store(remote)
     except Exception as exc:
         print(f"  [upstash] WARN: failed to load remote initial ranks store: {exc}")
 
     store = load_json(RANKS_PATH, None)
     if store is not None:
         print(f"  [local] loaded initial ranks store from {RANKS_PATH}")
-        return store
+        return sanitize_rank_store(store)
     print("  [local] no ranks.json found; initializing empty ranks store")
-    return init_ranks_store()
+    return sanitize_rank_store(init_ranks_store())
 
 
 def _coerce_rank_item(item: object, position: int) -> dict:
@@ -630,6 +630,34 @@ def select_stale_ids(drama_ids: set[str], existing_dramas: dict, *, force: bool)
     return to_update, skipped
 
 
+def should_refresh_only_danmaku_entry(entry: dict | None, *, force: bool) -> bool:
+    """Return True when only-danmaku mode should refresh one existing metric entry."""
+    if force:
+        return True
+    if not isinstance(entry, dict):
+        return True
+
+    count_value = entry.get("danmaku_uid_count")
+    if count_value in (None, ""):
+        return True
+    try:
+        if int(count_value) <= 0:
+            return True
+    except (TypeError, ValueError):
+        return True
+
+    return is_stale(entry.get("fetched_at"), False)
+
+
+def sanitize_rank_store(store: dict) -> dict:
+    manbo_dramas = (store.get("manbo") or {}).get("dramas")
+    if isinstance(manbo_dramas, dict):
+        for entry in manbo_dramas.values():
+            if isinstance(entry, dict):
+                entry.pop("danmaku_paid_episode_count", None)
+    return store
+
+
 def safe_int(value: object, default: int = 0) -> int:
     try:
         return int(value)
@@ -715,11 +743,6 @@ def merge_rank_and_ongoing_ids(rank_ids, ongoing_ids) -> set[str]:
         if value not in (None, ""):
             merged.add(str(value))
     return merged
-
-
-def select_manbo_danmaku_backfill_ids(danmaku_ids: set[str], detail_update_ids: set[str]) -> set[str]:
-    """Select Manbo danmaku IDs that were not already refreshed with detail updates."""
-    return {str(value) for value in (danmaku_ids or set())} - {str(value) for value in (detail_update_ids or set())}
 
 
 # ---------------------------------------------------------------------------
@@ -858,7 +881,13 @@ def fetch_missevan_drama_details(
         entry: dict = dramas.get(str(drama_id), {})
         should_skip_dm = skip_danmaku or (danmaku_ids is not None and str(drama_id) not in danmaku_ids)
         try:
-            _fetch_one_missevan(requester, str(drama_id), entry, skip_danmaku=should_skip_dm)
+            _fetch_one_missevan(
+                requester,
+                str(drama_id),
+                entry,
+                skip_danmaku=should_skip_dm,
+                clear_danmaku_on_skip=skip_danmaku,
+            )
         except RuntimeError as exc:
             if "HTTP_418" in str(exc):
                 print(f"  [missevan] FATAL: rate limited (418). Saving progress and stopping.")
@@ -878,6 +907,7 @@ def _fetch_one_missevan(
     entry: dict,
     *,
     skip_danmaku: bool,
+    clear_danmaku_on_skip: bool,
 ) -> None:
     # Basic drama info
     url = f"https://www.missevan.com/dramaapi/getdrama?drama_id={drama_id}"
@@ -937,7 +967,10 @@ def _fetch_one_missevan(
 
     # Danmaku UID count
     if skip_danmaku:
-        entry.setdefault("danmaku_uid_count", None)
+        if clear_danmaku_on_skip:
+            entry["danmaku_uid_count"] = None
+        else:
+            entry.setdefault("danmaku_uid_count", None)
     else:
         _fetch_missevan_danmaku(requester, episodes, entry)
 
@@ -998,16 +1031,14 @@ def fetch_manbo_drama_details(
         entry: dict = dramas.get(drama_id, {})
         try:
             _fetch_one_manbo(drama_id, entry)
-            should_fetch_danmaku = (
-                not skip_danmaku
-                and (danmaku_ids is None or drama_id in danmaku_ids)
-            )
-            if should_fetch_danmaku:
-                _, uid_count, paid_episode_count = fetch_one_manbo_danmaku_count(drama_id)
+            if skip_danmaku:
+                entry["danmaku_uid_count"] = None
+            elif danmaku_ids is None or drama_id in danmaku_ids:
+                _, uid_count = fetch_one_manbo_danmaku_count(drama_id)
                 entry["danmaku_uid_count"] = uid_count
-                entry["danmaku_paid_episode_count"] = paid_episode_count
         except Exception as exc:
             print(f"  [manbo] ERROR on {drama_id}: {exc}")
+        entry.pop("danmaku_paid_episode_count", None)
         dramas[drama_id] = entry
         save_counter += 1
         if save_counter >= 5:
@@ -1274,7 +1305,6 @@ def fetch_manbo_paid_danmaku_benchmark(
     return {
         "drama_id": str(drama_id),
         "title": title,
-        "paid_episode_count": len(paid_set_ids),
         "total_pages": sum(total_pages_by_set.values()),
         "unique_user_count": len(users),
         "failed_page_count": len(failed_pages),
@@ -1291,8 +1321,8 @@ def fetch_one_manbo_danmaku_count(
     drama_id: str,
     *,
     request_json=request_manbo_json,
-) -> tuple[str, int, int]:
-    """Return (drama_id, paid_danmaku_uid_count, paid_episode_count) for one Manbo drama."""
+) -> tuple[str, int]:
+    """Return (drama_id, paid_danmaku_uid_count) for one Manbo drama."""
     result = fetch_manbo_paid_danmaku_benchmark(
         drama_id,
         request_json=request_json,
@@ -1304,7 +1334,6 @@ def fetch_one_manbo_danmaku_count(
     return (
         drama_id,
         int(result.get("unique_user_count") or 0),
-        int(result.get("paid_episode_count") or 0),
     )
 
 
@@ -1319,11 +1348,7 @@ def fetch_manbo_danmaku_details(
     targets = []
     for drama_id in drama_ids:
         entry = manbo_dramas.get(drama_id, {})
-        if (
-            force
-            or entry.get("danmaku_uid_count") is None
-            or entry.get("danmaku_paid_episode_count") is None
-        ):
+        if should_refresh_only_danmaku_entry(entry, force=force):
             targets.append(drama_id)
 
     print(f"  [manbo] paid danmaku IDs: total={len(drama_ids)}, update={len(targets)}")
@@ -1343,16 +1368,16 @@ def fetch_manbo_danmaku_details(
             completed += 1
             entry = manbo_dramas.get(drama_id, {})
             try:
-                _, uid_count, paid_episode_count = future.result()
+                _, uid_count = future.result()
                 entry["danmaku_uid_count"] = uid_count
-                entry["danmaku_paid_episode_count"] = paid_episode_count
                 entry["fetched_at"] = now_iso()
                 print(
                     f"  [manbo] ({completed}/{len(targets)}) drama {drama_id}: "
-                    f"{uid_count} paid danmaku IDs from {paid_episode_count} paid episodes"
+                    f"{uid_count} paid danmaku IDs"
                 )
             except Exception as exc:
                 print(f"  [manbo] ({completed}/{len(targets)}) ERROR on {drama_id}: {exc}")
+            entry.pop("danmaku_paid_episode_count", None)
             manbo_dramas[drama_id] = entry
             save_counter += 1
             if save_counter >= 5:
@@ -1521,21 +1546,18 @@ def _load_upstash_json(key: str) -> dict | list | None:
 # ---------------------------------------------------------------------------
 
 def only_danmaku_mode(store: dict, *, force: bool, do_missevan: bool, do_manbo: bool) -> None:
-    """Only update paid danmaku UID counts for rank-selected dramas in ranks.json."""
+    """Only update paid danmaku UID counts for existing metric entries in ranks.json."""
     requester = MissevanRequester()
 
     if do_missevan:
         missevan_dramas = store["missevan"].get("dramas") or {}
-        ongoing_missevan_ids = load_ongoing_drama_ids("missevan")
-        rank_danmaku_ids = collect_missevan_danmaku_target_ids(store)
-        danmaku_eligible = merge_rank_and_ongoing_ids(rank_danmaku_ids, ongoing_missevan_ids)
         targets = []
         for drama_id, entry in missevan_dramas.items():
-            if drama_id in danmaku_eligible and (force or entry.get("danmaku_uid_count") is None):
+            if should_refresh_only_danmaku_entry(entry, force=force):
                 targets.append(drama_id)
         print(
             f"[only-danmaku] missevan: {len(targets)} dramas to update "
-            f"(rank={len(rank_danmaku_ids)}, ongoing={len(ongoing_missevan_ids)})"
+            f"(existing={len(missevan_dramas)})"
         )
         for idx, drama_id in enumerate(sorted(targets), 1):
             print(f"  [missevan] ({idx}/{len(targets)}) danmaku for drama {drama_id} ...")
@@ -1559,13 +1581,10 @@ def only_danmaku_mode(store: dict, *, force: bool, do_missevan: bool, do_manbo: 
 
     if do_manbo:
         manbo_dramas = store["manbo"].get("dramas") or {}
-        ongoing_manbo_ids = load_ongoing_drama_ids("manbo")
-        rank_danmaku_ids = collect_manbo_danmaku_target_ids(store)
-        danmaku_eligible = merge_rank_and_ongoing_ids(rank_danmaku_ids, ongoing_manbo_ids)
-        existing_targets = {drama_id for drama_id in danmaku_eligible if drama_id in manbo_dramas}
+        existing_targets = set(manbo_dramas)
         print(
             f"[only-danmaku] manbo: {len(existing_targets)} dramas selected "
-            f"(rank={len(rank_danmaku_ids)}, ongoing={len(ongoing_manbo_ids)})"
+            f"(existing={len(manbo_dramas)})"
         )
         fetch_manbo_danmaku_details(existing_targets, store, force=force)
 
@@ -1625,6 +1644,7 @@ def main() -> None:
     store["missevan"].setdefault("dramas", {})
     store["manbo"].setdefault("ranks", {})
     store["manbo"].setdefault("dramas", {})
+    sanitize_rank_store(store)
 
     # --only-danmaku mode: skip everything else
     if args.only_danmaku:
@@ -1728,12 +1748,6 @@ def main() -> None:
                 skip_danmaku=args.skip_danmaku,
                 danmaku_ids=manbo_danmaku_ids,
             )
-
-        if do_manbo and not args.skip_danmaku:
-            manbo_backfill_ids = select_manbo_danmaku_backfill_ids(manbo_danmaku_ids, manbo_to_update)
-            if manbo_backfill_ids:
-                print(f"=== Phase 5b: Manbo paid danmaku backfill ({len(manbo_backfill_ids)}) ===")
-                fetch_manbo_danmaku_details(manbo_backfill_ids, store, force=args.force)
 
     if do_missevan and do_manbo:
         with ThreadPoolExecutor(max_workers=2) as executor:

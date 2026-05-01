@@ -176,23 +176,50 @@ class RankPartialUploadTests(unittest.TestCase):
             {"101", "102", "103"},
         )
 
-    def test_only_danmaku_mode_includes_existing_ongoing_ids(self) -> None:
+    def test_should_refresh_only_danmaku_entry_uses_force_missing_zero_and_cache(self) -> None:
+        fresh = datetime.now(timezone.utc).isoformat()
+        stale = (datetime.now(timezone.utc) - timedelta(hours=13)).isoformat()
+
+        self.assertTrue(ranks.should_refresh_only_danmaku_entry({}, force=False))
+        self.assertTrue(
+            ranks.should_refresh_only_danmaku_entry(
+                {"danmaku_uid_count": 0, "fetched_at": fresh},
+                force=False,
+            )
+        )
+        self.assertFalse(
+            ranks.should_refresh_only_danmaku_entry(
+                {"danmaku_uid_count": 7, "fetched_at": fresh},
+                force=False,
+            )
+        )
+        self.assertTrue(
+            ranks.should_refresh_only_danmaku_entry(
+                {"danmaku_uid_count": 7, "fetched_at": stale},
+                force=False,
+            )
+        )
+        self.assertTrue(
+            ranks.should_refresh_only_danmaku_entry(
+                {"danmaku_uid_count": 7, "fetched_at": fresh},
+                force=True,
+            )
+        )
+
+    def test_only_danmaku_mode_force_updates_all_existing_metric_ids(self) -> None:
         store = {
             "missevan": {
-                "ranks": {"new_daily": {"items": ["101"]}},
+                "ranks": {},
                 "dramas": {
-                    "101": {"danmaku_uid_count": None},
-                    "102": {"danmaku_uid_count": None},
+                    "101": {"danmaku_uid_count": 1, "fetched_at": "2026-04-30T00:00:00+00:00"},
+                    "102": {"danmaku_uid_count": 2, "fetched_at": "2026-04-30T00:00:00+00:00"},
                 },
             },
             "manbo": {
-                "ranks": {
-                    "hot": {"items": [{"dramaId": "201"}]},
-                    "peak": {"items": [{"dramaId": "999"}]},
-                },
+                "ranks": {},
                 "dramas": {
-                    "201": {"danmaku_uid_count": None, "danmaku_paid_episode_count": None},
-                    "202": {"danmaku_uid_count": None, "danmaku_paid_episode_count": None},
+                    "201": {"danmaku_uid_count": 3, "fetched_at": "2026-04-30T00:00:00+00:00"},
+                    "202": {"danmaku_uid_count": 4, "fetched_at": "2026-04-30T00:00:00+00:00"},
                 },
             },
         }
@@ -204,12 +231,8 @@ class RankPartialUploadTests(unittest.TestCase):
                 requested_missevan.append(url.rsplit("=", 1)[-1])
                 return {"info": {"episodes": {"episode": []}}}
 
-        def fake_ongoing(platform):
-            return {"missevan": {"102", "103"}, "manbo": {"202", "203"}}[platform]
-
         with (
             patch.object(ranks, "MissevanRequester", return_value=FakeRequester()),
-            patch.object(ranks, "load_ongoing_drama_ids", side_effect=fake_ongoing),
             patch.object(ranks, "_fetch_missevan_danmaku", side_effect=lambda requester, episodes, entry: entry.update({"danmaku_uid_count": 0})),
             patch.object(ranks, "fetch_manbo_danmaku_details", side_effect=lambda ids, store, force: requested_manbo.extend(sorted(ids))),
             patch.object(ranks, "save_json"),
@@ -218,6 +241,38 @@ class RankPartialUploadTests(unittest.TestCase):
 
         self.assertEqual(sorted(requested_missevan), ["101", "102"])
         self.assertEqual(requested_manbo, ["201", "202"])
+
+    def test_only_danmaku_mode_without_force_refreshes_missing_zero_or_stale_missevan_entries(self) -> None:
+        fresh = datetime.now(timezone.utc).isoformat()
+        stale = (datetime.now(timezone.utc) - timedelta(hours=13)).isoformat()
+        store = {
+            "missevan": {
+                "ranks": {},
+                "dramas": {
+                    "101": {"danmaku_uid_count": None},
+                    "102": {"danmaku_uid_count": 0, "fetched_at": fresh},
+                    "103": {"danmaku_uid_count": 7, "fetched_at": fresh},
+                    "104": {"danmaku_uid_count": 8, "fetched_at": stale},
+                },
+            },
+            "manbo": {"ranks": {}, "dramas": {}},
+        }
+        requested_missevan = []
+
+        class FakeRequester:
+            def request_json(self, url):
+                requested_missevan.append(url.rsplit("=", 1)[-1])
+                return {"info": {"episodes": {"episode": []}}}
+
+        with (
+            patch.object(ranks, "MissevanRequester", return_value=FakeRequester()),
+            patch.object(ranks, "_fetch_missevan_danmaku", side_effect=lambda requester, episodes, entry: entry.update({"danmaku_uid_count": 11})),
+            patch.object(ranks, "save_json"),
+        ):
+            ranks.only_danmaku_mode(store, force=False, do_missevan=True, do_manbo=False)
+
+        self.assertEqual(sorted(requested_missevan), ["101", "102", "104"])
+        self.assertEqual(store["missevan"]["dramas"]["103"]["danmaku_uid_count"], 7)
 
     def test_latest_rank_history_date_uses_latest_index_date(self) -> None:
         with patch.object(ranks, "load_rank_history_index", return_value={"dates": ["2026-04-27", "2026-04-29", "2026-04-28"]}):
@@ -330,17 +385,26 @@ class RankPartialUploadTests(unittest.TestCase):
         self.assertEqual(to_update, {"102", "103"})
         self.assertEqual(skipped, 1)
 
-    def test_select_manbo_danmaku_backfill_ids_excludes_detail_updates(self) -> None:
-        self.assertEqual(
-            ranks.select_manbo_danmaku_backfill_ids({"201", "202", "203"}, {"202"}),
-            {"201", "203"},
-        )
-
     def test_pay_status_marks_paid_member_dramas_as_member(self) -> None:
         self.assertEqual(ranks.pay_status_from_metadata({"needpay": True, "is_member": True}), "会员")
         self.assertEqual(ranks.pay_status_from_metadata({"needpay": True, "vipFree": 1}), "会员")
         self.assertEqual(ranks.pay_status_from_metadata({"needpay": True, "vipFree": 0}), "付费")
         self.assertEqual(ranks.pay_status_from_metadata({"needpay": False, "vipFree": 1}), "免费")
+
+    def test_sanitize_rank_store_drops_legacy_manbo_danmaku_episode_count(self) -> None:
+        store = {
+            "manbo": {
+                "dramas": {
+                    "201": {"danmaku_uid_count": 9, "danmaku_paid_episode_count": 3},
+                    "202": {"name": "keep"},
+                }
+            }
+        }
+
+        ranks.sanitize_rank_store(store)
+
+        self.assertEqual(store["manbo"]["dramas"]["201"], {"danmaku_uid_count": 9})
+        self.assertEqual(store["manbo"]["dramas"]["202"], {"name": "keep"})
 
     def test_lookup_cvs_uses_member_fields_for_pay_status(self) -> None:
         store = {
@@ -377,6 +441,46 @@ class RankPartialUploadTests(unittest.TestCase):
         self.assertEqual(store["missevan"]["dramas"]["101"]["payStatus"], "会员")
         self.assertEqual(store["manbo"]["dramas"]["201"]["payStatus"], "会员")
 
+    def test_fetch_one_missevan_skip_danmaku_clears_only_on_global_skip(self) -> None:
+        class FakeRequester:
+            def request_json(self, url):
+                if "getdrama?drama_id=" in url:
+                    return {
+                        "info": {
+                            "drama": {"name": "猫耳剧", "cover": "cover", "view_count": 10},
+                            "episodes": {"episode": [{"sound_id": "1", "need_pay": 1}]},
+                        }
+                    }
+                if "drama-reward-detail" in url:
+                    return {"info": {"reward_num": 1}}
+                if "user-reward-rank" in url:
+                    return {"info": {"list": []}}
+                if "getdramabysound" in url:
+                    return {"info": {"drama": {"subscription_num": 2, "lastupdate_time": None}}}
+                raise AssertionError(url)
+
+        cleared_entry = {"danmaku_uid_count": 9}
+        preserved_entry = {"danmaku_uid_count": 8}
+
+        with patch.object(ranks, "_fetch_missevan_danmaku", side_effect=AssertionError("should not fetch danmaku")):
+            ranks._fetch_one_missevan(
+                FakeRequester(),
+                "101",
+                cleared_entry,
+                skip_danmaku=True,
+                clear_danmaku_on_skip=True,
+            )
+            ranks._fetch_one_missevan(
+                FakeRequester(),
+                "102",
+                preserved_entry,
+                skip_danmaku=True,
+                clear_danmaku_on_skip=False,
+            )
+
+        self.assertIsNone(cleared_entry["danmaku_uid_count"])
+        self.assertEqual(preserved_entry["danmaku_uid_count"], 8)
+
     def test_fetch_manbo_drama_details_refreshes_danmaku_only_for_updated_eligible_ids(self) -> None:
         store = {"manbo": {"dramas": {}}}
         fetched_details = []
@@ -388,7 +492,7 @@ class RankPartialUploadTests(unittest.TestCase):
 
         def fake_danmaku(drama_id):
             fetched_danmaku.append(drama_id)
-            return drama_id, 7, 2
+            return drama_id, 7
 
         with (
             patch.object(ranks, "_fetch_one_manbo", side_effect=fake_fetch_one),
@@ -406,15 +510,69 @@ class RankPartialUploadTests(unittest.TestCase):
         self.assertEqual(fetched_danmaku, ["202"])
         self.assertNotIn("danmaku_uid_count", store["manbo"]["dramas"]["201"])
         self.assertEqual(store["manbo"]["dramas"]["202"]["danmaku_uid_count"], 7)
-        self.assertEqual(store["manbo"]["dramas"]["202"]["danmaku_paid_episode_count"], 2)
+        self.assertNotIn("danmaku_paid_episode_count", store["manbo"]["dramas"]["202"])
 
-    def test_fetch_manbo_drama_details_skip_danmaku_preserves_existing_fields(self) -> None:
+    def test_fetch_manbo_paid_danmaku_benchmark_omits_paid_episode_count(self) -> None:
+        def fake_paid_set_loader(drama_id, *, request_json=None):
+            self.assertEqual(drama_id, "201")
+            return ["set-1"]
+
+        def fake_request_json(url):
+            self.assertIn("dramaSetId=set-1", url)
+            return {
+                "data": {
+                    "count": 2,
+                    "list": [{"eid": "u1"}, {"eid": "u2"}],
+                }
+            }
+
+        result = ranks.fetch_manbo_paid_danmaku_benchmark(
+            "201",
+            request_json=fake_request_json,
+            paid_set_id_loader=fake_paid_set_loader,
+            page_concurrency=1,
+        )
+
+        self.assertEqual(result["unique_user_count"], 2)
+        self.assertEqual(result["total_pages"], 1)
+        self.assertEqual(result["total_danmaku"], 2)
+        self.assertEqual(result["failed_page_count"], 0)
+        self.assertNotIn("paid_episode_count", result)
+
+    def test_fetch_manbo_danmaku_details_without_force_refreshes_missing_zero_or_stale_entries(self) -> None:
+        fresh = datetime.now(timezone.utc).isoformat()
+        stale = (datetime.now(timezone.utc) - timedelta(hours=13)).isoformat()
+        store = {
+            "manbo": {
+                "dramas": {
+                    "201": {"danmaku_uid_count": None},
+                    "202": {"danmaku_uid_count": 0, "fetched_at": fresh},
+                    "203": {"danmaku_uid_count": 7, "fetched_at": fresh},
+                    "204": {"danmaku_uid_count": 8, "fetched_at": stale},
+                }
+            }
+        }
+        fetched = []
+
+        def fake_danmaku(drama_id):
+            fetched.append(drama_id)
+            return drama_id, 12
+
+        with (
+            patch.object(ranks, "fetch_one_manbo_danmaku_count", side_effect=fake_danmaku),
+            patch.object(ranks, "save_json"),
+        ):
+            ranks.fetch_manbo_danmaku_details({"201", "202", "203", "204"}, store, force=False)
+
+        self.assertEqual(sorted(fetched), ["201", "202", "204"])
+        self.assertEqual(store["manbo"]["dramas"]["203"]["danmaku_uid_count"], 7)
+
+    def test_fetch_manbo_drama_details_skip_danmaku_clears_existing_count(self) -> None:
         store = {
             "manbo": {
                 "dramas": {
                     "201": {
                         "danmaku_uid_count": 9,
-                        "danmaku_paid_episode_count": 3,
                     }
                 }
             }
@@ -435,8 +593,8 @@ class RankPartialUploadTests(unittest.TestCase):
                 danmaku_ids={"201"},
             )
 
-        self.assertEqual(store["manbo"]["dramas"]["201"]["danmaku_uid_count"], 9)
-        self.assertEqual(store["manbo"]["dramas"]["201"]["danmaku_paid_episode_count"], 3)
+        self.assertIsNone(store["manbo"]["dramas"]["201"]["danmaku_uid_count"])
+        self.assertNotIn("danmaku_paid_episode_count", store["manbo"]["dramas"]["201"])
 
 
 if __name__ == "__main__":

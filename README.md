@@ -231,7 +231,51 @@ python rebuild_sqlite_from_libraries.py --export-workbook
 python export_sqlite_to_workbook.py
 ```
 
-## 7. 生成图片
+## 7. 抓取榜单与弹幕数据
+
+脚本：`fetch_rank_data.py`
+
+用途：
+
+- 抓取双平台榜单并写入 `ranks.json`
+- 合并 Upstash ongoing ID，补齐脱榜但仍需关注的剧目
+- 按 12 小时缓存窗口决定是否刷新剧目 detail
+- 刷新弹幕 UID 统计，并上传 partial / history / full rank store 到 Upstash
+
+普通模式：
+
+- 会先加载当前 store（优先远端 partial + 最新 metrics，失败再回退本地 `ranks.json`）
+- 拉取榜单后，把榜单 ID 和 ongoing ID 合并去重
+- 如果某个 drama 的 `fetched_at` 仍在 12 小时内，则默认跳过 detail 刷新
+- 传 `--force` 时忽略 12 小时缓存，直接刷新选中的剧目
+- 双平台同时开启时，猫耳和漫播的榜单抓取并行，detail 刷新也并行
+
+弹幕规则：
+
+- 默认会随 detail 一起刷新弹幕 UID 统计
+- 传 `--skip-danmaku` 时，本次被更新到的 drama 会显式把 `danmaku_uid_count` 写成 `null`
+- 不在弹幕目标子集里的 drama 会继续刷新 detail，但保留已有 `danmaku_uid_count`
+
+`--only-danmaku`：
+
+- 不拉榜单，也不重新读取 ongoing
+- 直接遍历当前 store 里已有的 drama metrics
+- 传 `--force` 时，直接刷新这些现有 drama 的弹幕
+- 不传 `--force` 时，只有在 `danmaku_uid_count` 为正且 `fetched_at` 仍在 12 小时缓存内时才跳过；其他情况都会刷新
+
+常用命令：
+
+```powershell
+python fetch_rank_data.py
+python fetch_rank_data.py --skip-danmaku
+python fetch_rank_data.py --force
+python fetch_rank_data.py --only-danmaku
+python fetch_rank_data.py --only-danmaku --force
+python fetch_rank_data.py --missevan-only
+python fetch_rank_data.py --manbo-only
+```
+
+## 8. 生成图片
 
 榜单图：
 

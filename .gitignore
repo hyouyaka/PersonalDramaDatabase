@@ -45,3 +45,7 @@ PersonalDramaDatabase_architecture.md
 
 # Local JSON data snapshots
 /*.json
+backfill_vip_fields.py
+PersonalDramaDatabase_architecture.md
+test_backfill_vip_fields.py
+PersonalDramaDatabase_architecture.md
