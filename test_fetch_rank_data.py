@@ -3,6 +3,8 @@ import unittest
 from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 
+import requests
+
 import fetch_rank_data as ranks
 
 
@@ -512,6 +514,147 @@ class RankPartialUploadTests(unittest.TestCase):
         self.assertEqual(store["manbo"]["dramas"]["202"]["danmaku_uid_count"], 7)
         self.assertNotIn("danmaku_paid_episode_count", store["manbo"]["dramas"]["202"])
 
+    def test_fetch_missevan_drama_details_retries_failed_danmaku_drama(self) -> None:
+        store = {"missevan": {"dramas": {"101": {"danmaku_uid_count": 5}}}}
+        danmaku_attempts = []
+
+        class FakeRequester:
+            def request_json(self, url):
+                if "getdrama?drama_id=" in url:
+                    return {
+                        "info": {
+                            "drama": {"name": "猫耳剧", "cover": "cover", "view_count": 10},
+                            "episodes": {"episode": [{"sound_id": "1", "need_pay": 1}]},
+                        }
+                    }
+                if "drama-reward-detail" in url:
+                    return {"info": {"reward_num": 1}}
+                if "user-reward-rank" in url:
+                    return {"info": {"list": []}}
+                if "getdramabysound" in url:
+                    return {"info": {"drama": {"subscription_num": 2, "lastupdate_time": None}}}
+                raise AssertionError(url)
+
+        def fake_danmaku(requester, episodes, entry):
+            danmaku_attempts.append(entry.get("name"))
+            if len(danmaku_attempts) == 1:
+                raise ranks.DanmakuRefreshError("timeout")
+            entry["danmaku_uid_count"] = 12
+
+        with (
+            patch.object(ranks, "_fetch_missevan_danmaku", side_effect=fake_danmaku),
+            patch.object(ranks, "save_json"),
+        ):
+            ranks.fetch_missevan_drama_details(
+                FakeRequester(),
+                {"101"},
+                store,
+                skip_danmaku=False,
+                danmaku_ids={"101"},
+            )
+
+        self.assertEqual(len(danmaku_attempts), 2)
+        self.assertEqual(store["missevan"]["dramas"]["101"]["danmaku_uid_count"], 12)
+
+    def test_fetch_missevan_danmaku_raises_when_one_paid_sound_fails(self) -> None:
+        entry = {"danmaku_uid_count": 9}
+        episodes = [
+            {"sound_id": "1", "need_pay": 1},
+            {"sound_id": "2", "need_pay": 1},
+        ]
+
+        class FakeResponse:
+            status_code = 200
+            text = '<i><d p="1,2,3,4,5,6,user-a">x</d></i>'
+
+            def raise_for_status(self):
+                return None
+
+        def fake_get(url, **kwargs):
+            if "soundid=2" in url:
+                raise requests.exceptions.ReadTimeout("timeout")
+            return FakeResponse()
+
+        with (
+            patch.object(ranks.requests, "get", side_effect=fake_get),
+            patch.object(ranks.time, "sleep"),
+        ):
+            with self.assertRaises(ranks.DanmakuRefreshError):
+                ranks._fetch_missevan_danmaku(object(), episodes, entry)
+
+        self.assertEqual(entry["danmaku_uid_count"], 9)
+
+    def test_fetch_missevan_drama_details_sets_danmaku_none_after_three_failed_retries(self) -> None:
+        store = {"missevan": {"dramas": {"101": {"danmaku_uid_count": 5}}}}
+        danmaku_attempts = []
+
+        class FakeRequester:
+            def request_json(self, url):
+                if "getdrama?drama_id=" in url:
+                    return {
+                        "info": {
+                            "drama": {"name": "猫耳剧", "cover": "cover", "view_count": 10},
+                            "episodes": {"episode": [{"sound_id": "1", "need_pay": 1}]},
+                        }
+                    }
+                if "drama-reward-detail" in url:
+                    return {"info": {"reward_num": 1}}
+                if "user-reward-rank" in url:
+                    return {"info": {"list": []}}
+                if "getdramabysound" in url:
+                    return {"info": {"drama": {"subscription_num": 2, "lastupdate_time": None}}}
+                raise AssertionError(url)
+
+        def fake_danmaku(requester, episodes, entry):
+            danmaku_attempts.append(entry.get("name"))
+            raise ranks.DanmakuRefreshError("timeout")
+
+        with (
+            patch.object(ranks, "_fetch_missevan_danmaku", side_effect=fake_danmaku),
+            patch.object(ranks, "save_json"),
+        ):
+            ranks.fetch_missevan_drama_details(
+                FakeRequester(),
+                {"101"},
+                store,
+                skip_danmaku=False,
+                danmaku_ids={"101"},
+            )
+
+        self.assertEqual(len(danmaku_attempts), 4)
+        self.assertIsNone(store["missevan"]["dramas"]["101"]["danmaku_uid_count"])
+
+    def test_fetch_manbo_drama_details_retries_failed_danmaku_drama(self) -> None:
+        store = {"manbo": {"dramas": {"201": {"danmaku_uid_count": 4}}}}
+        fetched_details = []
+        fetched_danmaku = []
+
+        def fake_fetch_one(drama_id, entry):
+            fetched_details.append(drama_id)
+            entry["name"] = f"drama-{drama_id}"
+
+        def fake_danmaku(drama_id):
+            fetched_danmaku.append(drama_id)
+            if len(fetched_danmaku) == 1:
+                raise RuntimeError("timeout")
+            return drama_id, 14
+
+        with (
+            patch.object(ranks, "_fetch_one_manbo", side_effect=fake_fetch_one),
+            patch.object(ranks, "fetch_one_manbo_danmaku_count", side_effect=fake_danmaku),
+            patch.object(ranks, "save_json"),
+        ):
+            ranks.fetch_manbo_drama_details(
+                {"201"},
+                store,
+                skip_danmaku=False,
+                danmaku_ids={"201"},
+            )
+
+        self.assertEqual(fetched_details, ["201"])
+        self.assertEqual(fetched_danmaku, ["201", "201"])
+        self.assertEqual(store["manbo"]["dramas"]["201"]["danmaku_uid_count"], 14)
+
     def test_fetch_manbo_paid_danmaku_benchmark_omits_paid_episode_count(self) -> None:
         def fake_paid_set_loader(drama_id, *, request_json=None):
             self.assertEqual(drama_id, "201")
@@ -566,6 +709,73 @@ class RankPartialUploadTests(unittest.TestCase):
 
         self.assertEqual(sorted(fetched), ["201", "202", "204"])
         self.assertEqual(store["manbo"]["dramas"]["203"]["danmaku_uid_count"], 7)
+
+    def test_fetch_manbo_danmaku_details_sets_danmaku_none_after_three_failed_retries(self) -> None:
+        store = {
+            "manbo": {
+                "dramas": {
+                    "201": {"danmaku_uid_count": 6},
+                }
+            }
+        }
+        fetched = []
+
+        def fake_danmaku(drama_id):
+            fetched.append(drama_id)
+            raise RuntimeError("timeout")
+
+        with (
+            patch.object(ranks, "fetch_one_manbo_danmaku_count", side_effect=fake_danmaku),
+            patch.object(ranks, "save_json"),
+        ):
+            ranks.fetch_manbo_danmaku_details({"201"}, store, force=True)
+
+        self.assertEqual(fetched, ["201", "201", "201", "201"])
+        self.assertIsNone(store["manbo"]["dramas"]["201"]["danmaku_uid_count"])
+
+    def test_only_danmaku_mode_retries_failed_missevan_and_manbo_dramas(self) -> None:
+        store = {
+            "missevan": {"ranks": {}, "dramas": {"101": {"danmaku_uid_count": 1}}},
+            "manbo": {"ranks": {}, "dramas": {"201": {"danmaku_uid_count": 2}}},
+        }
+        missevan_attempts = []
+        manbo_attempts = []
+
+        class FakeRequester:
+            def request_json(self, url):
+                missevan_attempts.append(url.rsplit("=", 1)[-1])
+                return {"info": {"episodes": {"episode": [{"sound_id": "1", "need_pay": 1}]}}}
+
+        def fake_missevan_danmaku(requester, episodes, entry):
+            if len(missevan_attempts) == 1:
+                raise ranks.DanmakuRefreshError("timeout")
+            entry["danmaku_uid_count"] = 11
+
+        def fake_manbo_danmaku(drama_id):
+            manbo_attempts.append(drama_id)
+            if len(manbo_attempts) == 1:
+                raise RuntimeError("timeout")
+            return drama_id, 22
+
+        with (
+            patch.object(ranks, "MissevanRequester", return_value=FakeRequester()),
+            patch.object(ranks, "_fetch_missevan_danmaku", side_effect=fake_missevan_danmaku),
+            patch.object(ranks, "fetch_one_manbo_danmaku_count", side_effect=lambda drama_id: (drama_id, 22)),
+            patch.object(ranks, "save_json"),
+        ):
+            ranks.only_danmaku_mode(store, force=True, do_missevan=True, do_manbo=False)
+
+        with (
+            patch.object(ranks, "MissevanRequester", return_value=FakeRequester()),
+            patch.object(ranks, "fetch_one_manbo_danmaku_count", side_effect=fake_manbo_danmaku),
+            patch.object(ranks, "save_json"),
+        ):
+            ranks.only_danmaku_mode(store, force=True, do_missevan=False, do_manbo=True)
+
+        self.assertEqual(missevan_attempts, ["101", "101"])
+        self.assertEqual(manbo_attempts, ["201", "201"])
+        self.assertEqual(store["missevan"]["dramas"]["101"]["danmaku_uid_count"], 11)
+        self.assertEqual(store["manbo"]["dramas"]["201"]["danmaku_uid_count"], 22)
 
     def test_fetch_manbo_drama_details_skip_danmaku_clears_existing_count(self) -> None:
         store = {

@@ -94,6 +94,11 @@ MANBO_DANMAKU_PAGE_SIZE = 200
 MANBO_DANMAKU_PAGE_CONCURRENCY = 48
 MANBO_DANMAKU_DRAMA_CONCURRENCY = 1
 MANBO_DANMAKU_REQUEST_RETRIES = 3
+DANMAKU_DRAMA_RETRY_ATTEMPTS = 3
+
+
+class DanmakuRefreshError(RuntimeError):
+    """Raised when a drama-level danmaku refresh should be retried."""
 
 # ---------------------------------------------------------------------------
 # Upstash helpers (adapted from sync_new_drama_ids.py)
@@ -665,6 +670,43 @@ def safe_int(value: object, default: int = 0) -> int:
         return default
 
 
+def retry_failed_danmaku_ids(
+    platform: str,
+    failed_ids: set[str] | list[str],
+    refresh_one,
+    *,
+    mark_failed=None,
+    max_attempts: int = DANMAKU_DRAMA_RETRY_ATTEMPTS,
+) -> set[str]:
+    """Retry failed drama-level danmaku refreshes and return IDs still failing."""
+    remaining = {str(value) for value in failed_ids if value not in (None, "")}
+    for attempt in range(1, max_attempts + 1):
+        if not remaining:
+            break
+        print(f"  [{platform}] danmaku retry {attempt}/{max_attempts}: {len(remaining)} drama(s)")
+        next_failed: set[str] = set()
+        for idx, drama_id in enumerate(sorted(remaining), 1):
+            try:
+                refresh_one(drama_id)
+            except RuntimeError as exc:
+                if "HTTP_418" in str(exc):
+                    raise
+                print(f"  [{platform}] retry {attempt}/{max_attempts} ERROR on {drama_id}: {exc}")
+                next_failed.add(drama_id)
+            except Exception as exc:
+                print(f"  [{platform}] retry {attempt}/{max_attempts} ERROR on {drama_id}: {exc}")
+                next_failed.add(drama_id)
+            else:
+                print(f"  [{platform}] retry {attempt}/{max_attempts} ({idx}/{len(remaining)}) drama {drama_id}: ok")
+        remaining = next_failed
+    if remaining:
+        print(f"  [{platform}] WARN: danmaku still failed after {max_attempts} retries: {', '.join(sorted(remaining))}")
+        if mark_failed is not None:
+            for drama_id in sorted(remaining):
+                mark_failed(drama_id)
+    return remaining
+
+
 def init_ranks_store() -> dict:
     return {
         "_meta": {"updated_at": now_iso()},
@@ -876,6 +918,7 @@ def fetch_missevan_drama_details(
     """Fetch detailed info for each Missevan drama ID."""
     dramas = store["missevan"].setdefault("dramas", {})
     total = len(drama_ids)
+    failed_danmaku_ids: set[str] = set()
     for idx, drama_id in enumerate(sorted(drama_ids), 1):
         print(f"  [missevan] ({idx}/{total}) drama {drama_id} ...")
         entry: dict = dramas.get(str(drama_id), {})
@@ -894,11 +937,40 @@ def fetch_missevan_drama_details(
                 dramas[str(drama_id)] = entry
                 save_json(RANKS_PATH, store)
                 raise
+            if isinstance(exc, DanmakuRefreshError):
+                failed_danmaku_ids.add(str(drama_id))
             print(f"  [missevan] ERROR on {drama_id}: {exc}")
         except Exception as exc:
             print(f"  [missevan] ERROR on {drama_id}: {exc}")
         dramas[str(drama_id)] = entry
         save_json(RANKS_PATH, store)
+
+    def retry_one_danmaku(drama_id: str) -> None:
+        entry = dramas.get(str(drama_id), {})
+        try:
+            _fetch_one_missevan(
+                requester,
+                str(drama_id),
+                entry,
+                skip_danmaku=False,
+                clear_danmaku_on_skip=False,
+            )
+        finally:
+            dramas[str(drama_id)] = entry
+            save_json(RANKS_PATH, store)
+
+    def mark_danmaku_failed(drama_id: str) -> None:
+        entry = dramas.get(str(drama_id), {})
+        entry["danmaku_uid_count"] = None
+        dramas[str(drama_id)] = entry
+        save_json(RANKS_PATH, store)
+
+    retry_failed_danmaku_ids(
+        "missevan",
+        failed_danmaku_ids,
+        retry_one_danmaku,
+        mark_failed=mark_danmaku_failed,
+    )
 
 
 def _fetch_one_missevan(
@@ -991,6 +1063,7 @@ def _fetch_missevan_danmaku(requester: MissevanRequester, episodes: list[dict], 
         return
 
     uid_set: set[str] = set()
+    failed_sounds: list[str] = []
     for sound_id in paid_sounds:
         try:
             dm_url = f"https://www.missevan.com/sound/getdm?soundid={sound_id}"
@@ -999,7 +1072,10 @@ def _fetch_missevan_danmaku(requester: MissevanRequester, episodes: list[dict], 
             _parse_missevan_dm_xml(resp.text, uid_set)
         except Exception as exc:
             print(f"    [danmaku] WARN: failed for sound {sound_id}: {exc}")
+            failed_sounds.append(sound_id)
         time.sleep(0.35)  # small delay per episode
+    if failed_sounds:
+        raise DanmakuRefreshError(f"failed Missevan danmaku sounds: {', '.join(failed_sounds)}")
     entry["danmaku_uid_count"] = len(uid_set)
 
 
@@ -1026,18 +1102,31 @@ def fetch_manbo_drama_details(
     dramas = store["manbo"].setdefault("dramas", {})
     total = len(drama_ids)
     save_counter = 0
+    failed_danmaku_ids: set[str] = set()
     for idx, drama_id in enumerate(sorted(drama_ids), 1):
         print(f"  [manbo] ({idx}/{total}) drama {drama_id} ...")
         entry: dict = dramas.get(drama_id, {})
         try:
             _fetch_one_manbo(drama_id, entry)
-            if skip_danmaku:
-                entry["danmaku_uid_count"] = None
-            elif danmaku_ids is None or drama_id in danmaku_ids:
-                _, uid_count = fetch_one_manbo_danmaku_count(drama_id)
-                entry["danmaku_uid_count"] = uid_count
         except Exception as exc:
             print(f"  [manbo] ERROR on {drama_id}: {exc}")
+            entry.pop("danmaku_paid_episode_count", None)
+            dramas[drama_id] = entry
+            save_counter += 1
+            if save_counter >= 5:
+                save_json(RANKS_PATH, store)
+                save_counter = 0
+            continue
+
+        if skip_danmaku:
+            entry["danmaku_uid_count"] = None
+        elif danmaku_ids is None or drama_id in danmaku_ids:
+            try:
+                _, uid_count = fetch_one_manbo_danmaku_count(drama_id)
+                entry["danmaku_uid_count"] = uid_count
+            except Exception as exc:
+                print(f"  [manbo] DANMAKU ERROR on {drama_id}: {exc}")
+                failed_danmaku_ids.add(str(drama_id))
         entry.pop("danmaku_paid_episode_count", None)
         dramas[drama_id] = entry
         save_counter += 1
@@ -1046,6 +1135,29 @@ def fetch_manbo_drama_details(
             save_counter = 0
     if save_counter > 0:
         save_json(RANKS_PATH, store)
+
+    def retry_one_danmaku(drama_id: str) -> None:
+        entry = dramas.get(str(drama_id), {})
+        _, uid_count = fetch_one_manbo_danmaku_count(str(drama_id))
+        entry["danmaku_uid_count"] = uid_count
+        entry["fetched_at"] = now_iso()
+        entry.pop("danmaku_paid_episode_count", None)
+        dramas[str(drama_id)] = entry
+        save_json(RANKS_PATH, store)
+
+    def mark_danmaku_failed(drama_id: str) -> None:
+        entry = dramas.get(str(drama_id), {})
+        entry["danmaku_uid_count"] = None
+        entry.pop("danmaku_paid_episode_count", None)
+        dramas[str(drama_id)] = entry
+        save_json(RANKS_PATH, store)
+
+    retry_failed_danmaku_ids(
+        "manbo",
+        failed_danmaku_ids,
+        retry_one_danmaku,
+        mark_failed=mark_danmaku_failed,
+    )
 
 
 def _fetch_one_manbo(drama_id: str, entry: dict) -> None:
@@ -1356,6 +1468,7 @@ def fetch_manbo_danmaku_details(
         return
 
     save_counter = 0
+    failed_danmaku_ids: set[str] = set()
     workers = max(1, min(MANBO_DANMAKU_DRAMA_CONCURRENCY, len(targets)))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_drama = {
@@ -1377,6 +1490,7 @@ def fetch_manbo_danmaku_details(
                 )
             except Exception as exc:
                 print(f"  [manbo] ({completed}/{len(targets)}) ERROR on {drama_id}: {exc}")
+                failed_danmaku_ids.add(str(drama_id))
             entry.pop("danmaku_paid_episode_count", None)
             manbo_dramas[drama_id] = entry
             save_counter += 1
@@ -1385,6 +1499,29 @@ def fetch_manbo_danmaku_details(
                 save_counter = 0
     if save_counter > 0:
         save_json(RANKS_PATH, store)
+
+    def retry_one_danmaku(drama_id: str) -> None:
+        entry = manbo_dramas.get(str(drama_id), {})
+        _, uid_count = fetch_one_manbo_danmaku_count(str(drama_id))
+        entry["danmaku_uid_count"] = uid_count
+        entry["fetched_at"] = now_iso()
+        entry.pop("danmaku_paid_episode_count", None)
+        manbo_dramas[str(drama_id)] = entry
+        save_json(RANKS_PATH, store)
+
+    def mark_danmaku_failed(drama_id: str) -> None:
+        entry = manbo_dramas.get(str(drama_id), {})
+        entry["danmaku_uid_count"] = None
+        entry.pop("danmaku_paid_episode_count", None)
+        manbo_dramas[str(drama_id)] = entry
+        save_json(RANKS_PATH, store)
+
+    retry_failed_danmaku_ids(
+        "manbo",
+        failed_danmaku_ids,
+        retry_one_danmaku,
+        mark_failed=mark_danmaku_failed,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1559,6 +1696,7 @@ def only_danmaku_mode(store: dict, *, force: bool, do_missevan: bool, do_manbo: 
             f"[only-danmaku] missevan: {len(targets)} dramas to update "
             f"(existing={len(missevan_dramas)})"
         )
+        failed_danmaku_ids: set[str] = set()
         for idx, drama_id in enumerate(sorted(targets), 1):
             print(f"  [missevan] ({idx}/{len(targets)}) danmaku for drama {drama_id} ...")
             # Need episodes list from getdrama
@@ -1574,10 +1712,34 @@ def only_danmaku_mode(store: dict, *, force: bool, do_missevan: bool, do_manbo: 
                     print(f"  [missevan] FATAL: rate limited. Saving progress and stopping.")
                     save_json(RANKS_PATH, store)
                     raise
+                if isinstance(exc, DanmakuRefreshError):
+                    failed_danmaku_ids.add(str(drama_id))
                 print(f"  [missevan] ERROR: {exc}")
             except Exception as exc:
                 print(f"  [missevan] ERROR: {exc}")
             save_json(RANKS_PATH, store)
+
+        def retry_one_missevan_danmaku(drama_id: str) -> None:
+            url = f"https://www.missevan.com/dramaapi/getdrama?drama_id={drama_id}"
+            data = requester.request_json(url)
+            info = data.get("info") or {}
+            episodes = (info.get("episodes") or {}).get("episode") or []
+            _fetch_missevan_danmaku(requester, episodes, missevan_dramas[str(drama_id)])
+            missevan_dramas[str(drama_id)]["fetched_at"] = now_iso()
+            save_json(RANKS_PATH, store)
+
+        def mark_missevan_danmaku_failed(drama_id: str) -> None:
+            entry = missevan_dramas.get(str(drama_id), {})
+            entry["danmaku_uid_count"] = None
+            missevan_dramas[str(drama_id)] = entry
+            save_json(RANKS_PATH, store)
+
+        retry_failed_danmaku_ids(
+            "missevan",
+            failed_danmaku_ids,
+            retry_one_missevan_danmaku,
+            mark_failed=mark_missevan_danmaku_failed,
+        )
 
     if do_manbo:
         manbo_dramas = store["manbo"].get("dramas") or {}
