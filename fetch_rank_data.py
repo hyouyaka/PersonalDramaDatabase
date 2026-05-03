@@ -51,10 +51,12 @@ RANKS_PATH = HERE / "ranks.json"
 CACHE_WINDOW = timedelta(hours=12)
 RANK_HISTORY_RETENTION_DAYS = 90
 SAVE_LOCK = threading.Lock()
+LOCAL_TIMEZONE = datetime.now().astimezone().tzinfo or timezone.utc
 
 load_env_file(HERE / ".env")
 
 QUEUE_KEY = "new:dramaIDs"
+PEAK_TREND_KEY = "ranks:trend:peak:missevan"
 PLATFORMS = ("missevan", "manbo")
 RANK_PARTIAL_KEYS = {
     "missevan": "ranks:partial:missevan",
@@ -466,6 +468,118 @@ def _build_metric_payload(store: dict, platform: str, history_date: str, generat
     }
 
 
+def build_missevan_peak_trend_payload(
+    current: dict | None,
+    store: dict,
+    history_date: str,
+    generated_at: str,
+    *,
+    pruned_dates: list[str] | tuple[str, ...] | set[str],
+) -> dict:
+    """Merge one Missevan peak rank snapshot into the long-lived trend payload."""
+    payload = current if isinstance(current, dict) else {}
+    dates = {str(value) for value in (payload.get("dates") or []) if value not in (None, "")}
+    pruned = {str(value) for value in pruned_dates if value not in (None, "")}
+    dates.difference_update(pruned)
+    dates.add(history_date)
+
+    series_payload: dict[str, dict] = {}
+    for name, entry in (payload.get("series") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        samples = {
+            str(date_key): sample
+            for date_key, sample in (entry.get("samples") or {}).items()
+            if str(date_key) not in pruned
+        }
+        if not samples:
+            continue
+        copied = dict(entry)
+        copied["name"] = str(copied.get("name") or name)
+        copied["samples"] = samples
+        series_payload[str(name)] = copied
+
+    peak_rank = (store.get("missevan", {}).get("ranks") or {}).get("peak") or {}
+    fetched_at = peak_rank.get("fetched_at") or generated_at
+    for position, item in enumerate(peak_rank.get("items") or [], 1):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        entry = series_payload.get(name, {"name": name, "samples": {}})
+        entry["name"] = name
+        entry["dramaIds"] = [str(value) for value in (item.get("dramaIds") or item.get("drama_ids") or [])]
+        entry["cvs"] = [str(value) for value in (item.get("cvs") or [])]
+        entry["cover"] = item.get("cover", "")
+        view_count = item.get("view_count")
+        entry.setdefault("samples", {})
+        entry["samples"][history_date] = {
+            "view_count": None if view_count is None else safe_int(view_count),
+            "position": position,
+            "fetched_at": fetched_at,
+        }
+        series_payload[name] = entry
+
+    return {
+        "version": 1,
+        "platform": "missevan",
+        "rank": "peak",
+        "metric": "view_count",
+        "updated_at": generated_at,
+        "dates": sorted(dates),
+        "series": series_payload,
+    }
+
+
+def upload_missevan_peak_trend(
+    store: dict,
+    *,
+    history_date: str,
+    generated_at: str,
+    pruned_dates: list[str] | tuple[str, ...] | set[str] = (),
+) -> dict:
+    current = _load_upstash_json(PEAK_TREND_KEY)
+    payload = build_missevan_peak_trend_payload(
+        current if isinstance(current, dict) else None,
+        store,
+        history_date,
+        generated_at,
+        pruned_dates=pruned_dates,
+    )
+    encoded = json.dumps(payload, ensure_ascii=False)
+    result = upstash_request(["SET", PEAK_TREND_KEY, encoded])
+    if result != "OK":
+        raise RuntimeError(f"Failed to upload {PEAK_TREND_KEY}: {result!r}")
+    print(f"[ok] uploaded {PEAK_TREND_KEY} ({len(encoded)} bytes, date={history_date})")
+    return payload
+
+
+def _history_date_from_store_meta(store: dict) -> tuple[str, str]:
+    updated_at = str((store.get("_meta") or {}).get("updated_at") or now_iso())
+    try:
+        parsed = datetime.fromisoformat(updated_at)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(LOCAL_TIMEZONE).date().isoformat(), updated_at
+    except ValueError:
+        return updated_at[:10], updated_at
+
+
+def backfill_missevan_peak_trend_from_latest() -> str:
+    latest = _load_upstash_json("ranks:latest")
+    if not isinstance(latest, dict):
+        raise RuntimeError("Unable to load ranks:latest for peak trend backfill.")
+    history_date, generated_at = _history_date_from_store_meta(latest)
+    upload_missevan_peak_trend(
+        latest,
+        history_date=history_date,
+        generated_at=generated_at,
+        pruned_dates=(),
+    )
+    return history_date
+
+
 def build_rank_history_payloads(
     store: dict,
     *,
@@ -593,6 +707,13 @@ def upload_rank_history(
         result = upstash_request(["SET", key, payload])
         if result != "OK":
             raise RuntimeError(f"Failed to upload {key}: {result!r}")
+    if "missevan" in platforms:
+        upload_missevan_peak_trend(
+            store,
+            history_date=history_date,
+            generated_at=generated_at,
+            pruned_dates=pruned_dates,
+        )
     for old_date in pruned_dates:
         for platform in PLATFORMS:
             upstash_request(["DEL", f"ranks:list:{old_date}:{platform}"])
@@ -1768,10 +1889,17 @@ def main() -> None:
     parser.add_argument("--benchmark-output", default="manbo_huixin_danmaku_benchmark.json", help="Path for Manbo benchmark JSON output")
     parser.add_argument("--benchmark-page-concurrency", type=int, default=MANBO_DANMAKU_PAGE_CONCURRENCY, help="Global page concurrency for Manbo benchmark")
     parser.add_argument("--benchmark-page-size", type=int, default=MANBO_DANMAKU_PAGE_SIZE, help="Page size for Manbo benchmark")
+    parser.add_argument("--backfill-missevan-peak-trend-from-latest", action="store_true", help="Backfill Missevan peak view-count trend from ranks:latest")
     platform_group = parser.add_mutually_exclusive_group()
     platform_group.add_argument("--missevan-only", action="store_true", help="Only process Missevan")
     platform_group.add_argument("--manbo-only", action="store_true", help="Only process Manbo")
     args = parser.parse_args()
+
+    if args.backfill_missevan_peak_trend_from_latest:
+        print("=== Backfilling Missevan peak trend from ranks:latest ===")
+        history_date = backfill_missevan_peak_trend_from_latest()
+        print(f"[ok] backfilled {PEAK_TREND_KEY} for {history_date}")
+        return
 
     if args.benchmark_manbo_danmaku:
         print("=== Manbo paid danmaku benchmark ===")

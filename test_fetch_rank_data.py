@@ -13,7 +13,22 @@ class RankPartialUploadTests(unittest.TestCase):
         return {
             "_meta": {"updated_at": "2026-04-27T00:00:00+00:00"},
             "missevan": {
-                "ranks": {"new_daily": {"name": "新品日榜", "items": ["101"]}},
+                "ranks": {
+                    "new_daily": {"name": "新品日榜", "items": ["101"]},
+                    "peak": {
+                        "name": "巅峰榜",
+                        "fetched_at": "2026-04-27T00:00:00+00:00",
+                        "items": [
+                            {
+                                "name": "魔道祖师",
+                                "view_count": 722137429,
+                                "cover": "https://example.test/modao.jpg",
+                                "cvs": ["路知行", "魏超"],
+                                "dramaIds": ["15861", "19059", "22602"],
+                            }
+                        ],
+                    },
+                },
                 "dramas": {"101": {"name": "猫耳剧", "view_count": 10}},
             },
             "manbo": {
@@ -37,6 +52,120 @@ class RankPartialUploadTests(unittest.TestCase):
                 "ranks:metrics:2026-04-27:missevan",
             },
         )
+
+    def test_peak_trend_payload_uses_name_as_series_key(self) -> None:
+        payload = ranks.build_missevan_peak_trend_payload(
+            None,
+            self.sample_store(),
+            "2026-04-27",
+            "2026-04-27T00:00:00+00:00",
+            pruned_dates=[],
+        )
+
+        self.assertEqual(payload["dates"], ["2026-04-27"])
+        self.assertIn("魔道祖师", payload["series"])
+        self.assertEqual(
+            payload["series"]["魔道祖师"],
+            {
+                "name": "魔道祖师",
+                "dramaIds": ["15861", "19059", "22602"],
+                "cvs": ["路知行", "魏超"],
+                "cover": "https://example.test/modao.jpg",
+                "samples": {
+                    "2026-04-27": {
+                        "view_count": 722137429,
+                        "position": 1,
+                        "fetched_at": "2026-04-27T00:00:00+00:00",
+                    }
+                },
+            },
+        )
+
+    def test_peak_trend_payload_prunes_old_samples_and_empty_series(self) -> None:
+        current = {
+            "version": 1,
+            "platform": "missevan",
+            "rank": "peak",
+            "metric": "view_count",
+            "updated_at": "2026-04-26T00:00:00+00:00",
+            "dates": ["2026-04-25", "2026-04-26"],
+            "series": {
+                "旧剧": {
+                    "name": "旧剧",
+                    "samples": {"2026-04-25": {"view_count": 1, "position": 1, "fetched_at": "old"}},
+                },
+                "魔道祖师": {
+                    "name": "魔道祖师",
+                    "samples": {"2026-04-26": {"view_count": 2, "position": 1, "fetched_at": "old"}},
+                },
+            },
+        }
+
+        payload = ranks.build_missevan_peak_trend_payload(
+            current,
+            self.sample_store(),
+            "2026-04-27",
+            "2026-04-27T00:00:00+00:00",
+            pruned_dates=["2026-04-25"],
+        )
+
+        self.assertEqual(payload["dates"], ["2026-04-26", "2026-04-27"])
+        self.assertNotIn("旧剧", payload["series"])
+        self.assertEqual(set(payload["series"]["魔道祖师"]["samples"]), {"2026-04-26", "2026-04-27"})
+
+    def test_upload_history_sets_peak_trend_for_missevan(self) -> None:
+        commands = []
+
+        def fake_upstash(command):
+            commands.append(command)
+            if command[0] == "EVAL":
+                return json.dumps([])
+            if command[0] == "GET" and command[1] == ranks.PEAK_TREND_KEY:
+                return None
+            return "OK"
+
+        with patch.object(ranks, "upstash_request", side_effect=fake_upstash):
+            ranks.upload_rank_history(self.sample_store(), platforms=("missevan",))
+
+        set_keys = [command[1] for command in commands if command[0] == "SET"]
+        self.assertIn(ranks.PEAK_TREND_KEY, set_keys)
+
+    def test_upload_history_skips_peak_trend_for_manbo_only(self) -> None:
+        commands = []
+
+        def fake_upstash(command):
+            commands.append(command)
+            if command[0] == "EVAL":
+                return json.dumps([])
+            return "OK"
+
+        with patch.object(ranks, "upstash_request", side_effect=fake_upstash):
+            ranks.upload_rank_history(self.sample_store(), platforms=("manbo",))
+
+        set_keys = [command[1] for command in commands if command[0] == "SET"]
+        self.assertNotIn(ranks.PEAK_TREND_KEY, set_keys)
+
+    def test_backfill_peak_trend_from_latest_uses_latest_meta_date(self) -> None:
+        commands = []
+        latest_store = self.sample_store()
+        latest_store["_meta"]["updated_at"] = "2026-05-03T00:25:06.341077+00:00"
+
+        def fake_upstash(command):
+            commands.append(command)
+            if command[0] == "GET" and command[1] == "ranks:latest":
+                return json.dumps(latest_store)
+            if command[0] == "GET" and command[1] == ranks.PEAK_TREND_KEY:
+                return None
+            return "OK"
+
+        with patch.object(ranks, "upstash_request", side_effect=fake_upstash):
+            history_date = ranks.backfill_missevan_peak_trend_from_latest()
+
+        self.assertEqual(history_date, "2026-05-02")
+        trend_sets = [command for command in commands if command[0] == "SET" and command[1] == ranks.PEAK_TREND_KEY]
+        self.assertEqual(len(trend_sets), 1)
+        payload = json.loads(trend_sets[0][2])
+        self.assertEqual(payload["dates"], ["2026-05-02"])
 
     def test_metric_payload_preserves_display_and_metadata_fields(self) -> None:
         store = self.sample_store()
