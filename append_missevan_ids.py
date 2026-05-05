@@ -5,6 +5,7 @@ import sys
 from cvid_map_tools import update_combined_cvid_map
 from platform_sync import load_json, MANBO_INFO_PATH, MISSEVAN_INFO_PATH
 from refresh_platform_metadata import upsert_missevan_drama_ids
+from sync_new_drama_ids import MISSEVAN_INFO_KEY, ROOT, download_info_file, load_env_file, merge_and_upload_info_file
 
 
 def main(argv: list[str]) -> int:
@@ -12,6 +13,8 @@ def main(argv: list[str]) -> int:
     if not drama_ids:
         print("Usage: python append_missevan_ids.py <drama_id> [<drama_id> ...]")
         return 1
+    load_env_file(ROOT / ".env")
+    download_info_file(MISSEVAN_INFO_KEY, MISSEVAN_INFO_PATH)
     stats = upsert_missevan_drama_ids(drama_ids, force=True)
     map_stats = update_combined_cvid_map(
         load_json(MISSEVAN_INFO_PATH, {}),
@@ -19,6 +22,7 @@ def main(argv: list[str]) -> int:
         missevan_drama_ids=set(drama_ids),
         manbo_drama_ids=set(),
     )
+    merge_and_upload_info_file(MISSEVAN_INFO_KEY, MISSEVAN_INFO_PATH, drama_ids)
     print("猫耳 metadata updated:", stats["processed"])
     print("猫耳 requests:", stats["request_count"])
     print("猫耳 backoff seconds:", stats["last_backoff_seconds"])

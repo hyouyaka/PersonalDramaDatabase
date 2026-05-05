@@ -5,6 +5,7 @@ import sys
 from cvid_map_tools import update_combined_cvid_map
 from platform_sync import load_json, MANBO_INFO_PATH, MISSEVAN_INFO_PATH
 from refresh_platform_metadata import upsert_manbo_drama_ids
+from sync_new_drama_ids import MANBO_INFO_KEY, ROOT, download_info_file, load_env_file, merge_and_upload_info_file
 
 
 def main(argv: list[str]) -> int:
@@ -12,6 +13,8 @@ def main(argv: list[str]) -> int:
     if not drama_ids:
         print("Usage: python append_manbo_ids.py <drama_id> [<drama_id> ...]")
         return 1
+    load_env_file(ROOT / ".env")
+    download_info_file(MANBO_INFO_KEY, MANBO_INFO_PATH)
     target_drama_ids = set(drama_ids)
     stats = upsert_manbo_drama_ids(drama_ids, force=True)
     manbo_store = load_json(MANBO_INFO_PATH, {"records": []})
@@ -27,6 +30,7 @@ def main(argv: list[str]) -> int:
         missevan_drama_ids=set(),
         manbo_drama_ids=target_drama_ids,
     )
+    merge_and_upload_info_file(MANBO_INFO_KEY, MANBO_INFO_PATH, drama_ids)
     print("漫播 processed:", stats["processed"])
     print("漫播 watch counts updated:", stats["processed"])
     print("漫播 mainCvNames synced:", synced_main_cv_names)

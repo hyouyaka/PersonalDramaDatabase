@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import html
 import re
 import sqlite3
 from copy import deepcopy
+from urllib.parse import quote
 
 from clean_manbo_pricing import MANBO_PRICING_EXCLUSIONS, classify_manbo_pricing
-from cvid_map_tools import load_combined_map
+from cvid_map_tools import load_combined_map, save_combined_map
 from platform_sync import (
     GENRE_BY_TYPE,
     MANBO_CATALOG_NAME_ALIASES,
@@ -25,10 +27,12 @@ from platform_sync import (
     first_main_episode_sound_id,
     finalize_missevan_store,
     infer_type_from_labels,
+    is_narrator_role,
     iter_missevan_nodes,
     load_cache,
     load_json,
     normalize,
+    normalize_match,
     pick_first_episode_month,
     preferred_sound_id,
     request_manbo_json,
@@ -47,6 +51,10 @@ from platform_sync import (
 
 MISSEVAN_BLOCKLIST = {"47639", "25812"}
 MISSEVAN_ARCHIVED_INFO_PATH = MISSEVAN_INFO_PATH.with_name("missevan-archived-drama.json")
+MISSEVAN_INTRO_CV_SECTION_PATTERN = re.compile(r"^(?:[=＝\-\s]*)?(?:配音组|配音|CAST|CV)(?:[=＝\-\s]*|[：:])*$", re.I)
+MISSEVAN_INTRO_SECTION_PATTERN = re.compile(r"^(?:[=＝\-\s]*)?(?:[^：:]{1,20}(?:组|制作|字幕|参与配音)|(?:[^：:]{0,20})staff)(?:[=＝\-\s]*|[：:]\s*)?$", re.I)
+MISSEVAN_INTRO_ROLE_CV_PATTERN = re.compile(r"^(?P<role>[^：:\n]{1,40})[：:](?P<cv>.+)$")
+MISSEVAN_CV_SUFFIX_PATTERN = re.compile(r"\s*(?:@|＠|【|\[|（|\(|<|《).*$")
 MANBO_CATALOG_OVERRIDES = {
     "奇洛李维斯回信": {"catalog": 5, "catalogName": "有声剧"},
 }
@@ -253,6 +261,208 @@ def _missevan_cv_maps(main_entries: list[dict], missevan_cv_name_map: dict[int, 
         if entry["role_name"]:
             cvroles[cv_id] = entry["role_name"]
     return cvroles, cvnames
+
+
+def missevan_intro_text_lines(intro: object) -> list[str]:
+    text = str(intro or "")
+    if not text:
+        return []
+    text = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", text)
+    text = re.sub(r"(?i)</\s*p\s*>", "\n", text)
+    text = re.sub(r"(?i)<\s*p(?:\s+[^>]*)?>", "\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text)
+    return [normalize(line) for line in re.split(r"[\r\n]+", text) if normalize(line)]
+
+
+def clean_missevan_intro_cv_name(value: object) -> str:
+    name = normalize(value)
+    if not name:
+        return ""
+    name = MISSEVAN_CV_SUFFIX_PATTERN.sub("", name)
+    name = re.split(r"[、，,；;]\s*", name, maxsplit=1)[0]
+    return normalize(name)
+
+
+def is_missevan_intro_narrator_role(role_name: object) -> bool:
+    role = normalize(role_name)
+    if is_narrator_role(role):
+        return True
+    parts = [normalize(part) for part in re.split(r"[/／、，,\s]+", role) if normalize(part)]
+    return bool(parts) and all(is_narrator_role(part) for part in parts)
+
+
+def extract_missevan_intro_cv_candidates(intro: object, *, limit: int = 2) -> list[dict]:
+    lines = missevan_intro_text_lines(intro)
+    candidates: list[dict] = []
+    in_cv_section = False
+    for line in lines:
+        if MISSEVAN_INTRO_CV_SECTION_PATTERN.match(line):
+            in_cv_section = True
+            continue
+        if not in_cv_section:
+            continue
+        if line.startswith("参与配音") or (
+            MISSEVAN_INTRO_SECTION_PATTERN.match(line) and not MISSEVAN_INTRO_CV_SECTION_PATTERN.match(line)
+        ):
+            break
+        match = MISSEVAN_INTRO_ROLE_CV_PATTERN.match(line)
+        if not match:
+            continue
+        role_name = normalize(match.group("role"))
+        if is_missevan_intro_narrator_role(role_name):
+            continue
+        display_name = clean_missevan_intro_cv_name(match.group("cv"))
+        if not display_name:
+            continue
+        if any(item["display_name"] == display_name for item in candidates):
+            continue
+        candidates.append({"role_name": role_name, "display_name": display_name})
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
+def missevan_cv_id_from_combined_map(display_name: str, combined_map: dict) -> tuple[int | None, str]:
+    norm = normalize_match(display_name)
+    matches: list[tuple[int, str]] = []
+    for key, payload in (combined_map or {}).items():
+        candidates = [key, payload.get("displayName"), *(payload.get("aliases") or [])]
+        if norm not in {normalize_match(candidate) for candidate in candidates if normalize_match(candidate)}:
+            continue
+        cv_id = payload.get("missevanCvId") or payload.get("cvId")
+        if cv_id in (None, ""):
+            continue
+        mapped_name = normalize(payload.get("displayName") or key or display_name)
+        matches.append((int(cv_id), mapped_name))
+    unique = {(cv_id, name) for cv_id, name in matches}
+    if len(unique) == 1:
+        return next(iter(unique))
+    return None, ""
+
+
+def search_missevan_cv(name: str, requester: MissevanRequester) -> dict | None:
+    query = quote(normalize(name))
+    if not query:
+        return None
+    payload = requester.request_json(f"https://www.missevan.com/sound/getsearch?s={query}&type=4&p=1&page_size=20")
+    rows = ((payload or {}).get("info") or {}).get("Datas") or []
+    exact_rows = [row for row in rows if normalize_match(row.get("name")) == normalize_match(name)]
+    candidates = exact_rows or rows
+    if len(candidates) != 1:
+        return None
+    candidate = candidates[0] or {}
+    cv_id = candidate.get("id")
+    display_name = normalize(candidate.get("name"))
+    if cv_id in (None, "") or not display_name:
+        return None
+    return {"cv_id": int(cv_id), "display_name": display_name}
+
+
+def upsert_missevan_cv_map_entry(combined_map: dict, display_name: str, cv_id: int) -> None:
+    key = normalize(display_name)
+    if not key:
+        return
+    payload = dict(combined_map.get(key) or {})
+    existing = payload.get("missevanCvId") or payload.get("cvId")
+    if existing not in (None, "") and int(existing) != int(cv_id):
+        return
+    payload["cvId"] = int(cv_id)
+    payload["missevanCvId"] = int(cv_id)
+    payload.setdefault("manboCvId", None)
+    payload["displayName"] = normalize(payload.get("displayName") or key)
+    payload["aliases"] = [normalize(alias) for alias in (payload.get("aliases") or []) if normalize(alias) and normalize(alias) != key]
+    payload.setdefault("source", "missevan_intro_search")
+    payload["updatedAt"] = utc_now()
+    payload.setdefault("notes", "")
+    combined_map[key] = payload
+
+
+def apply_missevan_intro_cv_fallback(
+    node: dict,
+    drama_id: str,
+    candidates: list[dict],
+    *,
+    combined_map: dict | None = None,
+    search_cv=None,
+    update_combined_map: bool = True,
+) -> dict:
+    if not candidates:
+        return node
+    active_map = load_combined_map() if combined_map is None else combined_map
+    search_func = search_cv
+    updated_node = dict(node)
+    resolved_entries: list[dict] = []
+    unresolved_names: list[str] = []
+    unresolved_roles: dict[str, str] = {}
+    changed_map = False
+
+    for idx, candidate in enumerate(candidates):
+        display_name = normalize(candidate.get("display_name"))
+        role_name = normalize(candidate.get("role_name"))
+        if not display_name:
+            continue
+        cv_id, mapped_name = missevan_cv_id_from_combined_map(display_name, active_map)
+        final_name = mapped_name or display_name
+        if cv_id is None and search_func is not None:
+            found = search_func(display_name)
+            if found:
+                cv_id = int(found["cv_id"])
+                final_name = normalize(found.get("display_name") or display_name)
+                if update_combined_map:
+                    upsert_missevan_cv_map_entry(active_map, final_name, cv_id)
+                    changed_map = True
+        if cv_id is None:
+            if display_name not in unresolved_names:
+                unresolved_names.append(display_name)
+                if role_name:
+                    unresolved_roles[display_name] = role_name
+            continue
+        resolved_entries.append(
+            {
+                "index": idx,
+                "cv_id": int(cv_id),
+                "display_name": final_name,
+                "role_name": role_name,
+                "raw_role_name": role_name,
+            }
+        )
+
+    if resolved_entries:
+        updated_node["maincvs"] = [int(entry["cv_id"]) for entry in resolved_entries]
+        cvroles, cvnames = _missevan_cv_maps(resolved_entries, _get_missevan_cv_name_map())
+        updated_node["cvnames"] = cvnames
+        updated_node["cvroles"] = cvroles
+    if unresolved_names:
+        updated_node["fallbackCvNames"] = unresolved_names
+        updated_node["fallbackCvRoles"] = unresolved_roles
+    else:
+        updated_node.pop("fallbackCvNames", None)
+        updated_node.pop("fallbackCvRoles", None)
+    if changed_map and update_combined_map:
+        save_combined_map(active_map)
+    return updated_node
+
+
+def sound_infos_have_cvs(*sound_infos: dict) -> bool:
+    return any(bool((info or {}).get("cvs")) for info in sound_infos)
+
+
+def fetch_missevan_intro_cv_candidates(requester: MissevanRequester, sound_ids: list[str]) -> list[dict]:
+    out: list[dict] = []
+    seen_names: set[str] = set()
+    for sound_id in sound_ids:
+        payload = requester.request_json(f"https://www.missevan.com/sound/getsound?soundid={sound_id}")
+        intro = (((payload or {}).get("info") or {}).get("sound") or {}).get("intro")
+        for candidate in extract_missevan_intro_cv_candidates(intro):
+            display_name = normalize(candidate.get("display_name"))
+            if not display_name or display_name in seen_names:
+                continue
+            seen_names.add(display_name)
+            out.append(candidate)
+            if len(out) >= 2:
+                return out
+    return out
 
 
 def build_missevan_base_node(info: dict, drama_type: int | None) -> tuple[dict, list[dict]]:
@@ -543,6 +753,27 @@ def refresh_missevan(*, target_drama_ids: set[str] | None = None, force: bool = 
         else:
             updated_node = apply_missevan_merged_sound_maincvs(updated_node, drama_id, base_entries, maincv_preview_sound_infos) if used_preview_sound else updated_node
             updated_node = apply_missevan_sound_maincvs(updated_node, drama_id, base_entries, episode_sound_info)
+        should_try_intro_cv_fallback = (
+            not (updated_node.get("maincvs") or [])
+            and not (info.get("cvs") or [])
+            and not sound_infos_have_cvs(sound_info, *preview_sound_infos, episode_sound_info)
+            and bool(preview_sound_id_list)
+        )
+        if should_try_intro_cv_fallback:
+            try:
+                intro_candidates = fetch_missevan_intro_cv_candidates(requester, preview_sound_id_list)
+                updated_node = apply_missevan_intro_cv_fallback(
+                    updated_node,
+                    drama_id,
+                    intro_candidates,
+                    search_cv=lambda cv_name: search_missevan_cv(cv_name, requester),
+                )
+            except RuntimeError:
+                save_missevan_store(MISSEVAN_INFO_PATH, store)
+                save_json(MISSEVAN_ARCHIVED_INFO_PATH, archive)
+                if update_counts:
+                    save_cache(MISSEVAN_COUNTS_PATH, cache)
+                raise
         updated_node["createTime"] = create_month
 
         catalog = updated_node.get("catalog")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
@@ -117,6 +118,12 @@ def upload_json_file(key: str, path: Path) -> None:
     print(f"[ok] uploaded {path.name} -> {key}")
 
 
+def write_info_payload(path: Path, payload: object) -> str:
+    value = json.dumps(payload, ensure_ascii=False, indent=2)
+    path.write_text(value, encoding="utf-8")
+    return value
+
+
 def count_info_payload(key: str, payload: object) -> int | None:
     if key == MISSEVAN_INFO_KEY and isinstance(payload, dict):
         return len(payload)
@@ -211,6 +218,67 @@ def build_manbo_index(store: dict) -> dict[str, dict]:
     return indexed
 
 
+def merge_missevan_info_for_ids(remote_store: dict, local_store: dict, drama_ids: list[str]) -> dict:
+    merged = dict(remote_store)
+    local_index = build_missevan_index(local_store)
+    for drama_id in normalize_ids(drama_ids):
+        record = local_index.get(drama_id)
+        if record is None:
+            print(f"[warn] no local 猫耳 record to upload for dramaId={drama_id}")
+            continue
+        merged[drama_id] = record
+    return merged
+
+
+def merge_manbo_info_for_ids(remote_store: dict, local_store: dict, drama_ids: list[str]) -> dict:
+    merged = dict(remote_store)
+    records = list(remote_store.get("records") or [])
+    local_index = build_manbo_index(local_store)
+    position_by_id = {
+        normalize(record.get("dramaId")): idx
+        for idx, record in enumerate(records)
+        if isinstance(record, dict) and normalize(record.get("dramaId"))
+    }
+    for drama_id in normalize_ids(drama_ids):
+        record = local_index.get(drama_id)
+        if record is None:
+            print(f"[warn] no local 漫播 record to upload for dramaId={drama_id}")
+            continue
+        idx = position_by_id.get(drama_id)
+        if idx is None:
+            position_by_id[drama_id] = len(records)
+            records.append(record)
+        else:
+            records[idx] = record
+    merged["records"] = records
+    return merged
+
+
+def merge_info_payload_for_ids(key: str, remote_store: object, local_store: object, drama_ids: list[str]) -> object:
+    if key == MISSEVAN_INFO_KEY:
+        if not isinstance(remote_store, dict) or not isinstance(local_store, dict):
+            raise RuntimeError(f"{key} must be a JSON object.")
+        return merge_missevan_info_for_ids(remote_store, local_store, drama_ids)
+    if key == MANBO_INFO_KEY:
+        if not isinstance(remote_store, dict) or not isinstance(local_store, dict):
+            raise RuntimeError(f"{key} must be a JSON object.")
+        return merge_manbo_info_for_ids(remote_store, local_store, drama_ids)
+    raise RuntimeError(f"Unsupported info key for merge upload: {key}")
+
+
+def merge_and_upload_info_file(key: str, path: Path, drama_ids: list[str]) -> None:
+    latest_remote = decode_remote_info_payload(key, upstash_request(["GET", key]))
+    assert_info_download_is_safe(key, latest_remote)
+    local_payload = load_json(path, {})
+    merged = merge_info_payload_for_ids(key, latest_remote, local_payload, drama_ids)
+    value = write_info_payload(path, merged)
+    assert_info_upload_is_safe(key, value, path)
+    result = upstash_request(["SET", key, value])
+    if result != "OK":
+        raise RuntimeError(f"Failed to upload merged {path.name} to {key}: {result!r}")
+    print(f"[ok] merged and uploaded {path.name} -> {key}")
+
+
 def is_missevan_ready(record: dict | None) -> bool:
     if not record:
         return False
@@ -278,7 +346,51 @@ def save_queue(queue: dict[str, list[str]]) -> None:
     )
 
 
-def main() -> int:
+def rank_backfill_platforms(missevan_ids: list[str], manbo_ids: list[str]) -> tuple[str, ...]:
+    platforms: list[str] = []
+    if missevan_ids:
+        platforms.append("missevan")
+    if manbo_ids:
+        platforms.append("manbo")
+    return tuple(platforms)
+
+
+def backfill_rank_metadata(platforms: tuple[str, ...]) -> None:
+    if not platforms:
+        print("[skip] rank backfill: no platforms")
+        return
+
+    import fetch_rank_data as ranks
+
+    print(f"=== Backfilling rank metadata ({', '.join(platforms)}) ===")
+    store = ranks.load_initial_rank_store()
+    store.setdefault("_meta", {})
+    store.setdefault("missevan", {"ranks": {}, "dramas": {}})
+    store.setdefault("manbo", {"ranks": {}, "dramas": {}})
+    store["missevan"].setdefault("ranks", {})
+    store["missevan"].setdefault("dramas", {})
+    store["manbo"].setdefault("ranks", {})
+    store["manbo"].setdefault("dramas", {})
+    ranks.sanitize_rank_store(store)
+    ranks.lookup_cvs(store)
+    store["_meta"]["updated_at"] = ranks.now_iso()
+    ranks.save_json(ranks.RANKS_PATH, store)
+    ranks.upload_rank_outputs(store, platforms)
+    print("[ok] backfilled rank metadata")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Sync queued new drama IDs into platform info stores")
+    parser.add_argument(
+        "--backfill-ranks",
+        action="store_true",
+        help="After syncing info stores, backfill rank metadata from the latest info stores",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args([] if argv is None else argv)
     configure_stdio()
     load_env_file(ROOT / ".env")
     queue = load_queue()
@@ -294,11 +406,13 @@ def main() -> int:
     run_script("append_manbo_ids.py", manbo_ids)
     run_script("append_missevan_ids.py", missevan_ids)
 
-    upload_json_file(MANBO_INFO_KEY, MANBO_INFO_PATH)
-    upload_json_file(MISSEVAN_INFO_KEY, MISSEVAN_INFO_PATH)
+    merge_and_upload_info_file(MANBO_INFO_KEY, MANBO_INFO_PATH, manbo_ids)
+    merge_and_upload_info_file(MISSEVAN_INFO_KEY, MISSEVAN_INFO_PATH, missevan_ids)
 
     remaining_queue = prune_queue(queue)
     save_queue(remaining_queue)
+    if args.backfill_ranks:
+        backfill_rank_metadata(rank_backfill_platforms(missevan_ids, manbo_ids))
     print(
         "[done]",
         json.dumps(
@@ -315,4 +429,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
