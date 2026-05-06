@@ -907,16 +907,6 @@
     "updatedAt": "2026-04-06T06:21:09+00:00",
     "notes": ""
   },
-  "机智少年Cifer🎧单向波形": {
-    "cvId": null,
-    "missevanCvId": null,
-    "manboCvId": 2683122741261,
-    "displayName": "机智少年Cifer🎧单向波形",
-    "aliases": [],
-    "source": "merged",
-    "updatedAt": "2026-04-06T06:21:09+00:00",
-    "notes": ""
-  },
   "李兰陵": {
     "cvId": 1776,
     "missevanCvId": 1776,
@@ -4416,11 +4406,13 @@
   "Cifer": {
     "cvId": 1318,
     "missevanCvId": 1318,
-    "manboCvId": null,
+    "manboCvId": 2683122741261,
     "displayName": "Cifer",
-    "aliases": [],
+    "aliases": [
+      "机智少年Cifer🎧单向波形"
+    ],
     "source": "observed",
-    "updatedAt": "2026-04-06T06:21:09+00:00",
+    "updatedAt": "2026-05-06T04:40:37+00:00",
     "notes": ""
   },
   "枫茗": {
