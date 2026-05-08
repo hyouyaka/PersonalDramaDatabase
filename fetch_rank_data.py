@@ -202,22 +202,12 @@ return payload
     )
 
 
-def upload_ranks(store: dict) -> None:
-    """Upload ranks store to Upstash under the 'ranks' key."""
-    payload = json.dumps(store, ensure_ascii=False)
-    result = upstash_request(["SET", "ranks", payload])
-    if result != "OK":
-        raise RuntimeError(f"Failed to upload ranks: {result!r}")
-    print(f"[ok] uploaded ranks to Upstash ({len(payload)} bytes)")
-
-
 def upload_full_ranks(store: dict) -> None:
-    """Upload complete merged ranks under all full-rank keys."""
+    """Upload complete merged ranks under the latest full-rank key."""
     payload = json.dumps(store, ensure_ascii=False)
-    for key in ("ranks", "ranks:latest"):
-        result = upstash_request(["SET", key, payload])
-        if result != "OK":
-            raise RuntimeError(f"Failed to upload {key}: {result!r}")
+    result = upstash_request(["SET", "ranks:latest", payload])
+    if result != "OK":
+        raise RuntimeError(f"Failed to upload ranks:latest: {result!r}")
     print(f"[ok] uploaded merged ranks to Upstash ({len(payload)} bytes)")
 
 
@@ -271,11 +261,8 @@ def load_rank_partial(platform: str) -> dict | None:
 
 
 def load_remote_full_ranks() -> dict | None:
-    for key in ("ranks", "ranks:latest"):
-        payload = decode_upstash_json(upstash_request(["GET", key]))
-        if isinstance(payload, dict):
-            return payload
-    return None
+    payload = decode_upstash_json(upstash_request(["GET", "ranks:latest"]))
+    return payload if isinstance(payload, dict) else None
 
 
 def merge_rank_partials(
