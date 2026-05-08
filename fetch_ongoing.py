@@ -187,7 +187,7 @@ def parse_missevan_timeline_weekly_records(payload: dict) -> list[dict[str, obje
         for drama in group.get("dramas") or []:
             if not isinstance(drama, dict):
                 continue
-            if safe_int(drama.get("pay_type"), -1) != 2:
+            if safe_int(drama.get("pay_type"), -1) == 0:
                 continue
             drama_id = drama.get("id")
             if drama_id not in (None, ""):
@@ -222,7 +222,7 @@ def fetch_missevan_weekly_records(
         for item in group:
             if not isinstance(item, dict):
                 continue
-            if "pay_type" in item and safe_int(item.get("pay_type"), -1) != 2:
+            if safe_int(item.get("pay_type"), -1) == 0:
                 continue
             drama_id = item.get("id")
             if drama_id not in (None, ""):
