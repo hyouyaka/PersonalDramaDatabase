@@ -21,8 +21,6 @@ dist/
 .eggs/
 
 # Test / coverage
-/test_*.py
-!/test_fetch_rank_data.py
 .pytest_cache/
 .coverage
 htmlcov/
