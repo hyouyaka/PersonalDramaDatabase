@@ -5372,5 +5372,35 @@
     "source": "observed",
     "updatedAt": "2026-05-01T05:41:54+00:00",
     "notes": ""
+  },
+  "BubbleFox_Official": {
+    "cvId": null,
+    "missevanCvId": null,
+    "manboCvId": 4211641143316,
+    "displayName": "BubbleFox_Official",
+    "aliases": [],
+    "source": "observed",
+    "updatedAt": "2026-05-08T08:42:24+00:00",
+    "notes": ""
+  },
+  "铃木达央": {
+    "cvId": 214,
+    "missevanCvId": 214,
+    "manboCvId": null,
+    "displayName": "铃木达央",
+    "aliases": [],
+    "source": "observed",
+    "updatedAt": "2026-05-08T08:44:35+00:00",
+    "notes": ""
+  },
+  "日野聪": {
+    "cvId": 89,
+    "missevanCvId": 89,
+    "manboCvId": null,
+    "displayName": "日野聪",
+    "aliases": [],
+    "source": "observed",
+    "updatedAt": "2026-05-08T08:44:35+00:00",
+    "notes": ""
   }
 }

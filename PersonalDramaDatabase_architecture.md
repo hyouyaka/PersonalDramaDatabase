@@ -59,7 +59,7 @@ flowchart LR
         V[fetch_ongoing.py] --> W[ongoing:missevan / ongoing:manbo]
         X[fetch_rank_data.py] --> Y[ranks:partial:*]
         X --> Z[ranks:list:* / ranks:metrics:* / ranks:index]
-        X --> AA[ranks / ranks:latest]
+        X --> AA[ranks:latest]
         W --> X
     end
 
@@ -344,7 +344,7 @@ flowchart LR
 - `ranks:list:{date}:{platform}`：按天存榜单列表历史
 - `ranks:metrics:{date}:{platform}`：按天存 drama metrics 历史
 - `ranks:index`：历史日期索引，默认保留 90 天
-- `ranks` 与 `ranks:latest`：合并后的完整最新 store
+- `ranks:latest`：合并后的完整最新 store
 
 这个脚本还支持：
 
@@ -399,7 +399,7 @@ GUI 现在不是一个简单 launcher，而是一个桌面工作台：
 
 1. `fetch_ongoing.py` 更新 `ongoing:*`
 2. `fetch_rank_data.py` 抓取榜单、详情、弹幕统计
-3. 本地 `ranks.json` 与 Upstash `ranks:*`/`ranks`/`ranks:latest` 同步刷新
+3. 本地 `ranks.json` 与 Upstash `ranks:*`/`ranks:latest` 同步刷新
 
 这里 ongoing 的作用不是单独出报表，而是给 rank pipeline 提供“保活 ID 集合”。
 
