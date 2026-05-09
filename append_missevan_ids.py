@@ -5,7 +5,14 @@ import sys
 from cvid_map_tools import update_combined_cvid_map
 from platform_sync import load_json, MANBO_INFO_PATH, MISSEVAN_INFO_PATH
 from refresh_platform_metadata import upsert_missevan_drama_ids
-from sync_new_drama_ids import MISSEVAN_INFO_KEY, ROOT, download_info_file, load_env_file, merge_and_upload_info_file
+from sync_new_drama_ids import (
+    MISSEVAN_INFO_KEY,
+    ROOT,
+    download_info_file,
+    load_env_file,
+    merge_and_upload_info_file,
+    upstash_request,
+)
 
 
 def main(argv: list[str]) -> int:
@@ -21,6 +28,8 @@ def main(argv: list[str]) -> int:
         load_json(MANBO_INFO_PATH, {"records": []}),
         missevan_drama_ids=set(drama_ids),
         manbo_drama_ids=set(),
+        remote=True,
+        upstash=upstash_request,
     )
     merge_and_upload_info_file(MISSEVAN_INFO_KEY, MISSEVAN_INFO_PATH, drama_ids)
     print("猫耳 metadata updated:", stats["processed"])

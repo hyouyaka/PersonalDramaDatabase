@@ -5,7 +5,14 @@ import sys
 from cvid_map_tools import update_combined_cvid_map
 from platform_sync import load_json, MANBO_INFO_PATH, MISSEVAN_INFO_PATH
 from refresh_platform_metadata import upsert_manbo_drama_ids
-from sync_new_drama_ids import MANBO_INFO_KEY, ROOT, download_info_file, load_env_file, merge_and_upload_info_file
+from sync_new_drama_ids import (
+    MANBO_INFO_KEY,
+    ROOT,
+    download_info_file,
+    load_env_file,
+    merge_and_upload_info_file,
+    upstash_request,
+)
 
 
 def main(argv: list[str]) -> int:
@@ -29,6 +36,8 @@ def main(argv: list[str]) -> int:
         manbo_store,
         missevan_drama_ids=set(),
         manbo_drama_ids=target_drama_ids,
+        remote=True,
+        upstash=upstash_request,
     )
     merge_and_upload_info_file(MANBO_INFO_KEY, MANBO_INFO_PATH, drama_ids)
     print("漫播 processed:", stats["processed"])

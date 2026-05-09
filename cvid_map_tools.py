@@ -5,6 +5,28 @@ from dataclasses import dataclass
 from platform_sync import COMBINED_CVID_MAP_PATH, iter_missevan_nodes, load_json, normalize, normalize_match, save_json, utc_now
 
 
+def load_remote_combined_map(*, upstash=None) -> dict[str, dict]:
+    from sync_new_drama_ids import CVID_MAP_KEY, load_remote_json_or_backup, upstash_request
+
+    payload = load_remote_json_or_backup(
+        CVID_MAP_KEY,
+        COMBINED_CVID_MAP_PATH,
+        None,
+        upstash=upstash or upstash_request,
+        upload_backup_if_missing=True,
+    )
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unable to load {CVID_MAP_KEY} from Upstash or local backup.")
+    return payload
+
+
+def save_remote_combined_map(data: dict[str, dict], *, upstash=None) -> None:
+    from sync_new_drama_ids import CVID_MAP_KEY, upload_json_payload, upstash_request
+
+    save_combined_map(data)
+    upload_json_payload(CVID_MAP_KEY, data, upstash=upstash or upstash_request)
+
+
 @dataclass
 class ObservedCV:
     platform: str
@@ -74,8 +96,10 @@ def update_combined_cvid_map(
     *,
     missevan_drama_ids: set[str] | None = None,
     manbo_drama_ids: set[str] | None = None,
+    remote: bool = False,
+    upstash=None,
 ) -> dict:
-    current = load_combined_map()
+    current = load_remote_combined_map(upstash=upstash) if remote else load_combined_map()
     now = utc_now()
     ambiguous: list[str] = []
     created = 0
@@ -182,7 +206,10 @@ def update_combined_cvid_map(
         register_indexes(key, payload)
         created += 1
 
-    save_combined_map(current)
+    if remote:
+        save_remote_combined_map(current, upstash=upstash)
+    else:
+        save_combined_map(current)
     return {
         "created": created,
         "updated": updated,

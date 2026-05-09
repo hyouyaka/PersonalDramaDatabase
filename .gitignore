@@ -45,6 +45,8 @@ PersonalDramaDatabase_architecture.md
 
 # Local JSON data snapshots
 /*.json
+/drama-series-info.json
+/missevan&manbo-cvid-map.json
 recovery_backups/
 backfill_vip_fields.py
 PersonalDramaDatabase_architecture.md

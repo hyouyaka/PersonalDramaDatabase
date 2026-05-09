@@ -10,18 +10,32 @@ from pathlib import Path
 
 import requests
 
-from platform_sync import MANBO_INFO_PATH, MISSEVAN_INFO_PATH, iter_missevan_nodes, load_json, normalize
+from platform_sync import (
+    COMBINED_CVID_MAP_PATH,
+    MANBO_INFO_PATH,
+    MISSEVAN_INFO_PATH,
+    SERIES_INFO_PATH,
+    iter_missevan_nodes,
+    load_json,
+    normalize,
+)
 
 
 ROOT = Path(__file__).resolve().parent
 QUEUE_KEY = "new:dramaIDs"
 MANBO_INFO_KEY = "manbo:info:v1"
 MISSEVAN_INFO_KEY = "missevan:info:v1"
+CVID_MAP_KEY = "cvid-map:v1"
+SERIES_INFO_KEY = "drama:series-info:v1"
 INFO_UPLOAD_MIN_COUNTS = {
     MISSEVAN_INFO_KEY: 100,
     MANBO_INFO_KEY: 50,
 }
 ALLOW_SMALL_INFO_UPLOAD_ENV = "ALLOW_SMALL_INFO_UPLOAD"
+
+
+class RemoteJsonMissing(RuntimeError):
+    pass
 
 
 def configure_stdio() -> None:
@@ -109,13 +123,26 @@ def run_script(script_name: str, drama_ids: list[str]) -> None:
         raise RuntimeError(f"{script_name} failed with exit code {return_code}")
 
 
-def upload_json_file(key: str, path: Path) -> None:
+def upload_json_file(key: str, path: Path, *, upstash=upstash_request) -> None:
     value = path.read_text(encoding="utf-8")
     assert_info_upload_is_safe(key, value, path)
-    result = upstash_request(["SET", key, value])
+    if key == CVID_MAP_KEY:
+        assert_cvid_map_upload_meets_remote_floor(json.loads(value), upstash=upstash)
+    result = upstash(["SET", key, value])
     if result != "OK":
         raise RuntimeError(f"Failed to upload {path.name} to {key}: {result!r}")
     print(f"[ok] uploaded {path.name} -> {key}")
+
+
+def upload_json_payload(key: str, payload: object, *, upstash=upstash_request) -> None:
+    value = json.dumps(payload, ensure_ascii=False)
+    assert_info_upload_is_safe(key, value, Path(key))
+    if key == CVID_MAP_KEY:
+        assert_cvid_map_upload_meets_remote_floor(payload, upstash=upstash)
+    result = upstash(["SET", key, value])
+    if result != "OK":
+        raise RuntimeError(f"Failed to upload payload to {key}: {result!r}")
+    print(f"[ok] uploaded payload -> {key}")
 
 
 def write_info_payload(path: Path, payload: object) -> str:
@@ -134,14 +161,47 @@ def count_info_payload(key: str, payload: object) -> int | None:
     return None
 
 
-def assert_info_upload_is_safe(key: str, value: str, path: Path) -> None:
-    minimum = INFO_UPLOAD_MIN_COUNTS.get(key)
-    if minimum is None or os.environ.get(ALLOW_SMALL_INFO_UPLOAD_ENV) == "1":
+def remote_json_count(key: str, *, upstash=upstash_request) -> int | None:
+    raw = upstash(["GET", key])
+    if raw in (None, ""):
+        return None
+    payload = decode_remote_json_payload(key, raw)
+    if isinstance(payload, dict):
+        return len(payload)
+    return None
+
+
+def assert_cvid_map_upload_meets_remote_floor(payload: object, *, upstash=upstash_request) -> None:
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Refusing to upload {CVID_MAP_KEY}: expected a JSON object.")
+    remote_count = remote_json_count(CVID_MAP_KEY, upstash=upstash)
+    if remote_count in (None, 0):
         return
+    minimum = (remote_count + 1) // 2
+    if len(payload) < minimum:
+        raise RuntimeError(
+            f"Refusing to upload {CVID_MAP_KEY}: {len(payload)} entries found, "
+            f"expected at least {minimum} (half of current remote count {remote_count})."
+        )
+
+
+def assert_info_upload_is_safe(key: str, value: str, path: Path) -> None:
     try:
         payload = json.loads(value)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Refusing to upload invalid JSON from {path.name} to {key}: {exc}") from exc
+    if key in (CVID_MAP_KEY, SERIES_INFO_KEY):
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Refusing to upload {path.name} to {key}: expected a JSON object.")
+        if not payload:
+            raise RuntimeError(f"Refusing to upload {path.name} to {key}: payload is empty.")
+        for item_key, item_value in payload.items():
+            if not isinstance(item_key, str) or not isinstance(item_value, dict):
+                raise RuntimeError(f"Refusing to upload {path.name} to {key}: unexpected payload shape.")
+        return
+    minimum = INFO_UPLOAD_MIN_COUNTS.get(key)
+    if minimum is None or os.environ.get(ALLOW_SMALL_INFO_UPLOAD_ENV) == "1":
+        return
     count = count_info_payload(key, payload)
     if count is None:
         raise RuntimeError(f"Refusing to upload {path.name} to {key}: unexpected info store shape.")
@@ -175,6 +235,10 @@ def assert_info_download_is_safe(key: str, payload: object) -> None:
 
 
 def backup_local_info_file(path: Path) -> Path | None:
+    return backup_local_json_file(path)
+
+
+def backup_local_json_file(path: Path) -> Path | None:
     if not path.exists():
         return None
     backup_dir = ROOT / "recovery_backups"
@@ -185,11 +249,72 @@ def backup_local_info_file(path: Path) -> Path | None:
     return backup_path
 
 
+def decode_remote_json_payload(key: str, raw: object) -> object:
+    if raw in (None, ""):
+        raise RemoteJsonMissing(f"{key} is empty or missing.")
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"{key} contains invalid JSON: {exc}") from exc
+    return raw
+
+
+def write_json_work_copy(path: Path, payload: object) -> Path | None:
+    backup_path = backup_local_json_file(path)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return backup_path
+
+
+def load_remote_json_or_backup(
+    key: str,
+    path: Path,
+    default: object,
+    *,
+    upstash=upstash_request,
+    upload_backup_if_missing: bool = False,
+    write_remote_to_local: bool = True,
+) -> object:
+    try:
+        raw = upstash(["GET", key])
+        payload = decode_remote_json_payload(key, raw)
+        if write_remote_to_local:
+            backup_path = write_json_work_copy(path, payload)
+            if backup_path is not None:
+                print(f"[backup] {path.name} -> {backup_path}")
+            print(f"[ok] downloaded {key} -> {path.name}")
+        return payload
+    except Exception as exc:
+        local_exists = path.exists()
+        if local_exists:
+            local_payload = load_json(path, default)
+            print(f"[local backup] using {path.name} for {key}: {exc}")
+            if upload_backup_if_missing and isinstance(exc, RemoteJsonMissing):
+                upload_json_payload(key, local_payload, upstash=upstash)
+            return local_payload
+        print(f"[local backup] no {path.name} backup for {key}: {exc}")
+        return default
+
+
+def download_json_key_to_file(
+    key: str,
+    path: Path,
+    default: object,
+    *,
+    upload_backup_if_missing: bool = False,
+) -> object:
+    return load_remote_json_or_backup(
+        key,
+        path,
+        default,
+        upload_backup_if_missing=upload_backup_if_missing,
+    )
+
+
 def download_info_file(key: str, path: Path) -> None:
     payload = decode_remote_info_payload(key, upstash_request(["GET", key]))
     assert_info_download_is_safe(key, payload)
-    backup_path = backup_local_info_file(path)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    backup_path = write_json_work_copy(path, payload)
     if backup_path is not None:
         print(f"[backup] {path.name} -> {backup_path}")
     print(f"[ok] downloaded {key} -> {path.name}")
@@ -198,6 +323,10 @@ def download_info_file(key: str, path: Path) -> None:
 def download_info_files() -> None:
     download_info_file(MANBO_INFO_KEY, MANBO_INFO_PATH)
     download_info_file(MISSEVAN_INFO_KEY, MISSEVAN_INFO_PATH)
+
+
+def download_support_files() -> None:
+    download_json_key_to_file(CVID_MAP_KEY, COMBINED_CVID_MAP_PATH, {}, upload_backup_if_missing=True)
 
 
 def build_missevan_index(store: dict) -> dict[str, dict]:
@@ -386,6 +515,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="After syncing info stores, backfill rank metadata from the latest info stores",
     )
+    parser.add_argument("--upload-cv-map", action="store_true", help=f"Upload local CV map to {CVID_MAP_KEY}")
+    parser.add_argument(
+        "--upload-series-info",
+        action="store_true",
+        help=f"Upload local drama series info to {SERIES_INFO_KEY}",
+    )
     return parser.parse_args(argv)
 
 
@@ -393,6 +528,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args([] if argv is None else argv)
     configure_stdio()
     load_env_file(ROOT / ".env")
+    if args.upload_cv_map:
+        upload_json_file(CVID_MAP_KEY, COMBINED_CVID_MAP_PATH)
+    if args.upload_series_info:
+        upload_json_file(SERIES_INFO_KEY, SERIES_INFO_PATH)
+    if args.upload_cv_map or args.upload_series_info:
+        return 0
     queue = load_queue()
     manbo_ids = queue.get("manbo") or []
     missevan_ids = queue.get("missevan") or []
@@ -402,6 +543,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     download_info_files()
+    download_support_files()
 
     run_script("append_manbo_ids.py", manbo_ids)
     run_script("append_missevan_ids.py", missevan_ids)

@@ -48,6 +48,7 @@ def load_env_file(path: Path) -> None:
 
 HERE = Path(__file__).resolve().parent
 RANKS_PATH = HERE / "ranks.json"
+SERIES_INFO_PATH = HERE / "drama-series-info.json"
 CACHE_WINDOW = timedelta(hours=12)
 RANK_HISTORY_RETENTION_DAYS = 90
 SAVE_LOCK = threading.Lock()
@@ -57,6 +58,7 @@ load_env_file(HERE / ".env")
 
 QUEUE_KEY = "new:dramaIDs"
 PEAK_TREND_KEY = "ranks:trend:peak:missevan"
+SERIES_INFO_KEY = "drama:series-info:v1"
 PLATFORMS = ("missevan", "manbo")
 RANK_PARTIAL_KEYS = {
     "missevan": "ranks:partial:missevan",
@@ -263,6 +265,15 @@ def load_rank_partial(platform: str) -> dict | None:
 def load_remote_full_ranks() -> dict | None:
     payload = decode_upstash_json(upstash_request(["GET", "ranks:latest"]))
     return payload if isinstance(payload, dict) else None
+
+
+def load_series_info() -> dict:
+    payload = _load_upstash_json(SERIES_INFO_KEY)
+    if isinstance(payload, dict):
+        print(f"  [upstash] loaded {SERIES_INFO_KEY}")
+        return payload
+    print(f"  [local backup] loaded series info from {SERIES_INFO_PATH}")
+    return load_json(SERIES_INFO_PATH, {})
 
 
 def merge_rank_partials(
@@ -939,7 +950,7 @@ def fetch_missevan_ranks(requester: MissevanRequester, store: dict) -> tuple[set
             "错撩": ["52355"],
         }
         # Build series title -> dramaIds lookup for 猫耳 platform
-        series_info = load_json(HERE / "drama-series-info.json", {})
+        series_info = load_series_info()
         missevan_series: dict[str, list[str]] = {}
         for entry in series_info.values():
             if entry.get("platform") == "猫耳":
