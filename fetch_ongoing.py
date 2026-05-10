@@ -12,7 +12,7 @@ from typing import Callable
 
 import requests
 
-from platform_sync import MISSEVAN_HEADERS, MissevanRequester, request_manbo_json
+from platform_sync import MANBO_CATALOG_OVERRIDES, MISSEVAN_HEADERS, MissevanRequester, normalize, request_manbo_json
 
 HERE = Path(__file__).resolve().parent
 BEIJING_TZ = timezone(timedelta(hours=8))
@@ -339,7 +339,7 @@ def is_paid_manbo_ongoing_item(item: dict) -> bool:
     price = safe_int(drama.get("price"))
     member_price = safe_int(drama.get("memberPrice"))
     vip_free = safe_int(drama.get("vipFree"))
-    return vip_free == 1 or (price > 0 and member_price > 0 and vip_free == 0)
+    return vip_free == 1 or price > 0 or member_price > 0
 
 
 def manbo_update_time_allowed(value: object) -> bool:
@@ -359,6 +359,15 @@ def manbo_item_allowed(item: dict) -> bool:
     return is_paid_manbo_ongoing_item(item) and manbo_update_time_allowed(item.get("workUpdateTimeFormat"))
 
 
+def manbo_ongoing_category(item: dict) -> int:
+    drama = item.get("radioDramaResp") or {}
+    title = normalize(drama.get("title"))
+    override = MANBO_CATALOG_OVERRIDES.get(title) if title else None
+    if override is not None:
+        return safe_int(override.get("catalog"))
+    return safe_int(drama.get("category"))
+
+
 def collect_manbo_records_from_items(items: list[dict]) -> dict[str, dict[str, object]]:
     weekly: list[dict[str, object]] = []
     daily: list[dict[str, object]] = []
@@ -369,7 +378,8 @@ def collect_manbo_records_from_items(items: list[dict]) -> dict[str, dict[str, o
         drama_id = drama.get("radioDramaIdStr") or item.get("id")
         if drama_id in (None, ""):
             continue
-        category = safe_int(drama.get("category"))
+        drama_id = str(drama_id)
+        category = manbo_ongoing_category(item)
         if category == 1:
             weekly.append(make_record(drama_id, "weekly"))
         elif category == 5:
