@@ -99,6 +99,7 @@ MANBO_DANMAKU_PAGE_CONCURRENCY = 48
 MANBO_DANMAKU_DRAMA_CONCURRENCY = 1
 MANBO_DANMAKU_REQUEST_RETRIES = 3
 DANMAKU_DRAMA_RETRY_ATTEMPTS = 3
+MANBO_DANMAKU_LOW_VALUE_RATIO = 0.02
 
 
 class DanmakuRefreshError(RuntimeError):
@@ -826,6 +827,32 @@ def retry_failed_danmaku_ids(
     return remaining
 
 
+def manbo_danmaku_count_too_low(
+    previous_count: object,
+    next_count: object,
+    *,
+    ratio: float = MANBO_DANMAKU_LOW_VALUE_RATIO,
+) -> bool:
+    try:
+        previous = int(previous_count)
+        current = int(next_count)
+    except (TypeError, ValueError):
+        return False
+    if previous <= 0 or current < 0:
+        return False
+    return current < previous * (1 - ratio)
+
+
+def assign_manbo_danmaku_uid_count(entry: dict, drama_id: str, uid_count: int) -> None:
+    previous = entry.get("danmaku_uid_count")
+    if manbo_danmaku_count_too_low(previous, uid_count):
+        raise DanmakuRefreshError(
+            f"low Manbo danmaku count for {drama_id}: previous={previous}, current={uid_count}, "
+            f"threshold={MANBO_DANMAKU_LOW_VALUE_RATIO:.0%}"
+        )
+    entry["danmaku_uid_count"] = uid_count
+
+
 def init_ranks_store() -> dict:
     return {
         "_meta": {"updated_at": now_iso()},
@@ -1179,20 +1206,27 @@ def _fetch_missevan_danmaku(requester: MissevanRequester, episodes: list[dict], 
 
     if not paid_sounds:
         entry["danmaku_uid_count"] = 0
+        print("    [danmaku] paid_sounds=0 success=0 failed=0 unique_users=0")
         return
 
     uid_set: set[str] = set()
     failed_sounds: list[str] = []
+    success_sounds = 0
     for sound_id in paid_sounds:
         try:
             dm_url = f"https://www.missevan.com/sound/getdm?soundid={sound_id}"
             resp = requests.get(dm_url, headers=MISSEVAN_HEADERS, timeout=30)
             resp.raise_for_status()
             _parse_missevan_dm_xml(resp.text, uid_set)
+            success_sounds += 1
         except Exception as exc:
             print(f"    [danmaku] WARN: failed for sound {sound_id}: {exc}")
             failed_sounds.append(sound_id)
         time.sleep(0.35)  # small delay per episode
+    print(
+        f"    [danmaku] paid_sounds={len(paid_sounds)} success={success_sounds} "
+        f"failed={len(failed_sounds)} unique_users={len(uid_set)}"
+    )
     if failed_sounds:
         raise DanmakuRefreshError(f"failed Missevan danmaku sounds: {', '.join(failed_sounds)}")
     entry["danmaku_uid_count"] = len(uid_set)
@@ -1242,7 +1276,7 @@ def fetch_manbo_drama_details(
         elif danmaku_ids is None or drama_id in danmaku_ids:
             try:
                 _, uid_count = fetch_one_manbo_danmaku_count(drama_id)
-                entry["danmaku_uid_count"] = uid_count
+                assign_manbo_danmaku_uid_count(entry, drama_id, uid_count)
             except Exception as exc:
                 print(f"  [manbo] DANMAKU ERROR on {drama_id}: {exc}")
                 failed_danmaku_ids.add(str(drama_id))
@@ -1258,7 +1292,7 @@ def fetch_manbo_drama_details(
     def retry_one_danmaku(drama_id: str) -> None:
         entry = dramas.get(str(drama_id), {})
         _, uid_count = fetch_one_manbo_danmaku_count(str(drama_id))
-        entry["danmaku_uid_count"] = uid_count
+        assign_manbo_danmaku_uid_count(entry, str(drama_id), uid_count)
         entry["fetched_at"] = now_iso()
         entry.pop("danmaku_paid_episode_count", None)
         dramas[str(drama_id)] = entry
@@ -1450,7 +1484,7 @@ def _request_manbo_danmaku_page(
     raise last_error or RuntimeError("failed to fetch Manbo danmaku page")
 
 
-def _extract_manbo_danmaku_page(data: dict, *, page_size: int) -> tuple[int, int, set[str]]:
+def _extract_manbo_danmaku_page(data: dict, *, page_size: int) -> tuple[int, int, set[str], int]:
     payload = data.get("data") or {}
     entries = payload.get("list") if isinstance(payload, dict) else []
     users = {
@@ -1460,7 +1494,8 @@ def _extract_manbo_danmaku_page(data: dict, *, page_size: int) -> tuple[int, int
     }
     total_count = safe_int(payload.get("count") if isinstance(payload, dict) else 0, len(users))
     total_pages = max(1, (total_count + page_size - 1) // page_size)
-    return total_count, total_pages, users
+    entry_count = len(entries or []) if isinstance(entries, list) else 0
+    return total_count, total_pages, users, entry_count
 
 
 def fetch_manbo_paid_danmaku_benchmark(
@@ -1479,9 +1514,11 @@ def fetch_manbo_paid_danmaku_benchmark(
     users: set[str] = set()
     failed_pages: list[dict[str, object]] = []
     total_pages_by_set: dict[str, int] = {}
+    fetched_pages_by_set: dict[str, int] = {}
     total_danmaku_by_set: dict[str, int] = {}
+    fetched_danmaku_by_set: dict[str, int] = {}
 
-    def fetch_and_extract(set_id: str, page_no: int) -> tuple[str, int, int, int, set[str]]:
+    def fetch_and_extract(set_id: str, page_no: int) -> tuple[str, int, int, int, set[str], int]:
         data = _request_manbo_danmaku_page(
             set_id,
             page_no,
@@ -1489,11 +1526,11 @@ def fetch_manbo_paid_danmaku_benchmark(
             page_size=page_size,
             retry_delay=retry_delay,
         )
-        total_count, total_pages, page_users = _extract_manbo_danmaku_page(data, page_size=page_size)
-        return set_id, page_no, total_count, total_pages, page_users
+        total_count, total_pages, page_users, entry_count = _extract_manbo_danmaku_page(data, page_size=page_size)
+        return set_id, page_no, total_count, total_pages, page_users, entry_count
 
     workers = max(1, min(page_concurrency, len(paid_set_ids) or 1))
-    first_page_results: list[tuple[str, int, int, int, set[str]]] = []
+    first_page_results: list[tuple[str, int, int, int, set[str], int]] = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_page = {
             executor.submit(fetch_and_extract, set_id, 1): (set_id, 1)
@@ -1507,9 +1544,11 @@ def fetch_manbo_paid_danmaku_benchmark(
                 failed_pages.append({"set_id": set_id, "page_no": page_no, "error": str(exc)})
                 continue
             first_page_results.append(result)
-            _, _, total_count, total_pages, page_users = result
+            _, _, total_count, total_pages, page_users, entry_count = result
             total_danmaku_by_set[set_id] = total_count
             total_pages_by_set[set_id] = total_pages
+            fetched_pages_by_set[set_id] = fetched_pages_by_set.get(set_id, 0) + 1
+            fetched_danmaku_by_set[set_id] = fetched_danmaku_by_set.get(set_id, 0) + entry_count
             users.update(page_users)
 
     remaining_pages = [
@@ -1526,17 +1565,36 @@ def fetch_manbo_paid_danmaku_benchmark(
         for future in as_completed(future_to_page):
             set_id, page_no = future_to_page[future]
             try:
-                _, _, _, _, page_users = future.result()
+                result = future.result()
             except Exception as exc:
                 failed_pages.append({"set_id": set_id, "page_no": page_no, "error": str(exc)})
                 continue
+            _, _, _, _, page_users, entry_count = result
+            fetched_pages_by_set[set_id] = fetched_pages_by_set.get(set_id, 0) + 1
+            fetched_danmaku_by_set[set_id] = fetched_danmaku_by_set.get(set_id, 0) + entry_count
             users.update(page_users)
+
+    for set_id, total_pages in total_pages_by_set.items():
+        fetched_pages = fetched_pages_by_set.get(set_id, 0)
+        expected_count = total_danmaku_by_set.get(set_id, 0)
+        fetched_count = fetched_danmaku_by_set.get(set_id, 0)
+        if fetched_pages < total_pages or fetched_count < expected_count:
+            failed_pages.append({
+                "set_id": set_id,
+                "page_no": None,
+                "error": (
+                    "incomplete Manbo danmaku pages: "
+                    f"pages={fetched_pages}/{total_pages}, entries={fetched_count}/{expected_count}"
+                ),
+            })
 
     elapsed_seconds = time.perf_counter() - started
     return {
         "drama_id": str(drama_id),
         "title": title,
+        "paid_set_count": len(paid_set_ids),
         "total_pages": sum(total_pages_by_set.values()),
+        "fetched_pages": sum(fetched_pages_by_set.values()),
         "unique_user_count": len(users),
         "failed_page_count": len(failed_pages),
         "failed_pages": failed_pages,
@@ -1545,6 +1603,7 @@ def fetch_manbo_paid_danmaku_benchmark(
         "elapsed_seconds": round(elapsed_seconds, 3),
         "elapsed": str(timedelta(seconds=elapsed_seconds)),
         "total_danmaku": sum(total_danmaku_by_set.values()),
+        "fetched_danmaku": sum(fetched_danmaku_by_set.values()),
     }
 
 
@@ -1558,6 +1617,12 @@ def fetch_one_manbo_danmaku_count(
         drama_id,
         request_json=request_json,
         page_concurrency=MANBO_DANMAKU_PAGE_CONCURRENCY,
+    )
+    print(
+        f"    [danmaku] manbo drama {drama_id}: paid_sets={result.get('paid_set_count', 0)} "
+        f"total_pages={result.get('total_pages', 0)} fetched_pages={result.get('fetched_pages', 0)} "
+        f"declared_danmaku={result.get('total_danmaku', 0)} fetched_danmaku={result.get('fetched_danmaku', 0)} "
+        f"unique_users={result.get('unique_user_count', 0)} failed_pages={result.get('failed_page_count', 0)}"
     )
     failed_pages = result.get("failed_pages") or []
     if failed_pages:
@@ -1601,7 +1666,7 @@ def fetch_manbo_danmaku_details(
             entry = manbo_dramas.get(drama_id, {})
             try:
                 _, uid_count = future.result()
-                entry["danmaku_uid_count"] = uid_count
+                assign_manbo_danmaku_uid_count(entry, drama_id, uid_count)
                 entry["fetched_at"] = now_iso()
                 print(
                     f"  [manbo] ({completed}/{len(targets)}) drama {drama_id}: "
@@ -1622,7 +1687,7 @@ def fetch_manbo_danmaku_details(
     def retry_one_danmaku(drama_id: str) -> None:
         entry = manbo_dramas.get(str(drama_id), {})
         _, uid_count = fetch_one_manbo_danmaku_count(str(drama_id))
-        entry["danmaku_uid_count"] = uid_count
+        assign_manbo_danmaku_uid_count(entry, str(drama_id), uid_count)
         entry["fetched_at"] = now_iso()
         entry.pop("danmaku_paid_episode_count", None)
         manbo_dramas[str(drama_id)] = entry
