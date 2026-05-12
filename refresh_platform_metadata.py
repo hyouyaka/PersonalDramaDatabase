@@ -52,7 +52,10 @@ from platform_sync import (
 
 MISSEVAN_BLOCKLIST = {"47639", "25812"}
 MISSEVAN_ARCHIVED_INFO_PATH = MISSEVAN_INFO_PATH.with_name("missevan-archived-drama.json")
-MISSEVAN_INTRO_CV_SECTION_PATTERN = re.compile(r"^(?:[=＝\-\s]*)?(?:配音组|配音|CAST|CV)(?:[=＝\-\s]*|[：:])*$", re.I)
+MISSEVAN_INTRO_CV_SECTION_PATTERN = re.compile(
+    r"^(?:[^A-Za-z0-9\u4e00-\u9fff]{0,20})?(?:配音组|配音|CAST|CV)(?:[^A-Za-z0-9\u4e00-\u9fff]{0,20})?$",
+    re.I,
+)
 MISSEVAN_INTRO_SECTION_PATTERN = re.compile(r"^(?:[=＝\-\s]*)?(?:[^：:]{1,20}(?:组|制作|字幕|参与配音)|(?:[^：:]{0,20})staff)(?:[=＝\-\s]*|[：:]\s*)?$", re.I)
 MISSEVAN_INTRO_ROLE_CV_PATTERN = re.compile(r"^(?P<role>[^：:\n]{1,40})[：:](?P<cv>.+)$")
 MISSEVAN_CV_SUFFIX_PATTERN = re.compile(r"\s*(?:@|＠|【|\[|（|\(|<|《).*$")

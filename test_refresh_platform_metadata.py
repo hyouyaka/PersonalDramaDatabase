@@ -1,0 +1,59 @@
+import unittest
+
+import refresh_platform_metadata
+
+
+class MissevanIntroCvCandidateTests(unittest.TestCase):
+    def test_extracts_candidates_from_plain_cv_section_titles(self) -> None:
+        for title in ("配音组", "配音：", "CAST", "CV"):
+            with self.subTest(title=title):
+                intro = f"""
+                <p>{title}</p>
+                <p>角色甲：甲声优@alias</p>
+                <p>角色乙：乙声优</p>
+                """
+
+                candidates = refresh_platform_metadata.extract_missevan_intro_cv_candidates(intro)
+
+                self.assertEqual(
+                    candidates,
+                    [
+                        {"role_name": "角色甲", "display_name": "甲声优"},
+                        {"role_name": "角色乙", "display_name": "乙声优"},
+                    ],
+                )
+
+    def test_extracts_candidates_from_decorated_cv_section_title(self) -> None:
+        intro = """
+        <p>ﾟ ˖◛⁺配音组☁ ﾟ</p>
+        <p>张沉：孙睿扬@Sun睿扬</p>
+        <p>程声：云惟一@-云惟一</p>
+        <p>参与配音：阿步、姜贺</p>
+        <p>ﾟ💦 制作组 ﾟ ˖◛⁺</p>
+        <p>配音导演：张馨月</p>
+        """
+
+        candidates = refresh_platform_metadata.extract_missevan_intro_cv_candidates(intro)
+
+        self.assertEqual(
+            candidates,
+            [
+                {"role_name": "张沉", "display_name": "孙睿扬"},
+                {"role_name": "程声", "display_name": "云惟一"},
+            ],
+        )
+
+    def test_does_not_extract_role_lines_without_cv_section_title(self) -> None:
+        intro = """
+        <p>普通简介</p>
+        <p>张沉：孙睿扬@Sun睿扬</p>
+        <p>配音导演：张馨月</p>
+        """
+
+        candidates = refresh_platform_metadata.extract_missevan_intro_cv_candidates(intro)
+
+        self.assertEqual(candidates, [])
+
+
+if __name__ == "__main__":
+    unittest.main()
