@@ -4,6 +4,24 @@ import refresh_platform_metadata
 
 
 class MissevanIntroCvCandidateTests(unittest.TestCase):
+    def test_intro_fallback_sound_ids_include_regular_sound_without_preview(self) -> None:
+        sound_ids = refresh_platform_metadata.missevan_intro_fallback_sound_ids(
+            [],
+            "12712741",
+            "12712741",
+        )
+
+        self.assertEqual(sound_ids, ["12712741"])
+
+    def test_intro_fallback_sound_ids_preserve_preview_priority_and_dedupe(self) -> None:
+        sound_ids = refresh_platform_metadata.missevan_intro_fallback_sound_ids(
+            ["preview-1", "preview-2"],
+            "preview-1",
+            "episode-1",
+        )
+
+        self.assertEqual(sound_ids, ["preview-1", "preview-2", "episode-1"])
+
     def test_extracts_candidates_from_plain_cv_section_titles(self) -> None:
         for title in ("配音组", "配音：", "CAST", "CV"):
             with self.subTest(title=title):

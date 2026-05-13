@@ -466,6 +466,18 @@ def fetch_missevan_intro_cv_candidates(requester: MissevanRequester, sound_ids: 
     return out
 
 
+def missevan_intro_fallback_sound_ids(preview_ids: list[str], sound_id: object, first_episode_sound_id: object) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw_id in [*(preview_ids or []), sound_id, first_episode_sound_id]:
+        item = normalize(raw_id)
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
 def build_missevan_base_node(info: dict, drama_type: int | None) -> tuple[dict, list[dict]]:
     drama = info.get("drama") or {}
     drama_id = str(drama.get("id") or "").strip()
@@ -754,15 +766,16 @@ def refresh_missevan(*, target_drama_ids: set[str] | None = None, force: bool = 
         else:
             updated_node = apply_missevan_merged_sound_maincvs(updated_node, drama_id, base_entries, maincv_preview_sound_infos) if used_preview_sound else updated_node
             updated_node = apply_missevan_sound_maincvs(updated_node, drama_id, base_entries, episode_sound_info)
+        fallback_sound_ids = missevan_intro_fallback_sound_ids(preview_sound_id_list, sound_id, first_episode_sound_id)
         should_try_intro_cv_fallback = (
             not (updated_node.get("maincvs") or [])
             and not (info.get("cvs") or [])
             and not sound_infos_have_cvs(sound_info, *preview_sound_infos, episode_sound_info)
-            and bool(preview_sound_id_list)
+            and bool(fallback_sound_ids)
         )
         if should_try_intro_cv_fallback:
             try:
-                intro_candidates = fetch_missevan_intro_cv_candidates(requester, preview_sound_id_list)
+                intro_candidates = fetch_missevan_intro_cv_candidates(requester, fallback_sound_ids)
                 updated_node = apply_missevan_intro_cv_fallback(
                     updated_node,
                     drama_id,
