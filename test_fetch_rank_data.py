@@ -52,6 +52,41 @@ class SeriesInfoStoreTests(unittest.TestCase):
         load_json.assert_called_once_with(fetch_rank_data.SERIES_INFO_PATH, {})
 
 
+class ManboCvLookupTests(unittest.TestCase):
+    def test_lookup_cvs_falls_back_to_nicknames_when_main_cv_names_are_blank(self) -> None:
+        store = {
+            "missevan": {"dramas": {}},
+            "manbo": {
+                "dramas": {
+                    "drama-1": {"name": "测试剧"},
+                }
+            },
+        }
+
+        def load_remote(key: str):
+            if key == "missevan:info:v1":
+                return {}
+            if key == "manbo:info:v1":
+                return {
+                    "records": [
+                        {
+                            "dramaId": "drama-1",
+                            "mainCvNames": ["规范名甲", ""],
+                            "mainCvNicknames": ["接口昵称甲", "接口昵称乙"],
+                            "catalog": 1,
+                            "needpay": True,
+                            "createTime": "2026.05",
+                        }
+                    ]
+                }
+            raise AssertionError(key)
+
+        with patch.object(fetch_rank_data, "_load_upstash_json", side_effect=load_remote), patch("builtins.print"):
+            fetch_rank_data.lookup_cvs(store)
+
+        self.assertEqual(store["manbo"]["dramas"]["drama-1"]["maincvs"], ["规范名甲", "接口昵称乙"])
+
+
 class ManboDanmakuStabilityTests(unittest.TestCase):
     def _manbo_page_requester(self, pages: dict[tuple[str, int], dict]):
         def request_json(url: str) -> dict:

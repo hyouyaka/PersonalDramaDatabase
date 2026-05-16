@@ -23,6 +23,7 @@ from platform_sync import (
     MISSEVAN_CATALOG_NAME_BY_ID,
     MissevanRequester,
     load_json,
+    normalize,
     request_manbo_json,
     save_json as _save_json,
 )
@@ -1784,6 +1785,22 @@ def update_metadata_fields(entry: dict, *, catalog_name: str | None, pay_status:
         entry.setdefault("createTime", None)
 
 
+def manbo_main_cv_names(record: dict) -> list[str] | None:
+    names = record.get("mainCvNames") or []
+    nicknames = record.get("mainCvNicknames") or []
+    count = max(len(names), len(nicknames))
+    if count <= 0:
+        return None
+
+    resolved: list[str] = []
+    for idx in range(count):
+        name = normalize(names[idx]) if idx < len(names) else ""
+        if not name and idx < len(nicknames):
+            name = normalize(nicknames[idx])
+        resolved.append(name)
+    return resolved or None
+
+
 def lookup_cvs(store: dict) -> None:
     """Look up main CVs and metadata from Upstash info stores, registering unknown IDs."""
     missevan_dramas = store["missevan"].get("dramas") or {}
@@ -1826,7 +1843,7 @@ def lookup_cvs(store: dict) -> None:
     for drama_id, entry in manbo_dramas.items():
         record = manbo_by_id.get(drama_id)
         if record:
-            entry["maincvs"] = record.get("mainCvNames") or None
+            entry["maincvs"] = manbo_main_cv_names(record)
             update_metadata_fields(
                 entry,
                 catalog_name=catalog_name_from_manbo(record),

@@ -436,6 +436,8 @@ def build_manbo_cv_entries(payload: dict) -> list[dict]:
         if cv_id in (None, ""):
             cv_id = item.get("platUid")
         if cv_id in (None, ""):
+            cv_id = item.get("cvId")
+        if cv_id in (None, ""):
             continue
         entries.append(
             {

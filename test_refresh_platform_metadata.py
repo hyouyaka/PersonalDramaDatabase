@@ -3,6 +3,42 @@ import unittest
 import refresh_platform_metadata
 
 
+class ManboCvFallbackTests(unittest.TestCase):
+    def test_build_manbo_record_falls_back_to_nickname_when_map_missing(self) -> None:
+        payload = {
+            "data": {
+                "title": "测试剧",
+                "category": 1,
+                "categoryLabels": [{"name": "纯爱"}],
+                "cvRespList": [
+                    {
+                        "dramaRoleType": 2,
+                        "platUid": 1001,
+                        "cvResp": {"id": 1001, "nickname": "映射昵称"},
+                        "cvNickname": "接口昵称甲",
+                        "role": "饰:甲",
+                    },
+                    {
+                        "dramaRoleType": 2,
+                        "platUid": 1002,
+                        "cvResp": {"id": 1002, "nickname": "接口昵称乙"},
+                        "cvNickname": "接口昵称乙",
+                        "role": "饰:乙",
+                    },
+                ],
+                "setRespList": [],
+            }
+        }
+
+        record = refresh_platform_metadata.build_manbo_record(
+            {"dramaId": "drama-1"},
+            payload,
+            {1001: "规范名甲"},
+        )
+
+        self.assertEqual(record["mainCvNames"], ["规范名甲", "接口昵称乙"])
+
+
 class MissevanIntroCvCandidateTests(unittest.TestCase):
     def test_intro_fallback_sound_ids_include_regular_sound_without_preview(self) -> None:
         sound_ids = refresh_platform_metadata.missevan_intro_fallback_sound_ids(

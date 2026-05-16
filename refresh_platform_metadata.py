@@ -886,8 +886,11 @@ def build_manbo_record(record: dict, payload: dict, manbo_cv_name_map: dict[int,
     updated["type"] = drama_type
     updated["genre"] = GENRE_BY_TYPE.get(drama_type, "")
     updated["mainCvIds"] = [int(entry["cv_id"]) for entry in main_entries]
-    updated["mainCvNames"] = [(manbo_cv_name_map or {}).get(cv_id, "") for cv_id in updated["mainCvIds"]]
     updated["mainCvNicknames"] = [entry["display_name"] for entry in main_entries]
+    updated["mainCvNames"] = [
+        normalize((manbo_cv_name_map or {}).get(cv_id)) or updated["mainCvNicknames"][idx]
+        for idx, cv_id in enumerate(updated["mainCvIds"])
+    ]
     updated["mainCvRoleNames"] = [entry["role_name"] for entry in main_entries]
     updated["createTime"] = pick_first_episode_month(data.get("setRespList") or [], title_key="setTitle", time_key="createTime", milliseconds=True)
     updated["author"] = extract_manbo_author(data.get("desc"))
