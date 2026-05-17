@@ -483,6 +483,15 @@ TREND_METRIC_FIELDS = (
     "diamond_value",
 )
 
+TREND_DRAMA_FIELDS = (
+    "cover",
+    "maincvs",
+    "catalogName",
+    "payStatus",
+    "createTime",
+    "updated_at",
+)
+
 
 def _trend_metrics_from_entry(entry: dict) -> dict:
     return {
@@ -490,6 +499,16 @@ def _trend_metrics_from_entry(entry: dict) -> dict:
         for field in TREND_METRIC_FIELDS
         if field in entry and entry.get(field) is not None
     }
+
+
+def _copy_trend_drama_fields(target: dict, source: dict) -> None:
+    for field in TREND_DRAMA_FIELDS:
+        value = source.get(field)
+        if value in (None, ""):
+            continue
+        if isinstance(value, list) and not value:
+            continue
+        target[field] = value
 
 
 def _rank_item_drama_ids(item: object) -> list[str]:
@@ -563,11 +582,13 @@ def build_rank_trend_payload(
         if not samples:
             continue
         drama_id_text = str(entry.get("id") or drama_id)
-        dramas[drama_id_text] = {
+        copied = {
             "id": drama_id_text,
             "name": str(entry.get("name") or drama_id_text),
             "samples": samples,
         }
+        _copy_trend_drama_fields(copied, entry)
+        dramas[drama_id_text] = copied
 
     metric_dramas = metrics_payload.get("dramas") if isinstance(metrics_payload, dict) else None
     if isinstance(metric_dramas, dict) and metric_dramas:
@@ -592,6 +613,7 @@ def build_rank_trend_payload(
             )
             entry["id"] = drama_id_text
             entry["name"] = str(metric_entry.get("name") or entry.get("name") or drama_id_text)
+            _copy_trend_drama_fields(entry, metric_entry)
             entry.setdefault("samples", {})
             entry["samples"][history_date] = {
                 "generated_at": sample_generated_at,

@@ -67,6 +67,11 @@ class RankTrendPayloadTests(unittest.TestCase):
                     "danmaku_uid_count": 45,
                     "subscription_num": 67,
                     "cover": "cover-a",
+                    "maincvs": ["甲", "乙"],
+                    "catalogName": "广播剧",
+                    "payStatus": "付费",
+                    "createTime": "2026-01-01",
+                    "updated_at": "2026-05-16T12:00:00+00:00",
                 },
                 "10000": {
                     "name": "只在指标里",
@@ -120,6 +125,12 @@ class RankTrendPayloadTests(unittest.TestCase):
         drama = payload["dramas"]["93038"]
         self.assertEqual(drama["id"], "93038")
         self.assertEqual(drama["name"], "一屋暗灯 全一季")
+        self.assertEqual(drama["cover"], "cover-a")
+        self.assertEqual(drama["maincvs"], ["甲", "乙"])
+        self.assertEqual(drama["catalogName"], "广播剧")
+        self.assertEqual(drama["payStatus"], "付费")
+        self.assertEqual(drama["createTime"], "2026-01-01")
+        self.assertEqual(drama["updated_at"], "2026-05-16T12:00:00+00:00")
         sample = drama["samples"]["2026-05-16"]
         self.assertEqual(sample["metrics"]["view_count"], 123)
         self.assertEqual(sample["metrics"]["danmaku_uid_count"], 45)
@@ -180,6 +191,48 @@ class RankTrendPayloadTests(unittest.TestCase):
         self.assertEqual(payload["dates"], ["2026-05-16"])
         self.assertNotIn("old-only", payload["dramas"])
         self.assertNotIn("2026-05-14", payload["dramas"]["93038"]["samples"])
+
+    def test_build_rank_trend_payload_updates_top_level_metadata_from_new_sample(self) -> None:
+        current = {
+            "version": 1,
+            "platform": "missevan",
+            "updated_at": "2026-05-15T00:00:00+00:00",
+            "dates": ["2026-05-15"],
+            "dramas": {
+                "93038": {
+                    "id": "93038",
+                    "name": "旧名",
+                    "cover": "old-cover",
+                    "maincvs": ["旧CV"],
+                    "catalogName": "旧分类",
+                    "payStatus": "旧付费状态",
+                    "createTime": "2025-01-01",
+                    "updated_at": "2026-05-15T08:00:00+00:00",
+                    "samples": {"2026-05-15": {"metrics": {"view_count": 100}, "ranks": []}},
+                }
+            },
+        }
+
+        payload = fetch_rank_data.build_rank_trend_payload(
+            current,
+            "missevan",
+            "2026-05-16",
+            self._metrics_payload("2026-05-16"),
+            self._list_payload("2026-05-16"),
+            generated_at="2026-05-16T00:00:00+00:00",
+            pruned_dates=(),
+        )
+
+        drama = payload["dramas"]["93038"]
+        self.assertEqual(drama["name"], "一屋暗灯 全一季")
+        self.assertEqual(drama["cover"], "cover-a")
+        self.assertEqual(drama["maincvs"], ["甲", "乙"])
+        self.assertEqual(drama["catalogName"], "广播剧")
+        self.assertEqual(drama["payStatus"], "付费")
+        self.assertEqual(drama["createTime"], "2026-01-01")
+        self.assertEqual(drama["updated_at"], "2026-05-16T12:00:00+00:00")
+        self.assertIn("2026-05-15", drama["samples"])
+        self.assertIn("2026-05-16", drama["samples"])
 
 
 class RankTrendBackfillTests(unittest.TestCase):
@@ -243,7 +296,18 @@ class RankTrendBackfillTests(unittest.TestCase):
         store = {
             "missevan": {
                 "ranks": {"new_daily": {"name": "新品日榜", "items": [{"dramaId": "93038"}]}},
-                "dramas": {"93038": {"name": "一屋暗灯 全一季", "view_count": 123}},
+                "dramas": {
+                    "93038": {
+                        "name": "一屋暗灯 全一季",
+                        "view_count": 123,
+                        "cover": "daily-cover",
+                        "maincvs": ["日常CV"],
+                        "catalogName": "日常分类",
+                        "payStatus": "日常付费状态",
+                        "createTime": "2026-02-01",
+                        "updated_at": "2026-05-16T18:00:00+00:00",
+                    }
+                },
             },
             "manbo": {"ranks": {}, "dramas": {}},
         }
@@ -289,7 +353,14 @@ class RankTrendBackfillTests(unittest.TestCase):
         self.assertEqual(len(trend_sets), 1)
         trend = json.loads(trend_sets[0][2])
         self.assertEqual(trend["dates"], ["2026-05-15", "2026-05-16"])
-        self.assertEqual(trend["dramas"]["93038"]["samples"]["2026-05-16"]["metrics"]["view_count"], 123)
+        drama = trend["dramas"]["93038"]
+        self.assertEqual(drama["cover"], "daily-cover")
+        self.assertEqual(drama["maincvs"], ["日常CV"])
+        self.assertEqual(drama["catalogName"], "日常分类")
+        self.assertEqual(drama["payStatus"], "日常付费状态")
+        self.assertEqual(drama["createTime"], "2026-02-01")
+        self.assertEqual(drama["updated_at"], "2026-05-16T18:00:00+00:00")
+        self.assertEqual(drama["samples"]["2026-05-16"]["metrics"]["view_count"], 123)
 
     def test_upload_rank_trend_snapshot_does_not_overwrite_when_current_read_fails(self) -> None:
         commands: list[list[object]] = []
