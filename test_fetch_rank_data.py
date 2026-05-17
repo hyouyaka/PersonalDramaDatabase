@@ -1,4 +1,5 @@
 import json
+import sys
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
@@ -50,6 +51,331 @@ class SeriesInfoStoreTests(unittest.TestCase):
             self.assertEqual(fetch_rank_data.load_series_info(), fallback)
 
         load_json.assert_called_once_with(fetch_rank_data.SERIES_INFO_PATH, {})
+
+
+class RankTrendPayloadTests(unittest.TestCase):
+    def _metrics_payload(self, date: str, *, generated_at: str = "2026-05-16T00:00:00+00:00") -> dict:
+        return {
+            "version": 1,
+            "date": date,
+            "platform": "missevan",
+            "generated_at": generated_at,
+            "dramas": {
+                "93038": {
+                    "name": "一屋暗灯 全一季",
+                    "view_count": 123,
+                    "danmaku_uid_count": 45,
+                    "subscription_num": 67,
+                    "cover": "cover-a",
+                },
+                "10000": {
+                    "name": "只在指标里",
+                    "view_count": 10,
+                },
+            },
+        }
+
+    def _list_payload(self, date: str, *, generated_at: str = "2026-05-16T00:00:00+00:00") -> dict:
+        return {
+            "version": 1,
+            "date": date,
+            "platform": "missevan",
+            "generated_at": generated_at,
+            "ranks": {
+                "new_daily": {
+                    "name": "新品日榜",
+                    "items": [
+                        {"drama_id": "93038", "position": 3},
+                        {"drama_id": "missing-metric", "position": 4},
+                    ],
+                },
+                "popular_weekly": {
+                    "name": "人气周榜",
+                    "items": [
+                        {"dramaId": "93038", "position": 8},
+                    ],
+                },
+                "peak": {
+                    "name": "巅峰榜",
+                    "items": [
+                        {"drama_id": "93038", "position": 1},
+                    ],
+                },
+            },
+        }
+
+    def test_build_rank_trend_payload_merges_metrics_and_rank_badges(self) -> None:
+        payload = fetch_rank_data.build_rank_trend_payload(
+            None,
+            "missevan",
+            "2026-05-16",
+            self._metrics_payload("2026-05-16"),
+            self._list_payload("2026-05-16"),
+            generated_at="2026-05-16T00:00:00+00:00",
+            pruned_dates=(),
+        )
+
+        self.assertEqual(payload["platform"], "missevan")
+        self.assertEqual(payload["dates"], ["2026-05-16"])
+        drama = payload["dramas"]["93038"]
+        self.assertEqual(drama["id"], "93038")
+        self.assertEqual(drama["name"], "一屋暗灯 全一季")
+        sample = drama["samples"]["2026-05-16"]
+        self.assertEqual(sample["metrics"]["view_count"], 123)
+        self.assertEqual(sample["metrics"]["danmaku_uid_count"], 45)
+        self.assertEqual(
+            sample["ranks"],
+            [
+                {"key": "new_daily", "name": "新品日榜", "position": 3},
+                {"key": "popular_weekly", "name": "人气周榜", "position": 8},
+            ],
+        )
+        self.assertNotIn("missing-metric", payload["dramas"])
+
+    def test_build_rank_trend_payload_keeps_metrics_when_list_missing(self) -> None:
+        payload = fetch_rank_data.build_rank_trend_payload(
+            None,
+            "missevan",
+            "2026-05-16",
+            self._metrics_payload("2026-05-16"),
+            None,
+            generated_at="2026-05-16T00:00:00+00:00",
+            pruned_dates=(),
+        )
+
+        sample = payload["dramas"]["93038"]["samples"]["2026-05-16"]
+        self.assertEqual(sample["ranks"], [])
+        self.assertEqual(sample["metrics"]["subscription_num"], 67)
+
+    def test_build_rank_trend_payload_prunes_old_dates_and_empty_dramas(self) -> None:
+        current = {
+            "version": 1,
+            "platform": "missevan",
+            "updated_at": "2026-05-15T00:00:00+00:00",
+            "dates": ["2026-05-14", "2026-05-15"],
+            "dramas": {
+                "93038": {
+                    "id": "93038",
+                    "name": "一屋暗灯 全一季",
+                    "samples": {"2026-05-14": {"metrics": {"view_count": 1}, "ranks": []}},
+                },
+                "old-only": {
+                    "id": "old-only",
+                    "name": "旧剧",
+                    "samples": {"2026-05-14": {"metrics": {"view_count": 2}, "ranks": []}},
+                },
+            },
+        }
+
+        payload = fetch_rank_data.build_rank_trend_payload(
+            current,
+            "missevan",
+            "2026-05-16",
+            self._metrics_payload("2026-05-16"),
+            self._list_payload("2026-05-16"),
+            generated_at="2026-05-16T00:00:00+00:00",
+            pruned_dates=("2026-05-14",),
+        )
+
+        self.assertEqual(payload["dates"], ["2026-05-16"])
+        self.assertNotIn("old-only", payload["dramas"])
+        self.assertNotIn("2026-05-14", payload["dramas"]["93038"]["samples"])
+
+
+class RankTrendBackfillTests(unittest.TestCase):
+    def test_backfill_reads_history_shards_and_writes_selected_trend_key(self) -> None:
+        responses = {
+            "ranks:index": {"version": 1, "dates": ["2026-05-15", "2026-05-16"]},
+            "ranks:metrics:2026-05-15:missevan": {
+                "version": 1,
+                "date": "2026-05-15",
+                "platform": "missevan",
+                "generated_at": "2026-05-15T00:00:00+00:00",
+                "dramas": {"93038": {"name": "一屋暗灯 全一季", "view_count": 100}},
+            },
+            "ranks:list:2026-05-15:missevan": {
+                "version": 1,
+                "date": "2026-05-15",
+                "platform": "missevan",
+                "generated_at": "2026-05-15T00:00:00+00:00",
+                "ranks": {"new_daily": {"name": "新品日榜", "items": [{"drama_id": "93038", "position": 2}]}},
+            },
+            "ranks:metrics:2026-05-16:missevan": {
+                "version": 1,
+                "date": "2026-05-16",
+                "platform": "missevan",
+                "generated_at": "2026-05-16T00:00:00+00:00",
+                "dramas": {"93038": {"name": "一屋暗灯 全一季", "view_count": 123}},
+            },
+            "ranks:list:2026-05-16:missevan": None,
+        }
+        commands: list[list[object]] = []
+
+        def fake_request(command: list[object]) -> object:
+            commands.append(command)
+            if command[0] == "GET":
+                value = responses[command[1]]
+                return json.dumps(value, ensure_ascii=False) if value is not None else None
+            if command[:2] == ["SET", "ranks:trend:missevan"]:
+                return "OK"
+            raise AssertionError(command)
+
+        with patch.object(fetch_rank_data, "upstash_request", side_effect=fake_request), patch("builtins.print"):
+            payloads = fetch_rank_data.backfill_rank_trends_from_history(("missevan",))
+
+        self.assertEqual(
+            [command[:2] for command in commands[:5]],
+            [
+                ["GET", "ranks:index"],
+                ["GET", "ranks:metrics:2026-05-15:missevan"],
+                ["GET", "ranks:list:2026-05-15:missevan"],
+                ["GET", "ranks:metrics:2026-05-16:missevan"],
+                ["GET", "ranks:list:2026-05-16:missevan"],
+            ],
+        )
+        self.assertEqual(commands[-1][:2], ["SET", "ranks:trend:missevan"])
+        written = json.loads(commands[-1][2])
+        self.assertEqual(written["dates"], ["2026-05-15", "2026-05-16"])
+        self.assertEqual(set(written["dramas"]["93038"]["samples"]), {"2026-05-15", "2026-05-16"})
+        self.assertEqual(payloads["missevan"], written)
+
+    def test_upload_rank_history_updates_daily_trend_key(self) -> None:
+        store = {
+            "missevan": {
+                "ranks": {"new_daily": {"name": "新品日榜", "items": [{"dramaId": "93038"}]}},
+                "dramas": {"93038": {"name": "一屋暗灯 全一季", "view_count": 123}},
+            },
+            "manbo": {"ranks": {}, "dramas": {}},
+        }
+        commands: list[list[object]] = []
+
+        def fake_request(command: list[object]) -> object:
+            commands.append(command)
+            if command[0] == "GET":
+                if command[1] == "ranks:trend:missevan":
+                    return json.dumps(
+                        {
+                            "version": 1,
+                            "platform": "missevan",
+                            "updated_at": "2026-05-15T00:00:00+00:00",
+                            "dates": ["2026-05-15"],
+                            "dramas": {
+                                "93038": {
+                                    "id": "93038",
+                                    "name": "一屋暗灯 全一季",
+                                    "samples": {"2026-05-15": {"metrics": {"view_count": 100}, "ranks": []}},
+                                }
+                            },
+                        },
+                        ensure_ascii=False,
+                    )
+                return None
+            if command[0] == "SET":
+                return "OK"
+            if command[0] == "DEL":
+                return 1
+            raise AssertionError(command)
+
+        with (
+            patch.object(fetch_rank_data, "now_iso", return_value="2026-05-16T00:00:00+00:00"),
+            patch.object(fetch_rank_data, "update_rank_history_index_atomic", return_value=["2026-05-14"]),
+            patch.object(fetch_rank_data, "upload_missevan_peak_trend"),
+            patch.object(fetch_rank_data, "upstash_request", side_effect=fake_request),
+            patch("builtins.print"),
+        ):
+            fetch_rank_data.upload_rank_history(store, platforms=("missevan",))
+
+        trend_sets = [command for command in commands if command[:2] == ["SET", "ranks:trend:missevan"]]
+        self.assertEqual(len(trend_sets), 1)
+        trend = json.loads(trend_sets[0][2])
+        self.assertEqual(trend["dates"], ["2026-05-15", "2026-05-16"])
+        self.assertEqual(trend["dramas"]["93038"]["samples"]["2026-05-16"]["metrics"]["view_count"], 123)
+
+    def test_upload_rank_trend_snapshot_does_not_overwrite_when_current_read_fails(self) -> None:
+        commands: list[list[object]] = []
+
+        def fake_request(command: list[object]) -> object:
+            commands.append(command)
+            if command[:2] == ["GET", "ranks:trend:missevan"]:
+                raise RuntimeError("temporary read failure")
+            if command[0] == "SET":
+                raise AssertionError("trend should not be overwritten after read failure")
+            raise AssertionError(command)
+
+        with patch.object(fetch_rank_data, "upstash_request", side_effect=fake_request):
+            with self.assertRaisesRegex(RuntimeError, "Failed to load ranks:trend:missevan"):
+                fetch_rank_data.upload_rank_trend_snapshot(
+                    "missevan",
+                    "2026-05-16",
+                    {
+                        "version": 1,
+                        "date": "2026-05-16",
+                        "platform": "missevan",
+                        "generated_at": "2026-05-16T00:00:00+00:00",
+                        "dramas": {"93038": {"name": "一屋暗灯 全一季", "view_count": 123}},
+                    },
+                    {
+                        "version": 1,
+                        "date": "2026-05-16",
+                        "platform": "missevan",
+                        "generated_at": "2026-05-16T00:00:00+00:00",
+                        "ranks": {"new_daily": {"name": "新品日榜", "items": [{"drama_id": "93038"}]}},
+                    },
+                    generated_at="2026-05-16T00:00:00+00:00",
+                )
+
+        self.assertEqual(commands, [["GET", "ranks:trend:missevan"]])
+
+    def test_upload_rank_outputs_still_updates_latest_when_trend_read_fails(self) -> None:
+        store = {
+            "_meta": {"updated_at": "2026-05-16T00:00:00+00:00"},
+            "missevan": {"ranks": {}, "dramas": {}},
+            "manbo": {
+                "ranks": {"popular_daily": {"name": "人气日榜", "items": [{"dramaId": "93038"}]}},
+                "dramas": {"93038": {"name": "一屋暗灯 全一季", "view_count": 123}},
+            },
+        }
+        commands: list[list[object]] = []
+        written: dict[str, str] = {}
+
+        def fake_request(command: list[object]) -> object:
+            commands.append(command)
+            if command[0] == "EVAL":
+                return "[]"
+            if command[:2] == ["GET", "ranks:trend:manbo"]:
+                raise RuntimeError("temporary trend read failure")
+            if command[0] == "GET":
+                return written.get(str(command[1]))
+            if command[0] == "SET":
+                written[str(command[1])] = str(command[2])
+                return "OK"
+            if command[0] == "DEL":
+                return 1
+            raise AssertionError(command)
+
+        with (
+            patch.object(fetch_rank_data, "now_iso", return_value="2026-05-16T00:00:00+00:00"),
+            patch.object(fetch_rank_data, "upstash_request", side_effect=fake_request),
+            patch("builtins.print"),
+        ):
+            merged = fetch_rank_data.upload_rank_outputs(store, ("manbo",))
+
+        self.assertIn("ranks:latest", written)
+        self.assertEqual(json.loads(written["ranks:latest"])["manbo"]["dramas"]["93038"]["view_count"], 123)
+        self.assertEqual(merged["manbo"]["dramas"]["93038"]["view_count"], 123)
+
+
+class RankTrendCliTests(unittest.TestCase):
+    def test_backfill_cli_runs_and_exits_before_refresh_flow(self) -> None:
+        with (
+            patch.object(sys, "argv", ["fetch_rank_data.py", "--backfill-rank-trends-from-history", "--missevan-only"]),
+            patch.object(fetch_rank_data, "backfill_rank_trends_from_history", return_value={"missevan": {}}) as backfill,
+            patch.object(fetch_rank_data, "load_initial_rank_store", side_effect=AssertionError("refresh should not run")),
+            patch("builtins.print"),
+        ):
+            fetch_rank_data.main()
+
+        backfill.assert_called_once_with(("missevan",))
 
 
 class ManboCvLookupTests(unittest.TestCase):
