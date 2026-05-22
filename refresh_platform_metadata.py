@@ -59,6 +59,29 @@ MISSEVAN_INTRO_CV_SECTION_PATTERN = re.compile(
 MISSEVAN_INTRO_SECTION_PATTERN = re.compile(r"^(?:[=＝\-\s]*)?(?:[^：:]{1,20}(?:组|制作|字幕|参与配音)|(?:[^：:]{0,20})staff)(?:[=＝\-\s]*|[：:]\s*)?$", re.I)
 MISSEVAN_INTRO_ROLE_CV_PATTERN = re.compile(r"^(?P<role>[^：:\n]{1,40})[：:](?P<cv>.+)$")
 MISSEVAN_CV_SUFFIX_PATTERN = re.compile(r"\s*(?:@|＠|【|\[|（|\(|<|《).*$")
+MISSEVAN_INTRO_STAFF_ROLE_NAMES = {
+    "配音导演",
+    "声音导演",
+    "录音棚",
+    "录音",
+    "录制",
+    "后期",
+    "后期制作",
+    "对轨",
+    "画本",
+    "编剧",
+    "剧本改编",
+    "策划",
+    "统筹",
+    "监制",
+    "制作人",
+    "美工",
+    "题字",
+    "字幕",
+    "宣传",
+    "出品",
+    "发行",
+}
 MANBO_MAINCV_OVERRIDES = {
     "1653464054477357115": {
         "ids": [1793456226309, 1942055112768, 2664739041286],  # 宫墙柳 + 魏超
@@ -293,6 +316,16 @@ def is_missevan_intro_narrator_role(role_name: object) -> bool:
     return bool(parts) and all(is_narrator_role(part) for part in parts)
 
 
+def is_missevan_intro_staff_role(role_name: object) -> bool:
+    role = normalize(role_name)
+    if not role:
+        return False
+    parts = [normalize(part) for part in re.split(r"[/／、，,\s]+", role) if normalize(part)]
+    return role in MISSEVAN_INTRO_STAFF_ROLE_NAMES or (
+        bool(parts) and all(part in MISSEVAN_INTRO_STAFF_ROLE_NAMES for part in parts)
+    )
+
+
 def extract_missevan_intro_cv_candidates(intro: object, *, limit: int = 2) -> list[dict]:
     lines = missevan_intro_text_lines(intro)
     candidates: list[dict] = []
@@ -311,7 +344,7 @@ def extract_missevan_intro_cv_candidates(intro: object, *, limit: int = 2) -> li
         if not match:
             continue
         role_name = normalize(match.group("role"))
-        if is_missevan_intro_narrator_role(role_name):
+        if is_missevan_intro_narrator_role(role_name) or is_missevan_intro_staff_role(role_name):
             continue
         display_name = clean_missevan_intro_cv_name(match.group("cv"))
         if not display_name:

@@ -97,6 +97,25 @@ class MissevanIntroCvCandidateTests(unittest.TestCase):
             ],
         )
 
+    def test_filters_staff_lines_inside_cv_section(self) -> None:
+        intro = """
+        <p>配音组</p>
+        <p>谢岫：吴晛@吴晛Hsien</p>
+        <p>配音导演：张馨月</p>
+        <p>录音棚：九紫声优团</p>
+        <p>霍无归：云惟一@-云惟一</p>
+        """
+
+        candidates = refresh_platform_metadata.extract_missevan_intro_cv_candidates(intro)
+
+        self.assertEqual(
+            candidates,
+            [
+                {"role_name": "谢岫", "display_name": "吴晛"},
+                {"role_name": "霍无归", "display_name": "云惟一"},
+            ],
+        )
+
     def test_does_not_extract_role_lines_without_cv_section_title(self) -> None:
         intro = """
         <p>普通简介</p>
