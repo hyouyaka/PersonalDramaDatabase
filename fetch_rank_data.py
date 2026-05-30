@@ -492,6 +492,24 @@ TREND_DRAMA_FIELDS = (
     "updated_at",
 )
 
+DANMAKU_REPAIR_COPY_FIELDS = (
+    "name",
+    "view_count",
+    "favorite_count",
+    "subscription_num",
+    "reward_num",
+    "reward_total",
+    "pay_count",
+    "diamond_value",
+    "cover",
+    "maincvs",
+    "catalogName",
+    "payStatus",
+    "createTime",
+    "updated_at",
+    "fetched_at",
+)
+
 
 def _trend_metrics_from_entry(entry: dict) -> dict:
     return {
@@ -951,17 +969,14 @@ def upload_rank_history(
             pruned_dates=pruned_dates,
         )
     for platform in platforms:
-        try:
-            upload_rank_trend_snapshot(
-                platform,
-                history_date,
-                payloads.get(f"ranks:metrics:{history_date}:{platform}"),
-                payloads.get(f"ranks:list:{history_date}:{platform}"),
-                generated_at=generated_at,
-                pruned_dates=pruned_dates,
-            )
-        except Exception as exc:
-            print(f"  [upstash] WARN: failed to upload {TREND_KEYS[platform]}: {exc}")
+        upload_rank_trend_snapshot(
+            platform,
+            history_date,
+            payloads.get(f"ranks:metrics:{history_date}:{platform}"),
+            payloads.get(f"ranks:list:{history_date}:{platform}"),
+            generated_at=generated_at,
+            pruned_dates=pruned_dates,
+        )
     for old_date in pruned_dates:
         for platform in PLATFORMS:
             upstash_request(["DEL", f"ranks:list:{old_date}:{platform}"])
@@ -1468,6 +1483,13 @@ def _fetch_missevan_danmaku(requester: MissevanRequester, episodes: list[dict], 
             resp.raise_for_status()
             _parse_missevan_dm_xml(resp.text, uid_set)
             success_sounds += 1
+        except requests.HTTPError as exc:
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", None)
+            if status_code == 418:
+                raise RuntimeError(f"HTTP_418 while fetching Missevan danmaku sound {sound_id}") from exc
+            print(f"    [danmaku] WARN: failed for sound {sound_id}: {exc}")
+            failed_sounds.append(sound_id)
         except Exception as exc:
             print(f"    [danmaku] WARN: failed for sound {sound_id}: {exc}")
             failed_sounds.append(sound_id)
@@ -2135,6 +2157,487 @@ def _load_upstash_json_strict(key: str) -> dict | list | None:
 
 
 # ---------------------------------------------------------------------------
+# Null danmaku repair mode
+# ---------------------------------------------------------------------------
+
+def is_empty_danmaku_value(value: object) -> bool:
+    """Return True for missing/blank danmaku values while preserving valid zero counts."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    return False
+
+
+def resolve_repair_history_date(explicit_date: str | None) -> str:
+    if explicit_date:
+        return str(explicit_date)
+    index = load_rank_history_index()
+    dates = [str(value) for value in (index.get("dates") or []) if value not in (None, "")]
+    if not dates:
+        raise RuntimeError("No rank history date found in ranks:index; pass --date YYYY-MM-DD.")
+    return max(dates)
+
+
+def _add_repair_source(targets: set[str], sources: dict[str, list[str]], drama_id: str, source: str) -> None:
+    targets.add(drama_id)
+    source_list = sources.setdefault(drama_id, [])
+    if source not in source_list:
+        source_list.append(source)
+
+
+def _entry_has_empty_danmaku(entry: object) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    if "danmaku_uid_count" not in entry:
+        return True
+    return is_empty_danmaku_value(entry.get("danmaku_uid_count"))
+
+
+def _collect_rank_memberships(ranks: object) -> dict[str, set[str]]:
+    memberships: dict[str, set[str]] = {}
+    if not isinstance(ranks, dict):
+        return memberships
+    for rank_key, rank in ranks.items():
+        if not isinstance(rank, dict):
+            continue
+        for item in rank.get("items") or []:
+            for drama_id in _rank_item_drama_ids(item):
+                memberships.setdefault(drama_id, set()).add(str(rank_key))
+    return memberships
+
+
+def _merge_rank_memberships(target: dict[str, set[str]], source: dict[str, set[str]]) -> None:
+    for drama_id, rank_keys in source.items():
+        target.setdefault(drama_id, set()).update(rank_keys)
+
+
+def _manbo_rank_memberships_from_payloads(payloads: dict[str, object], history_date: str) -> dict[str, set[str]]:
+    memberships: dict[str, set[str]] = {}
+
+    partial = payloads.get("partial")
+    partial_data = partial.get("data") if isinstance(partial, dict) else None
+    if isinstance(partial_data, dict):
+        _merge_rank_memberships(memberships, _collect_rank_memberships(partial_data.get("ranks")))
+
+    latest = payloads.get("latest")
+    latest_manbo = latest.get("manbo") if isinstance(latest, dict) else None
+    if isinstance(latest_manbo, dict):
+        _merge_rank_memberships(memberships, _collect_rank_memberships(latest_manbo.get("ranks")))
+
+    trend = payloads.get("trend")
+    trend_dramas = trend.get("dramas") if isinstance(trend, dict) else None
+    if isinstance(trend_dramas, dict):
+        for drama_id, entry in trend_dramas.items():
+            if not isinstance(entry, dict):
+                continue
+            samples = entry.get("samples")
+            sample = samples.get(history_date) if isinstance(samples, dict) else None
+            ranks = sample.get("ranks") if isinstance(sample, dict) else None
+            if not isinstance(ranks, list):
+                continue
+            for rank in ranks:
+                if not isinstance(rank, dict):
+                    continue
+                rank_key = rank.get("key")
+                if rank_key not in (None, ""):
+                    memberships.setdefault(str(drama_id), set()).add(str(rank_key))
+
+    return memberships
+
+
+def _drop_manbo_peak_only_targets(
+    targets: set[str],
+    sources: dict[str, list[str]],
+    payloads: dict[str, object],
+    history_date: str,
+) -> None:
+    memberships = _manbo_rank_memberships_from_payloads(payloads, history_date)
+    ongoing_ids = extract_ongoing_ids(payloads.get("ongoing"))
+    for drama_id, rank_keys in list(memberships.items()):
+        if drama_id in targets and drama_id not in ongoing_ids and rank_keys and rank_keys <= {"peak"}:
+            targets.discard(drama_id)
+            sources.pop(drama_id, None)
+
+
+def collect_null_danmaku_ids_from_layers(
+    platform: str,
+    history_date: str,
+) -> tuple[set[str], dict[str, list[str]], dict[str, object]]:
+    if platform not in PLATFORMS:
+        raise ValueError(f"Unsupported platform: {platform}")
+
+    payloads: dict[str, object] = {
+        "metrics": _load_upstash_json_strict(f"ranks:metrics:{history_date}:{platform}"),
+        "partial": _load_upstash_json_strict(RANK_PARTIAL_KEYS[platform]),
+        "latest": _load_upstash_json_strict("ranks:latest"),
+        "trend": _load_upstash_json_strict(TREND_KEYS[platform]),
+    }
+    if platform == "manbo":
+        payloads["ongoing"] = _load_upstash_json(ONGOING_KEYS[platform])
+    targets: set[str] = set()
+    sources: dict[str, list[str]] = {}
+
+    metrics = payloads.get("metrics")
+    metric_dramas = metrics.get("dramas") if isinstance(metrics, dict) else None
+    if isinstance(metric_dramas, dict):
+        for drama_id, entry in metric_dramas.items():
+            if _entry_has_empty_danmaku(entry):
+                _add_repair_source(targets, sources, str(drama_id), "metrics")
+
+    partial = payloads.get("partial")
+    partial_data = partial.get("data") if isinstance(partial, dict) else None
+    partial_dramas = partial_data.get("dramas") if isinstance(partial_data, dict) else None
+    if isinstance(partial_dramas, dict):
+        for drama_id, entry in partial_dramas.items():
+            if _entry_has_empty_danmaku(entry):
+                _add_repair_source(targets, sources, str(drama_id), "partial")
+
+    latest = payloads.get("latest")
+    latest_platform = latest.get(platform) if isinstance(latest, dict) else None
+    latest_dramas = latest_platform.get("dramas") if isinstance(latest_platform, dict) else None
+    if isinstance(latest_dramas, dict):
+        for drama_id, entry in latest_dramas.items():
+            if _entry_has_empty_danmaku(entry):
+                _add_repair_source(targets, sources, str(drama_id), "latest")
+
+    trend = payloads.get("trend")
+    trend_dramas = trend.get("dramas") if isinstance(trend, dict) else None
+    if isinstance(trend_dramas, dict):
+        for drama_id, entry in trend_dramas.items():
+            if not isinstance(entry, dict):
+                continue
+            samples = entry.get("samples")
+            if not isinstance(samples, dict) or history_date not in samples:
+                continue
+            sample = samples.get(history_date)
+            metrics_sample = sample.get("metrics") if isinstance(sample, dict) else None
+            if not isinstance(metrics_sample, dict) or "danmaku_uid_count" not in metrics_sample:
+                _add_repair_source(targets, sources, str(drama_id), "trend")
+            elif is_empty_danmaku_value(metrics_sample.get("danmaku_uid_count")):
+                _add_repair_source(targets, sources, str(drama_id), "trend")
+
+    if platform == "manbo":
+        _drop_manbo_peak_only_targets(targets, sources, payloads, history_date)
+
+    return targets, sources, payloads
+
+
+def _payload_drama_entry(payloads: dict[str, object], layer: str, platform: str, drama_id: str) -> dict | None:
+    payload = payloads.get(layer)
+    if layer == "metrics" and isinstance(payload, dict):
+        dramas = payload.get("dramas")
+        entry = dramas.get(drama_id) if isinstance(dramas, dict) else None
+        return entry if isinstance(entry, dict) else None
+    if layer == "partial" and isinstance(payload, dict):
+        data = payload.get("data")
+        dramas = data.get("dramas") if isinstance(data, dict) else None
+        entry = dramas.get(drama_id) if isinstance(dramas, dict) else None
+        return entry if isinstance(entry, dict) else None
+    if layer == "latest" and isinstance(payload, dict):
+        platform_payload = payload.get(platform)
+        dramas = platform_payload.get("dramas") if isinstance(platform_payload, dict) else None
+        entry = dramas.get(drama_id) if isinstance(dramas, dict) else None
+        return entry if isinstance(entry, dict) else None
+    if layer == "trend" and isinstance(payload, dict):
+        dramas = payload.get("dramas")
+        entry = dramas.get(drama_id) if isinstance(dramas, dict) else None
+        return entry if isinstance(entry, dict) else None
+    return None
+
+
+def _source_metric_entry(payloads: dict[str, object], platform: str, history_date: str, drama_id: str) -> dict:
+    merged: dict[str, object] = {}
+    for layer in ("metrics", "partial", "latest", "trend"):
+        entry = _payload_drama_entry(payloads, layer, platform, drama_id)
+        if not isinstance(entry, dict):
+            continue
+        if layer == "trend":
+            for field in ("name", "cover", "maincvs", "catalogName", "payStatus", "createTime", "updated_at"):
+                value = entry.get(field)
+                if value not in (None, "") and field not in merged:
+                    merged[field] = value
+            samples = entry.get("samples")
+            sample = samples.get(history_date) if isinstance(samples, dict) else None
+            sample_metrics = sample.get("metrics") if isinstance(sample, dict) else None
+            if isinstance(sample_metrics, dict):
+                for field in DANMAKU_REPAIR_COPY_FIELDS:
+                    value = sample_metrics.get(field)
+                    if value not in (None, "") and field not in merged:
+                        merged[field] = value
+            continue
+        for field in DANMAKU_REPAIR_COPY_FIELDS:
+            value = entry.get(field)
+            if value not in (None, "") and field not in merged:
+                merged[field] = value
+    merged.setdefault("name", drama_id)
+    return merged
+
+
+def _ensure_repair_metrics_payload(payload: object, platform: str, history_date: str, generated_at: str) -> dict:
+    if isinstance(payload, dict):
+        result = payload
+    else:
+        result = {}
+    result["version"] = result.get("version") or 1
+    result["date"] = result.get("date") or history_date
+    result["platform"] = result.get("platform") or platform
+    result["generated_at"] = generated_at
+    result.setdefault("dramas", {})
+    if not isinstance(result["dramas"], dict):
+        result["dramas"] = {}
+    return result
+
+
+def _ensure_repair_partial_payload(payload: object, platform: str, generated_at: str) -> dict:
+    if isinstance(payload, dict):
+        result = payload
+    else:
+        result = {}
+    result["version"] = result.get("version") or 1
+    result["platform"] = result.get("platform") or platform
+    result["updated_at"] = generated_at
+    data = result.get("data")
+    if not isinstance(data, dict):
+        data = {}
+        result["data"] = data
+    data.setdefault("ranks", {})
+    data.setdefault("dramas", {})
+    if not isinstance(data["dramas"], dict):
+        data["dramas"] = {}
+    return result
+
+
+def _ensure_repair_latest_payload(payload: object, generated_at: str) -> dict:
+    result = payload if isinstance(payload, dict) else {}
+    result.setdefault("_meta", {})
+    if isinstance(result["_meta"], dict):
+        result["_meta"]["updated_at"] = generated_at
+    for platform in PLATFORMS:
+        platform_payload = result.get(platform)
+        if not isinstance(platform_payload, dict):
+            platform_payload = {}
+            result[platform] = platform_payload
+        platform_payload.setdefault("ranks", {})
+        platform_payload.setdefault("dramas", {})
+        if not isinstance(platform_payload["dramas"], dict):
+            platform_payload["dramas"] = {}
+    return result
+
+
+def _ensure_repair_trend_payload(payload: object, platform: str, history_date: str, generated_at: str) -> dict:
+    result = payload if isinstance(payload, dict) else {}
+    result["version"] = result.get("version") or 1
+    result["platform"] = result.get("platform") or platform
+    result["updated_at"] = generated_at
+    dates = [str(value) for value in (result.get("dates") or []) if value not in (None, "")]
+    dates.append(history_date)
+    result["dates"] = sorted(set(dates))
+    result.setdefault("dramas", {})
+    if not isinstance(result["dramas"], dict):
+        result["dramas"] = {}
+    return result
+
+
+def write_repaired_danmaku_layers(
+    platform: str,
+    history_date: str,
+    repaired_counts: dict[str, int],
+    loaded_payloads: dict[str, object],
+) -> None:
+    if not repaired_counts:
+        return
+
+    generated_at = now_iso()
+    metrics_payload = _ensure_repair_metrics_payload(
+        loaded_payloads.get("metrics"),
+        platform,
+        history_date,
+        generated_at,
+    )
+    partial_payload = _ensure_repair_partial_payload(loaded_payloads.get("partial"), platform, generated_at)
+    latest_payload = _ensure_repair_latest_payload(loaded_payloads.get("latest"), generated_at)
+    trend_payload = _ensure_repair_trend_payload(
+        loaded_payloads.get("trend"),
+        platform,
+        history_date,
+        generated_at,
+    )
+
+    metric_dramas = metrics_payload["dramas"]
+    partial_dramas = partial_payload["data"]["dramas"]
+    latest_dramas = latest_payload[platform]["dramas"]
+    trend_dramas = trend_payload["dramas"]
+
+    for drama_id, count in sorted(repaired_counts.items()):
+        source_entry = _source_metric_entry(loaded_payloads, platform, history_date, drama_id)
+
+        metric_entry = metric_dramas.setdefault(drama_id, dict(source_entry))
+        if isinstance(metric_entry, dict):
+            for field, value in source_entry.items():
+                metric_entry.setdefault(field, value)
+            metric_entry["danmaku_uid_count"] = count
+            metric_entry["fetched_at"] = generated_at
+
+        partial_entry = partial_dramas.setdefault(drama_id, dict(metric_entry if isinstance(metric_entry, dict) else source_entry))
+        if isinstance(partial_entry, dict):
+            for field, value in source_entry.items():
+                partial_entry.setdefault(field, value)
+            partial_entry["danmaku_uid_count"] = count
+            partial_entry["fetched_at"] = generated_at
+
+        latest_entry = latest_dramas.setdefault(drama_id, dict(metric_entry if isinstance(metric_entry, dict) else source_entry))
+        if isinstance(latest_entry, dict):
+            for field, value in source_entry.items():
+                latest_entry.setdefault(field, value)
+            latest_entry["danmaku_uid_count"] = count
+            latest_entry["fetched_at"] = generated_at
+
+        trend_entry = trend_dramas.setdefault(drama_id, {"id": drama_id, "name": source_entry.get("name") or drama_id})
+        if isinstance(trend_entry, dict):
+            trend_entry["id"] = str(trend_entry.get("id") or drama_id)
+            trend_entry["name"] = str(source_entry.get("name") or trend_entry.get("name") or drama_id)
+            _copy_trend_drama_fields(trend_entry, source_entry)
+            samples = trend_entry.setdefault("samples", {})
+            if not isinstance(samples, dict):
+                samples = {}
+                trend_entry["samples"] = samples
+            sample = samples.setdefault(history_date, {"metrics": {}, "ranks": []})
+            if not isinstance(sample, dict):
+                sample = {"metrics": {}, "ranks": []}
+                samples[history_date] = sample
+            sample.setdefault("ranks", [])
+            sample["generated_at"] = generated_at
+            sample_metrics = sample.setdefault("metrics", {})
+            if not isinstance(sample_metrics, dict):
+                sample_metrics = {}
+                sample["metrics"] = sample_metrics
+            for field in TREND_METRIC_FIELDS:
+                if field in source_entry and field not in sample_metrics:
+                    sample_metrics[field] = source_entry[field]
+            sample_metrics["danmaku_uid_count"] = count
+
+    writes = (
+        (f"ranks:metrics:{history_date}:{platform}", metrics_payload),
+        (RANK_PARTIAL_KEYS[platform], partial_payload),
+        ("ranks:latest", latest_payload),
+        (TREND_KEYS[platform], trend_payload),
+    )
+    for key, payload in writes:
+        encoded = json.dumps(payload, ensure_ascii=False)
+        result = upstash_request(["SET", key, encoded])
+        if result != "OK":
+            raise RuntimeError(f"Failed to upload {key}: {result!r}")
+        print(f"[ok] repaired {key} ({len(encoded)} bytes)")
+
+
+def fetch_one_missevan_danmaku_count(drama_id: str, requester: MissevanRequester | None = None) -> tuple[str, int]:
+    active_requester = requester or MissevanRequester()
+    url = f"https://www.missevan.com/dramaapi/getdrama?drama_id={drama_id}"
+    data = active_requester.request_json(url)
+    info = data.get("info") or {}
+    episodes = (info.get("episodes") or {}).get("episode") or []
+    entry: dict = {}
+    _fetch_missevan_danmaku(active_requester, episodes, entry)
+    return str(drama_id), safe_int(entry.get("danmaku_uid_count"))
+
+
+def _repair_one_danmaku(platform: str, drama_id: str, requester: MissevanRequester | None = None) -> tuple[str, int]:
+    if platform == "missevan":
+        return fetch_one_missevan_danmaku_count(drama_id, requester)
+    if platform == "manbo":
+        return fetch_one_manbo_danmaku_count(drama_id)
+    raise ValueError(f"Unsupported platform: {platform}")
+
+
+def repair_null_danmaku_for_platform(
+    platform: str,
+    history_date: str,
+    *,
+    attempts: int = DANMAKU_DRAMA_RETRY_ATTEMPTS,
+    dry_run: bool = False,
+) -> dict[str, object]:
+    targets, sources, payloads = collect_null_danmaku_ids_from_layers(platform, history_date)
+    sorted_targets = sorted(targets)
+    print(f"[repair-null-danmaku] {platform} date={history_date} targets={len(sorted_targets)}")
+    for drama_id in sorted_targets:
+        print(f"  [{platform}] target {drama_id}: sources={','.join(sources.get(drama_id, []))}")
+
+    if dry_run or not sorted_targets:
+        if not sorted_targets:
+            print(f"  [{platform}] no empty danmaku entries")
+        return {"platform": platform, "date": history_date, "targets": sorted_targets, "repaired": {}, "failed": []}
+
+    requester = MissevanRequester() if platform == "missevan" else None
+    repaired: dict[str, int] = {}
+    failed: set[str] = set()
+    for idx, drama_id in enumerate(sorted_targets, 1):
+        try:
+            _, count = _repair_one_danmaku(platform, drama_id, requester)
+            repaired[drama_id] = count
+            print(f"  [{platform}] ({idx}/{len(sorted_targets)}) drama {drama_id}: {count} danmaku IDs")
+        except RuntimeError as exc:
+            if "HTTP_418" in str(exc):
+                if repaired:
+                    write_repaired_danmaku_layers(platform, history_date, repaired, payloads)
+                raise
+            print(f"  [{platform}] ({idx}/{len(sorted_targets)}) ERROR on {drama_id}: {exc}")
+            failed.add(drama_id)
+        except Exception as exc:
+            print(f"  [{platform}] ({idx}/{len(sorted_targets)}) ERROR on {drama_id}: {exc}")
+            failed.add(drama_id)
+
+    def retry_one_danmaku(drama_id: str) -> None:
+        _, count = _repair_one_danmaku(platform, drama_id, requester)
+        repaired[str(drama_id)] = count
+
+    try:
+        still_failed = retry_failed_danmaku_ids(
+            platform,
+            failed,
+            retry_one_danmaku,
+            max_attempts=attempts,
+        )
+    except RuntimeError as exc:
+        if "HTTP_418" in str(exc) and repaired:
+            write_repaired_danmaku_layers(platform, history_date, repaired, payloads)
+        raise
+    for drama_id in still_failed:
+        repaired.pop(str(drama_id), None)
+
+    if repaired:
+        write_repaired_danmaku_layers(platform, history_date, repaired, payloads)
+    else:
+        print(f"  [{platform}] no danmaku entries repaired")
+
+    return {
+        "platform": platform,
+        "date": history_date,
+        "targets": sorted_targets,
+        "repaired": repaired,
+        "failed": sorted(still_failed),
+    }
+
+
+def repair_null_danmaku_mode(
+    *,
+    history_date: str,
+    platforms: tuple[str, ...] | list[str],
+    attempts: int,
+    dry_run: bool,
+) -> dict[str, dict[str, object]]:
+    results: dict[str, dict[str, object]] = {}
+    for platform in platforms:
+        results[platform] = repair_null_danmaku_for_platform(
+            platform,
+            history_date,
+            attempts=attempts,
+            dry_run=dry_run,
+        )
+    return results
+
+
+# ---------------------------------------------------------------------------
 # --only-danmaku mode
 # ---------------------------------------------------------------------------
 
@@ -2226,6 +2729,10 @@ def main() -> None:
     parser.add_argument("--benchmark-page-size", type=int, default=MANBO_DANMAKU_PAGE_SIZE, help="Page size for Manbo benchmark")
     parser.add_argument("--backfill-missevan-peak-trend-from-latest", action="store_true", help="Backfill Missevan peak view-count trend from ranks:latest")
     parser.add_argument("--backfill-rank-trends-from-history", action="store_true", help="Backfill normal rank trends from ranks:index history shards")
+    parser.add_argument("--repair-null-danmaku", action="store_true", help="Repair empty danmaku UID counts across Upstash rank layers")
+    parser.add_argument("--date", help="History date to repair, defaults to latest date from ranks:index")
+    parser.add_argument("--repair-attempts", type=int, default=DANMAKU_DRAMA_RETRY_ATTEMPTS, help="Retry rounds for failed danmaku repairs")
+    parser.add_argument("--dry-run", action="store_true", help="List repair targets without fetching or writing")
     platform_group = parser.add_mutually_exclusive_group()
     platform_group.add_argument("--missevan-only", action="store_true", help="Only process Missevan")
     platform_group.add_argument("--manbo-only", action="store_true", help="Only process Manbo")
@@ -2238,6 +2745,25 @@ def main() -> None:
         for platform, enabled in (("missevan", do_missevan), ("manbo", do_manbo))
         if enabled
     )
+
+    if args.repair_null_danmaku:
+        print("=== Repairing null danmaku UID counts ===")
+        history_date = resolve_repair_history_date(args.date)
+        results = repair_null_danmaku_mode(
+            history_date=history_date,
+            platforms=active_platforms,
+            attempts=args.repair_attempts,
+            dry_run=args.dry_run,
+        )
+        for platform, result in results.items():
+            print(
+                f"[ok] repair summary {platform}: "
+                f"targets={len(result.get('targets') or [])}, "
+                f"repaired={len(result.get('repaired') or {})}, "
+                f"failed={len(result.get('failed') or [])}"
+            )
+        print("=== Done (repair-null-danmaku) ===")
+        return
 
     if args.backfill_rank_trends_from_history:
         print("=== Backfilling normal rank trends from history shards ===")
@@ -2288,10 +2814,7 @@ def main() -> None:
         only_danmaku_mode(store, force=args.force, do_missevan=do_missevan, do_manbo=do_manbo)
         store["_meta"]["updated_at"] = now_iso()
         save_json(RANKS_PATH, store)
-        try:
-            upload_rank_outputs(store, active_platforms)
-        except Exception as exc:
-            print(f"  [upstash] WARN: failed to upload rank outputs: {exc}")
+        upload_rank_outputs(store, active_platforms)
         print("=== Done (only-danmaku) ===")
         return
 
@@ -2410,10 +2933,7 @@ def main() -> None:
 
     # Upload to Upstash
     print("=== Uploading ranks to Upstash ===")
-    try:
-        upload_rank_outputs(store, active_platforms)
-    except Exception as exc:
-        print(f"  [upstash] WARN: failed to upload rank outputs: {exc}")
+    upload_rank_outputs(store, active_platforms)
 
     print("=== Done ===")
 

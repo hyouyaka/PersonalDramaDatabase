@@ -48,8 +48,14 @@ function Run-Step {
 
 $ExitCodes = @()
 $ExitCodes += Run-Step "fetch_ongoing.py" @("python", "-X", "utf8", "-u", "fetch_ongoing.py")
-$ExitCodes += Run-Step "fetch_rank_data.py" @("python", "-X", "utf8", "-u", "fetch_rank_data.py", "--force")
+$RankExitCode = Run-Step "fetch_rank_data.py" @("python", "-X", "utf8", "-u", "fetch_rank_data.py", "--force")
+$ExitCodes += $RankExitCode
 $ExitCodes += Run-Step "sync_new_drama_ids.py" @("python", "-X", "utf8", "-u", "sync_new_drama_ids.py", "--backfill-ranks")
+if ([int]$RankExitCode -eq 0) {
+    $ExitCodes += Run-Step "fetch_rank_data.py --repair-null-danmaku" @("python", "-X", "utf8", "-u", "fetch_rank_data.py", "--repair-null-danmaku")
+} else {
+    Write-Log "=== fetch_rank_data.py --repair-null-danmaku skipped: fetch_rank_data.py exit=$RankExitCode ==="
+}
 
 $FailedExitCodes = $ExitCodes | Where-Object { [int]$_ -ne 0 }
 $FinalCode = if ($FailedExitCodes.Count -gt 0) { 1 } else { 0 }

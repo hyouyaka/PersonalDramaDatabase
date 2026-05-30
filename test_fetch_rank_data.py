@@ -4,6 +4,8 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
+import requests
+
 import fetch_rank_data
 
 
@@ -397,7 +399,7 @@ class RankTrendBackfillTests(unittest.TestCase):
 
         self.assertEqual(commands, [["GET", "ranks:trend:missevan"]])
 
-    def test_upload_rank_outputs_still_updates_latest_when_trend_read_fails(self) -> None:
+    def test_upload_rank_outputs_fails_when_trend_read_fails(self) -> None:
         store = {
             "_meta": {"updated_at": "2026-05-16T00:00:00+00:00"},
             "missevan": {"ranks": {}, "dramas": {}},
@@ -429,11 +431,10 @@ class RankTrendBackfillTests(unittest.TestCase):
             patch.object(fetch_rank_data, "upstash_request", side_effect=fake_request),
             patch("builtins.print"),
         ):
-            merged = fetch_rank_data.upload_rank_outputs(store, ("manbo",))
+            with self.assertRaisesRegex(RuntimeError, "temporary trend read failure"):
+                fetch_rank_data.upload_rank_outputs(store, ("manbo",))
 
-        self.assertIn("ranks:latest", written)
-        self.assertEqual(json.loads(written["ranks:latest"])["manbo"]["dramas"]["93038"]["view_count"], 123)
-        self.assertEqual(merged["manbo"]["dramas"]["93038"]["view_count"], 123)
+        self.assertNotIn("ranks:latest", written)
 
 
 class RankTrendCliTests(unittest.TestCase):
@@ -447,6 +448,512 @@ class RankTrendCliTests(unittest.TestCase):
             fetch_rank_data.main()
 
         backfill.assert_called_once_with(("missevan",))
+
+    def test_refresh_cli_fails_when_rank_upload_fails(self) -> None:
+        store = {
+            "_meta": {},
+            "missevan": {"ranks": {}, "dramas": {}},
+            "manbo": {"ranks": {}, "dramas": {}},
+        }
+
+        with (
+            patch.object(sys, "argv", ["fetch_rank_data.py", "--force", "--missevan-only"]),
+            patch.object(fetch_rank_data, "load_initial_rank_store", return_value=store),
+            patch.object(fetch_rank_data, "MissevanRequester"),
+            patch.object(fetch_rank_data, "fetch_missevan_ranks", return_value=(set(), set())),
+            patch.object(fetch_rank_data, "load_ongoing_drama_ids", return_value=set()),
+            patch.object(fetch_rank_data, "lookup_cvs"),
+            patch.object(fetch_rank_data, "save_json"),
+            patch.object(fetch_rank_data, "upload_rank_outputs", side_effect=RuntimeError("publish failed")),
+            patch("builtins.print"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "publish failed"):
+                fetch_rank_data.main()
+
+    def test_only_danmaku_cli_fails_when_rank_upload_fails(self) -> None:
+        store = {
+            "_meta": {},
+            "missevan": {"ranks": {}, "dramas": {}},
+            "manbo": {"ranks": {}, "dramas": {}},
+        }
+
+        with (
+            patch.object(sys, "argv", ["fetch_rank_data.py", "--only-danmaku", "--missevan-only"]),
+            patch.object(fetch_rank_data, "load_initial_rank_store", return_value=store),
+            patch.object(fetch_rank_data, "only_danmaku_mode"),
+            patch.object(fetch_rank_data, "save_json"),
+            patch.object(fetch_rank_data, "upload_rank_outputs", side_effect=RuntimeError("publish failed")),
+            patch("builtins.print"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "publish failed"):
+                fetch_rank_data.main()
+
+
+class NullDanmakuRepairTests(unittest.TestCase):
+    def test_is_empty_danmaku_value_preserves_zero(self) -> None:
+        self.assertTrue(fetch_rank_data.is_empty_danmaku_value(None))
+        self.assertTrue(fetch_rank_data.is_empty_danmaku_value(""))
+        self.assertTrue(fetch_rank_data.is_empty_danmaku_value("   "))
+        self.assertFalse(fetch_rank_data.is_empty_danmaku_value(0))
+        self.assertFalse(fetch_rank_data.is_empty_danmaku_value("0"))
+        self.assertFalse(fetch_rank_data.is_empty_danmaku_value(12))
+
+    def test_collect_repair_ids_from_metrics_partial_latest_and_trend(self) -> None:
+        responses = {
+            "ranks:metrics:2026-05-28:missevan": {
+                "version": 1,
+                "date": "2026-05-28",
+                "platform": "missevan",
+                "generated_at": "2026-05-28T00:00:00+00:00",
+                "dramas": {
+                    "metrics-null": {"name": "metrics", "danmaku_uid_count": None},
+                    "ok": {"name": "ok", "danmaku_uid_count": 0},
+                },
+            },
+            "ranks:partial:missevan": {
+                "version": 1,
+                "platform": "missevan",
+                "data": {"ranks": {}, "dramas": {"partial-empty": {"name": "partial", "danmaku_uid_count": ""}}},
+            },
+            "ranks:latest": {
+                "version": 1,
+                "missevan": {"ranks": {}, "dramas": {"latest-missing": {"name": "latest"}}},
+                "manbo": {"ranks": {}, "dramas": {}},
+            },
+            "ranks:trend:missevan": {
+                "version": 1,
+                "platform": "missevan",
+                "dates": ["2026-05-28"],
+                "dramas": {
+                    "trend-null": {
+                        "id": "trend-null",
+                        "name": "trend",
+                        "samples": {"2026-05-28": {"metrics": {"danmaku_uid_count": None}, "ranks": []}},
+                    }
+                },
+            },
+        }
+
+        with patch.object(fetch_rank_data, "_load_upstash_json_strict", side_effect=lambda key: responses.get(key)):
+            targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers("missevan", "2026-05-28")
+
+        self.assertEqual(targets, {"metrics-null", "partial-empty", "latest-missing", "trend-null"})
+        self.assertEqual(sources["metrics-null"], ["metrics"])
+        self.assertEqual(sources["partial-empty"], ["partial"])
+        self.assertEqual(sources["latest-missing"], ["latest"])
+        self.assertEqual(sources["trend-null"], ["trend"])
+        self.assertNotIn("ok", targets)
+
+    def test_collect_repair_ids_includes_trend_null_when_latest_is_zero(self) -> None:
+        responses = {
+            "ranks:metrics:2026-05-28:missevan": {
+                "version": 1,
+                "date": "2026-05-28",
+                "platform": "missevan",
+                "generated_at": "2026-05-28T00:00:00+00:00",
+                "dramas": {"93038": {"name": "剧目", "danmaku_uid_count": 0}},
+            },
+            "ranks:partial:missevan": {
+                "version": 1,
+                "platform": "missevan",
+                "data": {"ranks": {}, "dramas": {"93038": {"name": "剧目", "danmaku_uid_count": 0}}},
+            },
+            "ranks:latest": {
+                "version": 1,
+                "missevan": {"ranks": {}, "dramas": {"93038": {"name": "剧目", "danmaku_uid_count": 0}}},
+                "manbo": {"ranks": {}, "dramas": {}},
+            },
+            "ranks:trend:missevan": {
+                "version": 1,
+                "platform": "missevan",
+                "dates": ["2026-05-28"],
+                "dramas": {
+                    "93038": {
+                        "id": "93038",
+                        "name": "剧目",
+                        "samples": {"2026-05-28": {"metrics": {"danmaku_uid_count": None}, "ranks": []}},
+                    }
+                },
+            },
+        }
+
+        with patch.object(fetch_rank_data, "_load_upstash_json_strict", side_effect=lambda key: responses.get(key)):
+            targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers("missevan", "2026-05-28")
+
+        self.assertEqual(targets, {"93038"})
+        self.assertEqual(sources["93038"], ["trend"])
+
+    def test_collect_repair_ids_skips_manbo_peak_only_entries(self) -> None:
+        responses = {
+            "ranks:metrics:2026-05-28:manbo": {
+                "version": 1,
+                "date": "2026-05-28",
+                "platform": "manbo",
+                "generated_at": "2026-05-28T00:00:00+00:00",
+                "dramas": {
+                    "peak-only": {"name": "只在巅峰榜", "danmaku_uid_count": None},
+                    "hot-only": {"name": "热播榜", "danmaku_uid_count": None},
+                    "peak-and-hot": {"name": "两个榜都有", "danmaku_uid_count": None},
+                },
+            },
+            "ranks:partial:manbo": {
+                "version": 1,
+                "platform": "manbo",
+                "data": {
+                    "ranks": {
+                        "peak": {"name": "巅峰榜", "items": [{"dramaId": "peak-only"}, {"dramaId": "peak-and-hot"}]},
+                        "hot": {"name": "热播榜", "items": [{"dramaId": "hot-only"}, {"dramaId": "peak-and-hot"}]},
+                    },
+                    "dramas": {
+                        "peak-only": {"name": "只在巅峰榜", "danmaku_uid_count": None},
+                        "hot-only": {"name": "热播榜", "danmaku_uid_count": None},
+                        "peak-and-hot": {"name": "两个榜都有", "danmaku_uid_count": None},
+                    },
+                },
+            },
+            "ranks:latest": {
+                "version": 1,
+                "missevan": {"ranks": {}, "dramas": {}},
+                "manbo": {
+                    "ranks": {
+                        "peak": {"name": "巅峰榜", "items": [{"dramaId": "peak-only"}, {"dramaId": "peak-and-hot"}]},
+                        "hot": {"name": "热播榜", "items": [{"dramaId": "hot-only"}, {"dramaId": "peak-and-hot"}]},
+                    },
+                    "dramas": {},
+                },
+            },
+            "ranks:trend:manbo": {
+                "version": 1,
+                "platform": "manbo",
+                "dates": ["2026-05-28"],
+                "dramas": {
+                    "peak-only": {
+                        "id": "peak-only",
+                        "name": "只在巅峰榜",
+                        "samples": {
+                            "2026-05-28": {
+                                "metrics": {"danmaku_uid_count": None},
+                                "ranks": [{"key": "peak", "name": "巅峰榜", "position": 1}],
+                            }
+                        },
+                    },
+                    "hot-only": {
+                        "id": "hot-only",
+                        "name": "热播榜",
+                        "samples": {
+                            "2026-05-28": {
+                                "metrics": {"danmaku_uid_count": None},
+                                "ranks": [{"key": "hot", "name": "热播榜", "position": 1}],
+                            }
+                        },
+                    },
+                    "peak-and-hot": {
+                        "id": "peak-and-hot",
+                        "name": "两个榜都有",
+                        "samples": {
+                            "2026-05-28": {
+                                "metrics": {"danmaku_uid_count": None},
+                                "ranks": [
+                                    {"key": "peak", "name": "巅峰榜", "position": 2},
+                                    {"key": "hot", "name": "热播榜", "position": 2},
+                                ],
+                            }
+                        },
+                    },
+                },
+            },
+        }
+
+        with (
+            patch.object(fetch_rank_data, "_load_upstash_json_strict", side_effect=lambda key: responses.get(key)),
+            patch.object(fetch_rank_data, "_load_upstash_json", side_effect=lambda key: responses.get(key)),
+        ):
+            targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers("manbo", "2026-05-28")
+
+        self.assertEqual(targets, {"hot-only", "peak-and-hot"})
+        self.assertNotIn("peak-only", sources)
+
+    def test_collect_repair_ids_keeps_manbo_peak_only_when_ongoing(self) -> None:
+        responses = {
+            "ranks:metrics:2026-05-28:manbo": {
+                "version": 1,
+                "date": "2026-05-28",
+                "platform": "manbo",
+                "dramas": {"peak-ongoing": {"name": "巅峰榜更新剧", "danmaku_uid_count": None}},
+            },
+            "ranks:partial:manbo": {
+                "version": 1,
+                "platform": "manbo",
+                "data": {
+                    "ranks": {"peak": {"name": "巅峰榜", "items": [{"dramaId": "peak-ongoing"}]}},
+                    "dramas": {"peak-ongoing": {"name": "巅峰榜更新剧", "danmaku_uid_count": None}},
+                },
+            },
+            "ranks:latest": {
+                "version": 1,
+                "missevan": {"ranks": {}, "dramas": {}},
+                "manbo": {
+                    "ranks": {"peak": {"name": "巅峰榜", "items": [{"dramaId": "peak-ongoing"}]}},
+                    "dramas": {"peak-ongoing": {"name": "巅峰榜更新剧", "danmaku_uid_count": None}},
+                },
+            },
+            "ranks:trend:manbo": {
+                "version": 1,
+                "platform": "manbo",
+                "dates": ["2026-05-28"],
+                "dramas": {
+                    "peak-ongoing": {
+                        "id": "peak-ongoing",
+                        "name": "巅峰榜更新剧",
+                        "samples": {
+                            "2026-05-28": {
+                                "metrics": {"danmaku_uid_count": None},
+                                "ranks": [{"key": "peak", "name": "巅峰榜", "position": 1}],
+                            }
+                        },
+                    }
+                },
+            },
+            "ongoing:manbo": {
+                "version": 1,
+                "platform": "manbo",
+                "records": {"peak-ongoing": {"dramaId": "peak-ongoing", "updateType": "weekly"}},
+            },
+        }
+
+        with (
+            patch.object(fetch_rank_data, "_load_upstash_json_strict", side_effect=lambda key: responses.get(key)),
+            patch.object(fetch_rank_data, "_load_upstash_json", side_effect=lambda key: responses.get(key)),
+        ):
+            targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers("manbo", "2026-05-28")
+
+        self.assertEqual(targets, {"peak-ongoing"})
+        self.assertEqual(sources["peak-ongoing"], ["metrics", "partial", "latest", "trend"])
+
+    def test_collect_repair_ids_aborts_when_rewritten_layer_read_fails(self) -> None:
+        def fake_request(command: list[object]) -> object:
+            if command[:2] == ["GET", "ranks:latest"]:
+                raise RuntimeError("temporary latest read failure")
+            if command[0] == "GET":
+                return json.dumps({"version": 1, "dramas": {}}, ensure_ascii=False)
+            if command[0] == "SET":
+                raise AssertionError("repair should not write after a read failure")
+            raise AssertionError(command)
+
+        with patch.object(fetch_rank_data, "upstash_request", side_effect=fake_request):
+            with self.assertRaisesRegex(RuntimeError, "Failed to load ranks:latest"):
+                fetch_rank_data.collect_null_danmaku_ids_from_layers("missevan", "2026-05-28")
+
+    def test_repair_dry_run_does_not_fetch_or_write(self) -> None:
+        payloads = {
+            "metrics": {
+                "version": 1,
+                "date": "2026-05-28",
+                "platform": "manbo",
+                "dramas": {"600": {"name": "漫播剧", "danmaku_uid_count": None}},
+            },
+            "partial": {"version": 1, "platform": "manbo", "data": {"ranks": {}, "dramas": {}}},
+            "latest": {"version": 1, "missevan": {"ranks": {}, "dramas": {}}, "manbo": {"ranks": {}, "dramas": {}}},
+            "trend": {"version": 1, "platform": "manbo", "dates": [], "dramas": {}},
+        }
+
+        with (
+            patch.object(fetch_rank_data, "collect_null_danmaku_ids_from_layers", return_value=({"600"}, {"600": ["metrics"]}, payloads)),
+            patch.object(fetch_rank_data, "fetch_one_manbo_danmaku_count", side_effect=AssertionError("should not fetch")),
+            patch.object(fetch_rank_data, "upstash_request", side_effect=AssertionError("should not write")),
+            patch("builtins.print"),
+        ):
+            result = fetch_rank_data.repair_null_danmaku_for_platform("manbo", "2026-05-28", dry_run=True)
+
+        self.assertEqual(result["targets"], ["600"])
+        self.assertEqual(result["repaired"], {})
+
+    def test_repair_writes_same_count_to_all_layers(self) -> None:
+        payloads = {
+            "metrics": {
+                "version": 1,
+                "date": "2026-05-28",
+                "platform": "manbo",
+                "generated_at": "old",
+                "dramas": {"600": {"name": "漫播剧", "danmaku_uid_count": None}},
+            },
+            "partial": {
+                "version": 1,
+                "platform": "manbo",
+                "data": {"ranks": {}, "dramas": {"600": {"name": "漫播剧", "danmaku_uid_count": None}}},
+            },
+            "latest": {
+                "version": 1,
+                "missevan": {"ranks": {}, "dramas": {}},
+                "manbo": {"ranks": {}, "dramas": {"600": {"name": "漫播剧", "danmaku_uid_count": None}}},
+            },
+            "trend": {
+                "version": 1,
+                "platform": "manbo",
+                "dates": ["2026-05-28"],
+                "dramas": {
+                    "600": {
+                        "id": "600",
+                        "name": "漫播剧",
+                        "samples": {"2026-05-28": {"metrics": {"danmaku_uid_count": None}, "ranks": []}},
+                    }
+                },
+            },
+        }
+        written: dict[str, dict] = {}
+
+        def fake_request(command: list[object]) -> object:
+            if command[0] == "SET":
+                written[str(command[1])] = json.loads(str(command[2]))
+                return "OK"
+            raise AssertionError(command)
+
+        with (
+            patch.object(fetch_rank_data, "collect_null_danmaku_ids_from_layers", return_value=({"600"}, {"600": ["metrics", "partial", "latest", "trend"]}, payloads)),
+            patch.object(fetch_rank_data, "fetch_one_manbo_danmaku_count", return_value=("600", 42)),
+            patch.object(fetch_rank_data, "upstash_request", side_effect=fake_request),
+            patch.object(fetch_rank_data, "now_iso", return_value="2026-05-28T12:00:00+00:00"),
+            patch("builtins.print"),
+        ):
+            result = fetch_rank_data.repair_null_danmaku_for_platform("manbo", "2026-05-28")
+
+        self.assertEqual(result["repaired"], {"600": 42})
+        self.assertEqual(written["ranks:metrics:2026-05-28:manbo"]["dramas"]["600"]["danmaku_uid_count"], 42)
+        self.assertEqual(written["ranks:partial:manbo"]["data"]["dramas"]["600"]["danmaku_uid_count"], 42)
+        self.assertEqual(written["ranks:latest"]["manbo"]["dramas"]["600"]["danmaku_uid_count"], 42)
+        trend_metrics = written["ranks:trend:manbo"]["dramas"]["600"]["samples"]["2026-05-28"]["metrics"]
+        self.assertEqual(trend_metrics["danmaku_uid_count"], 42)
+
+    def test_repair_creates_metric_entry_when_target_only_in_trend(self) -> None:
+        payloads = {
+            "metrics": {"version": 1, "date": "2026-05-28", "platform": "missevan", "dramas": {}},
+            "partial": {"version": 1, "platform": "missevan", "data": {"ranks": {}, "dramas": {}}},
+            "latest": {"version": 1, "missevan": {"ranks": {}, "dramas": {}}, "manbo": {"ranks": {}, "dramas": {}}},
+            "trend": {
+                "version": 1,
+                "platform": "missevan",
+                "dates": ["2026-05-28"],
+                "dramas": {
+                    "93038": {
+                        "id": "93038",
+                        "name": "猫耳剧",
+                        "cover": "cover-a",
+                        "maincvs": ["甲"],
+                        "samples": {
+                            "2026-05-28": {
+                                "metrics": {"view_count": 123, "danmaku_uid_count": None},
+                                "ranks": [],
+                            }
+                        },
+                    }
+                },
+            },
+        }
+        written: dict[str, dict] = {}
+
+        def fake_request(command: list[object]) -> object:
+            if command[0] == "SET":
+                written[str(command[1])] = json.loads(str(command[2]))
+                return "OK"
+            raise AssertionError(command)
+
+        with (
+            patch.object(fetch_rank_data, "collect_null_danmaku_ids_from_layers", return_value=({"93038"}, {"93038": ["trend"]}, payloads)),
+            patch.object(fetch_rank_data, "fetch_one_missevan_danmaku_count", return_value=("93038", 7)),
+            patch.object(fetch_rank_data, "upstash_request", side_effect=fake_request),
+            patch.object(fetch_rank_data, "now_iso", return_value="2026-05-28T12:00:00+00:00"),
+            patch("builtins.print"),
+        ):
+            fetch_rank_data.repair_null_danmaku_for_platform("missevan", "2026-05-28")
+
+        metric_entry = written["ranks:metrics:2026-05-28:missevan"]["dramas"]["93038"]
+        self.assertEqual(metric_entry["name"], "猫耳剧")
+        self.assertEqual(metric_entry["cover"], "cover-a")
+        self.assertEqual(metric_entry["maincvs"], ["甲"])
+        self.assertEqual(metric_entry["view_count"], 123)
+        self.assertEqual(metric_entry["danmaku_uid_count"], 7)
+
+    def test_repair_date_override_skips_index_lookup(self) -> None:
+        with patch.object(fetch_rank_data, "load_rank_history_index", side_effect=AssertionError("index should not load")):
+            self.assertEqual(fetch_rank_data.resolve_repair_history_date("2026-05-28"), "2026-05-28")
+
+    def test_repair_writes_completed_counts_when_retry_hits_418(self) -> None:
+        payloads = {
+            "metrics": {
+                "version": 1,
+                "date": "2026-05-28",
+                "platform": "missevan",
+                "dramas": {
+                    "ok": {"name": "已成功", "danmaku_uid_count": None},
+                    "rate-limited": {"name": "限频", "danmaku_uid_count": None},
+                },
+            },
+            "partial": {"version": 1, "platform": "missevan", "data": {"ranks": {}, "dramas": {}}},
+            "latest": {"version": 1, "missevan": {"ranks": {}, "dramas": {}}, "manbo": {"ranks": {}, "dramas": {}}},
+            "trend": {"version": 1, "platform": "missevan", "dates": [], "dramas": {}},
+        }
+
+        with (
+            patch.object(
+                fetch_rank_data,
+                "collect_null_danmaku_ids_from_layers",
+                return_value=({"ok", "rate-limited"}, {"ok": ["metrics"], "rate-limited": ["metrics"]}, payloads),
+            ),
+            patch.object(
+                fetch_rank_data,
+                "_repair_one_danmaku",
+                side_effect=[("ok", 1), RuntimeError("temporary"), RuntimeError("HTTP_418")],
+            ),
+            patch.object(fetch_rank_data, "write_repaired_danmaku_layers") as write_layers,
+            patch("builtins.print"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "HTTP_418"):
+                fetch_rank_data.repair_null_danmaku_for_platform("missevan", "2026-05-28")
+
+        write_layers.assert_called_once_with("missevan", "2026-05-28", {"ok": 1}, payloads)
+
+    def test_repair_stops_when_missevan_getdm_returns_418(self) -> None:
+        payloads = {
+            "metrics": {
+                "version": 1,
+                "date": "2026-05-28",
+                "platform": "missevan",
+                "dramas": {
+                    "ok": {"name": "已成功", "danmaku_uid_count": None},
+                    "rate-limited": {"name": "限频", "danmaku_uid_count": None},
+                },
+            },
+            "partial": {"version": 1, "platform": "missevan", "data": {"ranks": {}, "dramas": {}}},
+            "latest": {"version": 1, "missevan": {"ranks": {}, "dramas": {}}, "manbo": {"ranks": {}, "dramas": {}}},
+            "trend": {"version": 1, "platform": "missevan", "dates": [], "dramas": {}},
+        }
+
+        class FakeRequester:
+            def request_json(self, url: str) -> dict:
+                if "ok" in url:
+                    return {"info": {"episodes": {"episode": []}}}
+                return {"info": {"episodes": {"episode": [{"need_pay": 1, "sound_id": "sound-418"}]}}}
+
+        response = requests.Response()
+        response.status_code = 418
+        response.url = "https://www.missevan.com/sound/getdm?soundid=sound-418"
+
+        with (
+            patch.object(
+                fetch_rank_data,
+                "collect_null_danmaku_ids_from_layers",
+                return_value=({"ok", "rate-limited"}, {"ok": ["metrics"], "rate-limited": ["metrics"]}, payloads),
+            ),
+            patch.object(fetch_rank_data, "MissevanRequester", return_value=FakeRequester()),
+            patch.object(fetch_rank_data.requests, "get", return_value=response),
+            patch.object(fetch_rank_data, "write_repaired_danmaku_layers") as write_layers,
+            patch.object(fetch_rank_data.time, "sleep"),
+            patch("builtins.print"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "HTTP_418"):
+                fetch_rank_data.repair_null_danmaku_for_platform("missevan", "2026-05-28")
+
+        write_layers.assert_called_once_with("missevan", "2026-05-28", {"ok": 0}, payloads)
 
 
 class ManboCvLookupTests(unittest.TestCase):
