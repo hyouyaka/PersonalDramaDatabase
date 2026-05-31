@@ -1033,6 +1033,7 @@ class ManboDanmakuStabilityTests(unittest.TestCase):
             paid_set_id_loader=lambda *_args, **_kwargs: ["set-a"],
             page_size=2,
             page_concurrency=4,
+            short_page_retry_delay=0,
         )
 
         self.assertEqual(result["unique_user_count"], 4)
@@ -1051,10 +1052,123 @@ class ManboDanmakuStabilityTests(unittest.TestCase):
             paid_set_id_loader=lambda *_args, **_kwargs: ["set-a"],
             page_size=2,
             page_concurrency=4,
+            short_page_retry_delay=0,
         )
 
         self.assertEqual(result["failed_page_count"], 1)
         self.assertIn("incomplete", result["failed_pages"][0]["error"])
+
+    def test_manbo_short_page_is_retried_before_marking_failure(self) -> None:
+        calls: dict[tuple[str, int], int] = {}
+
+        def request_json(url: str) -> dict:
+            query = parse_qs(urlparse(url).query)
+            set_id = query["dramaSetId"][0]
+            page_no = int(query["pageNo"][0])
+            key = (set_id, page_no)
+            calls[key] = calls.get(key, 0) + 1
+            if key == ("set-a", 2) and calls[key] == 1:
+                return {"data": {"count": 4, "list": [{"eid": "3"}]}}
+            pages = {
+                ("set-a", 1): {"data": {"count": 4, "list": [{"eid": "1"}, {"eid": "2"}]}},
+                ("set-a", 2): {"data": {"count": 4, "list": [{"eid": "3"}, {"eid": "4"}]}},
+            }
+            return pages[key]
+
+        result = fetch_rank_data.fetch_manbo_paid_danmaku_benchmark(
+            "drama-1",
+            request_json=request_json,
+            paid_set_id_loader=lambda *_args, **_kwargs: ["set-a"],
+            page_size=2,
+            page_concurrency=4,
+            retry_delay=0,
+            short_page_retry_delay=0,
+        )
+
+        self.assertEqual(result["failed_page_count"], 0)
+        self.assertEqual(result["unique_user_count"], 4)
+        self.assertEqual(result["fetched_danmaku"], 4)
+        self.assertEqual(calls[("set-a", 2)], 2)
+
+    def test_manbo_short_page_retry_only_refetches_short_page(self) -> None:
+        calls: dict[tuple[str, int], int] = {}
+
+        def request_json(url: str) -> dict:
+            query = parse_qs(urlparse(url).query)
+            set_id = query["dramaSetId"][0]
+            page_no = int(query["pageNo"][0])
+            key = (set_id, page_no)
+            calls[key] = calls.get(key, 0) + 1
+            if key == ("set-a", 2) and calls[key] == 1:
+                return {"data": {"count": 6, "list": [{"eid": "3"}]}}
+            pages = {
+                ("set-a", 1): {"data": {"count": 6, "list": [{"eid": "1"}, {"eid": "2"}]}},
+                ("set-a", 2): {"data": {"count": 6, "list": [{"eid": "3"}, {"eid": "4"}]}},
+                ("set-a", 3): {"data": {"count": 6, "list": [{"eid": "5"}, {"eid": "6"}]}},
+            }
+            return pages[key]
+
+        result = fetch_rank_data.fetch_manbo_paid_danmaku_benchmark(
+            "drama-1",
+            request_json=request_json,
+            paid_set_id_loader=lambda *_args, **_kwargs: ["set-a"],
+            page_size=2,
+            page_concurrency=4,
+            retry_delay=0,
+            short_page_retry_delay=0,
+        )
+
+        self.assertEqual(result["failed_page_count"], 0)
+        self.assertEqual(result["unique_user_count"], 6)
+        self.assertEqual(calls[("set-a", 1)], 1)
+        self.assertEqual(calls[("set-a", 2)], 2)
+        self.assertEqual(calls[("set-a", 3)], 1)
+
+    def test_manbo_persistent_short_page_reports_page_and_counts(self) -> None:
+        pages = {
+            ("set-a", 1): {"data": {"count": 4, "list": [{"eid": "1"}, {"eid": "2"}]}},
+            ("set-a", 2): {"data": {"count": 4, "list": [{"eid": "3"}]}},
+        }
+
+        result = fetch_rank_data.fetch_manbo_paid_danmaku_benchmark(
+            "drama-1",
+            request_json=self._manbo_page_requester(pages),
+            paid_set_id_loader=lambda *_args, **_kwargs: ["set-a"],
+            page_size=2,
+            page_concurrency=4,
+            retry_delay=0,
+            short_page_retry_delay=0,
+        )
+
+        self.assertEqual(result["failed_page_count"], 1)
+        failure = result["failed_pages"][0]
+        self.assertEqual(failure["set_id"], "set-a")
+        self.assertEqual(failure["page_no"], 2)
+        self.assertEqual(failure["expected_entries"], 2)
+        self.assertEqual(failure["actual_entries"], 1)
+
+    def test_manbo_short_page_uses_first_page_total_when_later_count_drops(self) -> None:
+        pages = {
+            ("set-a", 1): {"data": {"count": 4, "list": [{"eid": "1"}, {"eid": "2"}]}},
+            ("set-a", 2): {"data": {"count": 2, "list": []}},
+        }
+
+        result = fetch_rank_data.fetch_manbo_paid_danmaku_benchmark(
+            "drama-1",
+            request_json=self._manbo_page_requester(pages),
+            paid_set_id_loader=lambda *_args, **_kwargs: ["set-a"],
+            page_size=2,
+            page_concurrency=4,
+            retry_delay=0,
+            short_page_retry_delay=0,
+        )
+
+        self.assertEqual(result["failed_page_count"], 1)
+        failure = result["failed_pages"][0]
+        self.assertEqual(failure["set_id"], "set-a")
+        self.assertEqual(failure["page_no"], 2)
+        self.assertEqual(failure["expected_entries"], 2)
+        self.assertEqual(failure["actual_entries"], 0)
 
     def test_manbo_low_value_over_two_percent_uses_existing_retry_path(self) -> None:
         store = {

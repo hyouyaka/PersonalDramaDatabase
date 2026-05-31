@@ -79,6 +79,26 @@ def save_json(path: Path, data) -> None:
     with SAVE_LOCK:
         _save_json(path, data)
 
+
+def env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value in (None, ""):
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
 # -- Missevan rank definitions (key -> (type, sub_type, display_name)) ------
 MISSEVAN_RANKS = {
     "new_daily":          (1, 1, "新品日榜"),
@@ -100,9 +120,11 @@ MANBO_RANKS = {
 }
 
 MANBO_DANMAKU_PAGE_SIZE = 200
-MANBO_DANMAKU_PAGE_CONCURRENCY = 48
+MANBO_DANMAKU_PAGE_CONCURRENCY = env_int("MANBO_DANMAKU_PAGE_CONCURRENCY", 24)
 MANBO_DANMAKU_DRAMA_CONCURRENCY = 1
 MANBO_DANMAKU_REQUEST_RETRIES = 3
+MANBO_DANMAKU_SHORT_PAGE_RETRIES = env_int("MANBO_DANMAKU_SHORT_PAGE_RETRIES", 4)
+MANBO_DANMAKU_SHORT_PAGE_RETRY_DELAY = env_float("MANBO_DANMAKU_SHORT_PAGE_RETRY_DELAY", 1.2)
 DANMAKU_DRAMA_RETRY_ATTEMPTS = 3
 MANBO_DANMAKU_LOW_VALUE_RATIO = 0.02
 
@@ -1738,21 +1760,43 @@ def _request_manbo_danmaku_page(
     request_json=request_manbo_json,
     page_size: int = MANBO_DANMAKU_PAGE_SIZE,
     retry_delay: float = 0.5,
+    short_page_retries: int = MANBO_DANMAKU_SHORT_PAGE_RETRIES,
+    short_page_retry_delay: float = MANBO_DANMAKU_SHORT_PAGE_RETRY_DELAY,
+    expected_total_count: int | None = None,
 ) -> dict:
     url = (
         "https://www.kilamanbo.com/web_manbo/getDanmaKuPgList"
         f"?pageSize={page_size}&dramaSetId={set_id}&pageNo={page_no}"
     )
     last_error: Exception | None = None
-    for attempt in range(1, MANBO_DANMAKU_REQUEST_RETRIES + 1):
-        try:
-            return request_json(url)
-        except Exception as exc:
-            last_error = exc
-            if attempt >= MANBO_DANMAKU_REQUEST_RETRIES:
-                raise
-            time.sleep(retry_delay * attempt)
+    max_short_attempts = max(1, short_page_retries)
+    for short_attempt in range(1, max_short_attempts + 1):
+        data = None
+        for attempt in range(1, MANBO_DANMAKU_REQUEST_RETRIES + 1):
+            try:
+                data = request_json(url)
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt >= MANBO_DANMAKU_REQUEST_RETRIES:
+                    raise
+                time.sleep(retry_delay * attempt)
+        if data is None:
+            raise last_error or RuntimeError("failed to fetch Manbo danmaku page")
+
+        total_count, _total_pages, _users, entry_count = _extract_manbo_danmaku_page(data, page_size=page_size)
+        expected_count = total_count if expected_total_count is None else expected_total_count
+        expected_entries = expected_manbo_danmaku_page_entries(expected_count, page_no, page_size)
+        if entry_count >= expected_entries or short_attempt >= max_short_attempts:
+            return data
+        time.sleep(short_page_retry_delay * short_attempt)
+
     raise last_error or RuntimeError("failed to fetch Manbo danmaku page")
+
+
+def expected_manbo_danmaku_page_entries(total_count: int, page_no: int, page_size: int) -> int:
+    remaining = max(0, total_count - max(0, page_no - 1) * page_size)
+    return min(page_size, remaining)
 
 
 def _extract_manbo_danmaku_page(data: dict, *, page_size: int) -> tuple[int, int, set[str], int]:
@@ -1778,6 +1822,8 @@ def fetch_manbo_paid_danmaku_benchmark(
     page_size: int = MANBO_DANMAKU_PAGE_SIZE,
     page_concurrency: int = MANBO_DANMAKU_PAGE_CONCURRENCY,
     retry_delay: float = 0.5,
+    short_page_retries: int = MANBO_DANMAKU_SHORT_PAGE_RETRIES,
+    short_page_retry_delay: float = MANBO_DANMAKU_SHORT_PAGE_RETRY_DELAY,
 ) -> dict:
     """Fetch all paid Manbo danmaku pages through one bounded queue and globally dedupe eids."""
     started = time.perf_counter()
@@ -1789,19 +1835,28 @@ def fetch_manbo_paid_danmaku_benchmark(
     total_danmaku_by_set: dict[str, int] = {}
     fetched_danmaku_by_set: dict[str, int] = {}
 
-    def fetch_and_extract(set_id: str, page_no: int) -> tuple[str, int, int, int, set[str], int]:
+    def fetch_and_extract(
+        set_id: str,
+        page_no: int,
+        expected_total_count: int | None = None,
+    ) -> tuple[str, int, int, int, set[str], int, int]:
         data = _request_manbo_danmaku_page(
             set_id,
             page_no,
             request_json=request_json,
             page_size=page_size,
             retry_delay=retry_delay,
+            short_page_retries=short_page_retries,
+            short_page_retry_delay=short_page_retry_delay,
+            expected_total_count=expected_total_count,
         )
         total_count, total_pages, page_users, entry_count = _extract_manbo_danmaku_page(data, page_size=page_size)
-        return set_id, page_no, total_count, total_pages, page_users, entry_count
+        expected_count = total_count if expected_total_count is None else expected_total_count
+        expected_entries = expected_manbo_danmaku_page_entries(expected_count, page_no, page_size)
+        return set_id, page_no, total_count, total_pages, page_users, entry_count, expected_entries
 
     workers = max(1, min(page_concurrency, len(paid_set_ids) or 1))
-    first_page_results: list[tuple[str, int, int, int, set[str], int]] = []
+    first_page_results: list[tuple[str, int, int, int, set[str], int, int]] = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_page = {
             executor.submit(fetch_and_extract, set_id, 1): (set_id, 1)
@@ -1815,12 +1870,23 @@ def fetch_manbo_paid_danmaku_benchmark(
                 failed_pages.append({"set_id": set_id, "page_no": page_no, "error": str(exc)})
                 continue
             first_page_results.append(result)
-            _, _, total_count, total_pages, page_users, entry_count = result
+            _, _, total_count, total_pages, page_users, entry_count, expected_entries = result
             total_danmaku_by_set[set_id] = total_count
             total_pages_by_set[set_id] = total_pages
             fetched_pages_by_set[set_id] = fetched_pages_by_set.get(set_id, 0) + 1
             fetched_danmaku_by_set[set_id] = fetched_danmaku_by_set.get(set_id, 0) + entry_count
             users.update(page_users)
+            if entry_count < expected_entries:
+                failed_pages.append({
+                    "set_id": set_id,
+                    "page_no": page_no,
+                    "expected_entries": expected_entries,
+                    "actual_entries": entry_count,
+                    "error": (
+                        "incomplete Manbo danmaku page: "
+                        f"page={page_no}, entries={entry_count}/{expected_entries}"
+                    ),
+                })
 
     remaining_pages = [
         (set_id, page_no)
@@ -1830,7 +1896,7 @@ def fetch_manbo_paid_danmaku_benchmark(
     workers = max(1, min(page_concurrency, len(remaining_pages) or 1))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_page = {
-            executor.submit(fetch_and_extract, set_id, page_no): (set_id, page_no)
+            executor.submit(fetch_and_extract, set_id, page_no, total_danmaku_by_set.get(set_id)): (set_id, page_no)
             for set_id, page_no in remaining_pages
         }
         for future in as_completed(future_to_page):
@@ -1840,16 +1906,27 @@ def fetch_manbo_paid_danmaku_benchmark(
             except Exception as exc:
                 failed_pages.append({"set_id": set_id, "page_no": page_no, "error": str(exc)})
                 continue
-            _, _, _, _, page_users, entry_count = result
+            _, _, _, _, page_users, entry_count, expected_entries = result
             fetched_pages_by_set[set_id] = fetched_pages_by_set.get(set_id, 0) + 1
             fetched_danmaku_by_set[set_id] = fetched_danmaku_by_set.get(set_id, 0) + entry_count
             users.update(page_users)
+            if entry_count < expected_entries:
+                failed_pages.append({
+                    "set_id": set_id,
+                    "page_no": page_no,
+                    "expected_entries": expected_entries,
+                    "actual_entries": entry_count,
+                    "error": (
+                        "incomplete Manbo danmaku page: "
+                        f"page={page_no}, entries={entry_count}/{expected_entries}"
+                    ),
+                })
 
     for set_id, total_pages in total_pages_by_set.items():
         fetched_pages = fetched_pages_by_set.get(set_id, 0)
         expected_count = total_danmaku_by_set.get(set_id, 0)
         fetched_count = fetched_danmaku_by_set.get(set_id, 0)
-        if fetched_pages < total_pages or fetched_count < expected_count:
+        if fetched_pages < total_pages:
             failed_pages.append({
                 "set_id": set_id,
                 "page_no": None,
