@@ -6,7 +6,7 @@ import argparse
 import json
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -24,6 +24,7 @@ ONGOING_KEYS = {
 MISSEVAN_SUMMERDRAMA_URL = "https://www.missevan.com/dramaapi/summerdrama"
 MISSEVAN_TIMELINE_URL = "https://app.missevan.com/drama/timeline"
 MISSEVAN_SOUND_PAGE_URL = "https://www.missevan.com/sound/m?order=0&id=17&p={page}"
+MISSEVAN_SOUND_INFO_URL = "https://www.missevan.com/sound/getsound?soundid={sound_id}"
 MISSEVAN_SOUND_DRAMA_URL = "https://www.missevan.com/dramaapi/getdramabysound?sound_id={sound_id}"
 MANBO_TIME_DETAIL_URL = (
     "https://api.kilamanbo.com/api/v530/radio/drama/new/time/detail"
@@ -57,6 +58,19 @@ def safe_int(value: object, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def missevan_timestamp_to_beijing_date(value: object) -> date | None:
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return None
+    if timestamp > 10_000_000_000:
+        timestamp /= 1000
+    try:
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone(BEIJING_TZ).date()
+    except (OSError, OverflowError, ValueError):
+        return None
 
 
 def upstash_request(command: list[object]) -> object:
@@ -258,12 +272,32 @@ def fetch_missevan_sound_page(page: int) -> str:
     return response.text
 
 
+def fetch_missevan_sound_create_date(requester: MissevanRequester, sound_id: str) -> date | None:
+    data = requester.request_json(MISSEVAN_SOUND_INFO_URL.format(sound_id=sound_id))
+    info = data.get("info") or {}
+    sound = info.get("sound") if isinstance(info, dict) else {}
+    return missevan_timestamp_to_beijing_date((sound or {}).get("create_time"))
+
+
 def collect_missevan_daily_sound_ids(
     fetch_html: Callable[[int], str] = fetch_missevan_sound_page,
     *,
-    limit: int = 20,
+    requester: MissevanRequester | None = None,
+    initial_limit: int = 20,
+    batch_size: int = 10,
+    max_sound_ids: int = 120,
+    now: datetime | None = None,
+    limit: int | None = None,
     max_pages: int = 50,
 ) -> list[str]:
+    active_requester = requester or MissevanRequester()
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    cutoff_date = current.astimezone(BEIJING_TZ).date() - timedelta(days=7)
+    effective_max = max(1, safe_int(limit if limit is not None else max_sound_ids, max_sound_ids))
+    next_check_count = min(max(1, safe_int(initial_limit, 20)), effective_max)
+    step = max(1, safe_int(batch_size, 10))
     sound_ids: list[str] = []
     seen: set[str] = set()
     for page in range(1, max_pages + 1):
@@ -281,7 +315,14 @@ def collect_missevan_daily_sound_ids(
             ):
                 seen.add(sound_id)
                 sound_ids.append(sound_id)
-                if len(sound_ids) >= limit:
+                if len(sound_ids) >= next_check_count:
+                    create_date = fetch_missevan_sound_create_date(active_requester, sound_id)
+                    if create_date is None or create_date < cutoff_date:
+                        return sound_ids
+                    if len(sound_ids) >= effective_max:
+                        return sound_ids
+                    next_check_count = min(next_check_count + step, effective_max)
+                if len(sound_ids) >= effective_max:
                     return sound_ids
     return sound_ids
 
@@ -309,7 +350,7 @@ def fetch_missevan_daily_drama_ids(
 def fetch_missevan_records(requester: MissevanRequester | None = None) -> dict[str, dict[str, object]]:
     active_requester = requester or MissevanRequester()
     weekly = fetch_missevan_weekly_records(active_requester)
-    sound_ids = collect_missevan_daily_sound_ids()
+    sound_ids = collect_missevan_daily_sound_ids(requester=active_requester)
     daily_ids = fetch_missevan_daily_drama_ids(active_requester, sound_ids)
     daily = [make_record(drama_id, "daily") for drama_id in daily_ids]
     return merge_records(weekly=weekly, daily=daily)
