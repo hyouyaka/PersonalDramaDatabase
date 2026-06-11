@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 from platform_sync import (
@@ -178,33 +179,75 @@ def refresh_manbo_watch_counts(*, target_ids: set[str] | None = None) -> dict:
     return {"processed": processed, "skipped": skipped}
 
 
-def main() -> int:
+def print_missevan_stats(stats: dict) -> None:
+    print("猫耳 watch counts processed:", stats["processed"])
+    print("猫耳 watch counts skipped:", stats["skipped"])
+    print("猫耳 watch counts archived:", stats["archived"])
+    print("猫耳 requests:", stats["request_count"])
+    print("猫耳 recent backoff seconds:", stats["last_backoff_seconds"])
+
+
+def print_manbo_stats(stats: dict) -> None:
+    print("漫播 watch counts processed:", stats["processed"])
+    print("漫播 watch counts skipped:", stats["skipped"])
+
+
+def run_missevan_refresh(target_ids: set[str] | None) -> dict:
+    try:
+        stats = refresh_missevan_watch_counts(target_ids=target_ids)
+    except RuntimeError as exc:
+        if "HTTP_418" not in str(exc):
+            raise
+        print("Hit 418 while refreshing 猫耳 watch counts. Progress has been saved.")
+        raise
+    print_missevan_stats(stats)
+    return stats
+
+
+def run_manbo_refresh(target_ids: set[str] | None) -> dict:
+    stats = refresh_manbo_watch_counts(target_ids=target_ids)
+    print_manbo_stats(stats)
+    return stats
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--platform", choices=("all", "missevan", "manbo"), default="all")
     parser.add_argument("--missevan", nargs="+", help="只刷新指定猫耳 dramaId，可传多个")
     parser.add_argument("--manbo", nargs="+", help="只刷新指定漫播 dramaId，可传多个")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     missevan_ids = {item.strip() for item in (args.missevan or []) if item.strip()}
     manbo_ids = {item.strip() for item in (args.manbo or []) if item.strip()}
     explicit_target_mode = bool(missevan_ids or manbo_ids)
+    do_missevan = bool(missevan_ids or (not explicit_target_mode and args.platform in ("all", "missevan")))
+    do_manbo = bool(manbo_ids or (not explicit_target_mode and args.platform in ("all", "manbo")))
 
-    if missevan_ids or (not explicit_target_mode and args.platform in ("all", "missevan")):
+    if do_missevan and do_manbo and not explicit_target_mode and args.platform == "all":
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {
+                executor.submit(run_missevan_refresh, None): "missevan",
+                executor.submit(run_manbo_refresh, None): "manbo",
+            }
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except RuntimeError as exc:
+                    if futures[future] == "missevan" and "HTTP_418" in str(exc):
+                        return 2
+                    raise
+        return 0
+
+    if do_missevan:
         try:
-            missevan_stats = refresh_missevan_watch_counts(target_ids=missevan_ids or None)
-        except RuntimeError:
-            print("Hit 418 while refreshing 猫耳 watch counts. Progress has been saved.")
+            run_missevan_refresh(missevan_ids or None)
+        except RuntimeError as exc:
+            if "HTTP_418" not in str(exc):
+                raise
             return 2
-        print("猫耳 watch counts processed:", missevan_stats["processed"])
-        print("猫耳 watch counts skipped:", missevan_stats["skipped"])
-        print("猫耳 watch counts archived:", missevan_stats["archived"])
-        print("猫耳 requests:", missevan_stats["request_count"])
-        print("猫耳 recent backoff seconds:", missevan_stats["last_backoff_seconds"])
 
-    if manbo_ids or (not explicit_target_mode and args.platform in ("all", "manbo")):
-        manbo_stats = refresh_manbo_watch_counts(target_ids=manbo_ids or None)
-        print("漫播 watch counts processed:", manbo_stats["processed"])
-        print("漫播 watch counts skipped:", manbo_stats["skipped"])
+    if do_manbo:
+        run_manbo_refresh(manbo_ids or None)
 
     return 0
 

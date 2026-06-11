@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 
-from cvid_map_tools import update_combined_cvid_map
+from cvid_map_tools import BestEffortAvatarLookup, CvAvatarLookup, update_combined_cvid_map
 from platform_sync import load_json, MANBO_INFO_PATH, MISSEVAN_INFO_PATH
 from refresh_platform_metadata import upsert_missevan_drama_ids
 from sync_new_drama_ids import (
@@ -30,6 +30,7 @@ def main(argv: list[str]) -> int:
         manbo_drama_ids=set(),
         remote=True,
         upstash=upstash_request,
+        avatar_lookup=BestEffortAvatarLookup(CvAvatarLookup()),
     )
     merge_and_upload_info_file(MISSEVAN_INFO_KEY, MISSEVAN_INFO_PATH, drama_ids)
     print("猫耳 metadata updated:", stats["processed"])

@@ -585,8 +585,17 @@ class MissevanRequester:
         attempt = 0
         while True:
             time.sleep(self.base_delay + random.random() * self.jitter)
-            response = requests.get(url, headers=MISSEVAN_HEADERS, timeout=30)
             self.request_count += 1
+            try:
+                response = requests.get(url, headers=MISSEVAN_HEADERS, timeout=30)
+            except requests.RequestException:
+                attempt += 1
+                if attempt > self.max_retries:
+                    raise
+                backoff = min(120.0, 12.0 * (2 ** (attempt - 1)) + random.random() * 5.0)
+                self.last_backoff_seconds = backoff
+                time.sleep(backoff)
+                continue
             if response.status_code != 418:
                 response.raise_for_status()
                 self.last_backoff_seconds = 0.0

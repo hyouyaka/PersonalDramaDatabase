@@ -133,5 +133,24 @@ class UploadJsonValidationTests(unittest.TestCase):
         self.assertEqual(upstash.call_args_list[1].args[0][:2], ["SET", sync_new_drama_ids.CVID_MAP_KEY])
 
 
+class QueueReadyTests(unittest.TestCase):
+    def test_missevan_ready_requires_cover(self) -> None:
+        base = {
+            "title": "猫耳剧",
+            "type": 0,
+            "catalog": "现代",
+            "createTime": "2026-06-10",
+            "cover": "https://example.test/cover.jpg",
+            "is_member": False,
+            "maincvs": [1, 2],
+        }
+
+        self.assertTrue(sync_new_drama_ids.is_missevan_ready(base))
+
+        without_cover = dict(base)
+        without_cover["cover"] = ""
+        self.assertFalse(sync_new_drama_ids.is_missevan_ready(without_cover))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,8 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from urllib.parse import urlsplit, urlunsplit
 
-from platform_sync import COMBINED_CVID_MAP_PATH, iter_missevan_nodes, load_json, normalize, normalize_match, save_json, utc_now
+from platform_sync import (
+    COMBINED_CVID_MAP_PATH,
+    MissevanRequester,
+    iter_missevan_nodes,
+    load_json,
+    normalize,
+    normalize_match,
+    request_manbo_json,
+    save_json,
+    utc_now,
+)
 
 
 def load_remote_combined_map(*, upstash=None) -> dict[str, dict]:
@@ -25,6 +36,84 @@ def save_remote_combined_map(data: dict[str, dict], *, upstash=None) -> None:
 
     save_combined_map(data)
     upload_json_payload(CVID_MAP_KEY, data, upstash=upstash or upstash_request)
+
+
+def normalize_avatar_url(value: object) -> str:
+    url = normalize(value)
+    if not url:
+        return ""
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+def _http_status(exc: Exception) -> int | None:
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None)
+
+
+def fetch_missevan_cv_avatar(cv_id: int, requester: MissevanRequester) -> str:
+    payload = requester.request_json(f"https://www.missevan.com/dramaapi/cvinfo?page=1&cv_id={cv_id}")
+    return normalize_avatar_url(((payload.get("info") or {}).get("cv") or {}).get("icon"))
+
+
+def fetch_manbo_cv_avatar(cv_id: int, *, manbo_request=request_manbo_json) -> str:
+    payload = manbo_request(f"https://api.kilamanbo.com/api/v530/personal/homepage/getUserBaseInfo?uid={cv_id}")
+    return normalize_avatar_url((((payload.get("b") or {}).get("userResp") or {}).get("headPortraitUrl")))
+
+
+class CvAvatarLookup:
+    def __init__(
+        self,
+        *,
+        requester: MissevanRequester | None = None,
+        manbo_request=request_manbo_json,
+    ) -> None:
+        self.requester = requester or MissevanRequester(base_delay=4.5, jitter=2.0)
+        self.manbo_request = manbo_request
+        self.fallback_to_manbo = 0
+
+    def __call__(self, platform: str, cv_id: int) -> str:
+        if platform == "猫耳":
+            try:
+                return fetch_missevan_cv_avatar(cv_id, self.requester)
+            except Exception as exc:
+                if _http_status(exc) in (403, 404):
+                    return ""
+                raise
+        if platform == "漫播":
+            return fetch_manbo_cv_avatar(cv_id, manbo_request=self.manbo_request)
+        return ""
+
+
+class BestEffortAvatarLookup:
+    def __init__(self, lookup) -> None:
+        self.lookup = lookup
+        self.fallback_to_manbo = 0
+
+    def __call__(self, platform: str, cv_id: int) -> str:
+        try:
+            return self.lookup(platform, cv_id)
+        except Exception as exc:
+            print(f"[warn] avatar lookup skipped platform={platform} cv_id={cv_id}: {exc}")
+            return ""
+
+
+def payload_avatar(payload: dict, *, avatar_lookup=None, force: bool = False) -> str:
+    current = normalize_avatar_url(payload.get("avatar"))
+    if (current and not force) or avatar_lookup is None:
+        return current
+    missevan_id = payload.get("missevanCvId", payload.get("cvId"))
+    if missevan_id not in (None, ""):
+        avatar = normalize_avatar_url(avatar_lookup("猫耳", int(missevan_id)))
+        if avatar:
+            return avatar
+    manbo_id = payload.get("manboCvId")
+    if manbo_id not in (None, ""):
+        avatar = normalize_avatar_url(avatar_lookup("漫播", int(manbo_id)))
+        if avatar and missevan_id not in (None, "") and hasattr(avatar_lookup, "fallback_to_manbo"):
+            avatar_lookup.fallback_to_manbo += 1
+        return avatar
+    return ""
 
 
 @dataclass
@@ -98,6 +187,8 @@ def update_combined_cvid_map(
     manbo_drama_ids: set[str] | None = None,
     remote: bool = False,
     upstash=None,
+    avatar_lookup=None,
+    force_avatar: bool = False,
 ) -> dict:
     current = load_remote_combined_map(upstash=upstash) if remote else load_combined_map()
     now = utc_now()
@@ -178,7 +269,10 @@ def update_combined_cvid_map(
             payload["aliases"] = aliases
             payload["displayName"] = payload.get("displayName") or key
             payload.setdefault("notes", "")
-            if not id_changed and not aliases_changed and not display_name_changed:
+            next_avatar = payload_avatar(payload, avatar_lookup=avatar_lookup, force=force_avatar)
+            avatar_changed = payload.get("avatar") != next_avatar
+            payload["avatar"] = next_avatar
+            if not id_changed and not aliases_changed and not display_name_changed and not avatar_changed:
                 unchanged += 1
                 continue
             payload["updatedAt"] = now
@@ -198,10 +292,12 @@ def update_combined_cvid_map(
             "manboCvId": int(item.platform_cv_id) if item.platform == "漫播" and item.platform_cv_id is not None else None,
             "displayName": key,
             "aliases": [alias for alias in item.aliases if normalize(alias) and normalize(alias) != key],
+            "avatar": "",
             "source": "observed",
             "updatedAt": now,
             "notes": "",
         }
+        payload["avatar"] = payload_avatar(payload, avatar_lookup=avatar_lookup, force=force_avatar)
         current[key] = payload
         register_indexes(key, payload)
         created += 1

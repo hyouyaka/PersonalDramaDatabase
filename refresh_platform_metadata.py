@@ -406,6 +406,7 @@ def upsert_missevan_cv_map_entry(combined_map: dict, display_name: str, cv_id: i
     payload.setdefault("manboCvId", None)
     payload["displayName"] = normalize(payload.get("displayName") or key)
     payload["aliases"] = [normalize(alias) for alias in (payload.get("aliases") or []) if normalize(alias) and normalize(alias) != key]
+    payload.setdefault("avatar", "")
     payload.setdefault("source", "missevan_intro_search")
     payload["updatedAt"] = utc_now()
     payload.setdefault("notes", "")
@@ -527,6 +528,7 @@ def build_missevan_base_node(info: dict, drama_type: int | None) -> tuple[dict, 
         "cvroles": cvroles,
         "cvnames": cvnames,
         "catalog": None if drama.get("catalog") in (None, "") else int(drama["catalog"]),
+        "cover": normalize(drama.get("cover")),
         "createTime": "",
         "author": normalize(drama.get("author")),
         "needpay": safe_int(drama.get("pay_type")) != 0 and safe_int(drama.get("price")) > 0,

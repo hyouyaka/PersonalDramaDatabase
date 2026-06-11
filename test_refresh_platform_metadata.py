@@ -6,10 +6,11 @@ import refresh_platform_metadata
 class ManboCvFallbackTests(unittest.TestCase):
     def test_build_manbo_record_falls_back_to_nickname_when_map_missing(self) -> None:
         payload = {
-            "data": {
-                "title": "测试剧",
-                "category": 1,
-                "categoryLabels": [{"name": "纯爱"}],
+                "data": {
+                    "title": "测试剧",
+                    "cover": "https://cover.test/manbo.jpg",
+                    "category": 1,
+                    "categoryLabels": [{"name": "纯爱"}],
                 "cvRespList": [
                     {
                         "dramaRoleType": 2,
@@ -37,6 +38,37 @@ class ManboCvFallbackTests(unittest.TestCase):
         )
 
         self.assertEqual(record["mainCvNames"], ["规范名甲", "接口昵称乙"])
+
+
+class MissevanCoverTests(unittest.TestCase):
+    def test_build_missevan_base_node_keeps_cover(self) -> None:
+        node, _entries = refresh_platform_metadata.build_missevan_base_node(
+            {
+                "drama": {
+                    "id": 93605,
+                    "name": "猫耳测试剧",
+                    "cover": "https://cover.test/missevan.jpg",
+                    "catalog": 89,
+                    "pay_type": 1,
+                    "price": 1,
+                },
+                "cvs": [],
+                "episodes": {"episode": []},
+            },
+            4,
+        )
+
+        self.assertEqual(node["cover"], "https://cover.test/missevan.jpg")
+
+
+class MissevanCvMapEntryTests(unittest.TestCase):
+    def test_upsert_missevan_cv_map_entry_initializes_avatar(self) -> None:
+        combined_map = {}
+
+        refresh_platform_metadata.upsert_missevan_cv_map_entry(combined_map, "CV A", 11)
+
+        self.assertIn("avatar", combined_map["CV A"])
+        self.assertEqual(combined_map["CV A"]["avatar"], "")
 
 
 class MissevanIntroCvCandidateTests(unittest.TestCase):

@@ -421,6 +421,8 @@ def is_missevan_ready(record: dict | None) -> bool:
     has_author = bool(normalize(record.get("author")))
     if not has_create_time and not has_author:
         return False
+    if not normalize(record.get("cover")):
+        return False
     if "is_member" not in record:
         return False
     return len(record.get("maincvs") or []) >= 2

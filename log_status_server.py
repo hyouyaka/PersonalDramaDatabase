@@ -1,8 +1,8 @@
-"""Serve the daily update log over the local network.
+"""Serve update logs over the local network.
 
 Run on the update PC, then open http://<server-ip>:8765 from another PC.
 The server reads logs/daily-update-latest.log by default and can also show
-timestamped daily-update-*.log files from the same logs directory.
+daily-update-*.log and weekly-cv-update-*.log files from the same logs directory.
 """
 
 from __future__ import annotations
@@ -17,7 +17,12 @@ from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(os.environ.get("DRAMA_DB_ROOT", Path(__file__).resolve().parent))
 LOG_DIR = Path(os.environ.get("DRAMA_DB_LOG_DIR", ROOT / "logs"))
-LATEST_LOG = LOG_DIR / "daily-update-latest.log"
+LOG_PREFIXES = tuple(
+    prefix.strip()
+    for prefix in os.environ.get("DRAMA_LOG_PREFIXES", "daily-update,weekly-cv-update").split(",")
+    if prefix.strip()
+)
+LATEST_LOG = LOG_DIR / os.environ.get("DRAMA_LOG_LATEST", "daily-update-latest.log")
 HOST = os.environ.get("DRAMA_LOG_HOST", "0.0.0.0")
 PORT = int(os.environ.get("DRAMA_LOG_PORT", "8765"))
 MAX_LOG_BYTES = int(os.environ.get("DRAMA_LOG_MAX_BYTES", "200000"))
@@ -32,7 +37,7 @@ def safe_log_path(name: str | None) -> Path:
 
     if candidate.parent != log_dir:
         raise ValueError("invalid log path")
-    if not candidate.name.startswith("daily-update-") or candidate.suffix != ".log":
+    if candidate.suffix != ".log" or not any(candidate.name.startswith(f"{prefix}-") for prefix in LOG_PREFIXES):
         raise ValueError("invalid log name")
 
     return candidate
@@ -58,19 +63,18 @@ def list_logs() -> list[dict[str, object]]:
     if not LOG_DIR.exists():
         return []
 
-    logs = []
-    for path in LOG_DIR.glob("daily-update-*.log"):
-        stat = path.stat()
-        logs.append(
-            {
+    logs_by_name: dict[str, dict[str, object]] = {}
+    for prefix in LOG_PREFIXES:
+        for path in LOG_DIR.glob(f"{prefix}-*.log"):
+            stat = path.stat()
+            logs_by_name[path.name] = {
                 "name": path.name,
                 "size": stat.st_size,
                 "mtime": stat.st_mtime,
                 "is_latest": path.name == LATEST_LOG.name,
             }
-        )
 
-    return sorted(logs, key=lambda item: (bool(item["is_latest"]), float(item["mtime"])), reverse=True)
+    return sorted(logs_by_name.values(), key=lambda item: (bool(item["is_latest"]), float(item["mtime"])), reverse=True)
 
 
 def infer_state(content: str) -> dict[str, str]:
@@ -175,7 +179,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def render_page() -> str:
-    title = "Drama Daily Update Logs"
+    title = "Drama Update Logs"
     escaped_log_dir = html.escape(str(LOG_DIR))
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -332,14 +336,20 @@ def render_page() -> str:
 
       for (const item of data.logs) {{
         const option = document.createElement("option");
-        option.value = item.is_latest ? "latest" : item.name;
-        option.textContent = `${{item.is_latest ? "latest" : item.name}} (${{formatSize(item.size)}})`;
+        option.value = item.name;
+        option.textContent = `${{item.is_latest ? "latest - " : ""}}${{item.name}} (${{formatSize(item.size)}})`;
         logSelect.appendChild(option);
       }}
 
       if ([...logSelect.options].some(option => option.value === selected)) {{
         logSelect.value = selected;
         currentName = selected;
+      }} else if ([...logSelect.options].some(option => option.value === data.latest)) {{
+        logSelect.value = data.latest;
+        currentName = data.latest;
+      }} else if (logSelect.options.length > 0) {{
+        logSelect.value = logSelect.options[0].value;
+        currentName = logSelect.value;
       }} else {{
         logSelect.value = "latest";
         currentName = "latest";

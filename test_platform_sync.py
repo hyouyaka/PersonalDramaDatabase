@@ -1,4 +1,7 @@
 import unittest
+from unittest.mock import Mock, patch
+
+import requests
 
 import platform_sync
 
@@ -30,6 +33,24 @@ class ManboCvEntryTests(unittest.TestCase):
                 }
             ],
         )
+
+
+class MissevanRequesterRetryTests(unittest.TestCase):
+    def test_request_json_retries_transient_connection_errors(self) -> None:
+        requester = platform_sync.MissevanRequester(base_delay=0, jitter=0, max_retries=2)
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {"ok": True}
+
+        with (
+            patch.object(platform_sync.time, "sleep"),
+            patch.object(platform_sync.requests, "get", side_effect=[requests.ConnectionError("dns"), response]) as get,
+        ):
+            payload = requester.request_json("https://example.test")
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(requester.request_count, 2)
 
 
 if __name__ == "__main__":
