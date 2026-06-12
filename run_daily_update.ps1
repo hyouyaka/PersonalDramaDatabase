@@ -52,8 +52,10 @@ $RankExitCode = Run-Step "fetch_rank_data.py" @("python", "-X", "utf8", "-u", "f
 $ExitCodes += $RankExitCode
 $ExitCodes += Run-Step "sync_new_drama_ids.py" @("python", "-X", "utf8", "-u", "sync_new_drama_ids.py", "--backfill-ranks")
 if ([int]$RankExitCode -eq 0) {
+    $ExitCodes += Run-Step "update_rank_meta.py normal" @("python", "-X", "utf8", "-u", "update_rank_meta.py", "normal")
     $ExitCodes += Run-Step "fetch_rank_data.py --repair-null-danmaku" @("python", "-X", "utf8", "-u", "fetch_rank_data.py", "--repair-null-danmaku")
 } else {
+    Write-Log "=== update_rank_meta.py normal skipped: fetch_rank_data.py exit=$RankExitCode ==="
     Write-Log "=== fetch_rank_data.py --repair-null-danmaku skipped: fetch_rank_data.py exit=$RankExitCode ==="
 }
 

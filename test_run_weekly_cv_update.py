@@ -15,10 +15,18 @@ class WeeklyCvUpdateScriptTests(unittest.TestCase):
         )
         self.assertIn("if ([int]$RefreshExitCode -eq 0) {", script)
         self.assertIn(
-            '$ExitCodes += Run-Step "build_cv_ranks.py" @("python", "-X", "utf8", "-u", "build_cv_ranks.py")',
+            '$BuildExitCode = Run-Step "build_cv_ranks.py" @("python", "-X", "utf8", "-u", "build_cv_ranks.py")',
+            script,
+        )
+        self.assertIn("$ExitCodes += $BuildExitCode", script)
+        self.assertIn("if ([int]$BuildExitCode -eq 0) {", script)
+        self.assertIn(
+            '$ExitCodes += Run-Step "update_rank_meta.py cv" @("python", "-X", "utf8", "-u", "update_rank_meta.py", "cv")',
             script,
         )
         self.assertIn("build_cv_ranks.py skipped", script)
+        self.assertIn("update_rank_meta.py cv skipped: build_cv_ranks.py", script)
+        self.assertIn("update_rank_meta.py cv skipped: refresh_watch_counts.py", script)
 
 
 if __name__ == "__main__":
