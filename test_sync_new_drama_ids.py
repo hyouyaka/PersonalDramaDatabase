@@ -133,6 +133,84 @@ class UploadJsonValidationTests(unittest.TestCase):
         self.assertEqual(upstash.call_args_list[1].args[0][:2], ["SET", sync_new_drama_ids.CVID_MAP_KEY])
 
 
+class WatchcountSyncTests(unittest.TestCase):
+    def write_cache(self, tmp: str, payload: dict) -> Path:
+        path = Path(tmp) / "watch-counts.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    def test_remote_newer_watchcount_overwrites_local_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            local = {"_meta": {"updated_at": "2026-06-10T00:00:00+00:00"}, "counts": {"100": {"view_count": 1}}}
+            remote = {"_meta": {"updated_at": "2026-06-11T00:00:00+00:00"}, "counts": {"100": {"view_count": 2}}}
+            path = self.write_cache(tmp, local)
+            upstash = Mock(return_value=json.dumps(remote, ensure_ascii=False))
+
+            downloaded = sync_new_drama_ids.sync_remote_watchcount_if_newer("missevan", path, upstash=upstash)
+            saved = json.loads(path.read_text(encoding="utf-8"))
+
+            self.assertTrue(downloaded)
+            self.assertEqual(saved, remote)
+            upstash.assert_called_once_with(["GET", "missevan:watchcount:latest"])
+
+    def test_remote_older_watchcount_keeps_local_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            local = {"_meta": {"updated_at": "2026-06-12T00:00:00+00:00"}, "counts": {"100": {"view_count": 3}}}
+            remote = {"_meta": {"updated_at": "2026-06-11T00:00:00+00:00"}, "counts": {"100": {"view_count": 2}}}
+            path = self.write_cache(tmp, local)
+            upstash = Mock(return_value=json.dumps(remote, ensure_ascii=False))
+
+            downloaded = sync_new_drama_ids.sync_remote_watchcount_if_newer("missevan", path, upstash=upstash)
+            saved = json.loads(path.read_text(encoding="utf-8"))
+
+            self.assertFalse(downloaded)
+            self.assertEqual(saved, local)
+
+    def test_force_downloads_watchcount_even_when_remote_is_older(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            local = {"_meta": {"updated_at": "2026-06-12T00:00:00+00:00"}, "counts": {"100": {"view_count": 3}}}
+            remote = {"_meta": {"updated_at": "2026-06-11T00:00:00+00:00"}, "counts": {"100": {"view_count": 2}}}
+            path = self.write_cache(tmp, local)
+            upstash = Mock(return_value=json.dumps(remote, ensure_ascii=False))
+
+            downloaded = sync_new_drama_ids.sync_remote_watchcount_if_newer(
+                "missevan",
+                path,
+                upstash=upstash,
+                force=True,
+            )
+            saved = json.loads(path.read_text(encoding="utf-8"))
+
+            self.assertTrue(downloaded)
+            self.assertEqual(saved, remote)
+
+    def test_upload_watchcount_file_writes_date_and_latest_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_cache(
+                tmp,
+                {"_meta": {"updated_at": "2026-06-12T04:17:39+00:00"}, "counts": {"100": {"view_count": 9}}},
+            )
+            upstash = Mock(return_value="OK")
+
+            sync_new_drama_ids.upload_watchcount_file("missevan", path, upstash=upstash)
+
+        self.assertEqual(upstash.call_args_list[0].args[0][0:2], ["SET", "missevan:watchcount:2026-06-12"])
+        self.assertEqual(upstash.call_args_list[1].args[0][0:2], ["SET", "missevan:watchcount:latest"])
+        self.assertEqual(json.loads(upstash.call_args_list[0].args[0][2])["counts"]["100"]["view_count"], 9)
+
+    def test_remote_watchcount_missing_counts_is_rejected_before_overwriting_local_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            local = {"_meta": {"updated_at": "2026-06-10T00:00:00+00:00"}, "counts": {"100": {"view_count": 1}}}
+            remote = {"_meta": {"updated_at": "2026-06-11T00:00:00+00:00"}}
+            path = self.write_cache(tmp, local)
+            upstash = Mock(return_value=json.dumps(remote, ensure_ascii=False))
+
+            with self.assertRaisesRegex(RuntimeError, "missing counts object"):
+                sync_new_drama_ids.sync_remote_watchcount_if_newer("missevan", path, upstash=upstash)
+
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), local)
+
+
 class QueueReadyTests(unittest.TestCase):
     def test_missevan_ready_requires_cover(self) -> None:
         base = {

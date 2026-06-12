@@ -48,6 +48,7 @@ PersonalDramaDatabase_architecture.md
 /drama-series-info.json
 /missevan&manbo-cvid-map.json
 /DramasByCV.sqlite
+/DramasByCV_merged.xlsx
 recovery_backups/
 backfill_vip_fields.py
 /backfill_cv_avatars.py

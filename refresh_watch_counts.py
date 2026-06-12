@@ -22,6 +22,7 @@ from platform_sync import (
     save_missevan_store,
     utc_now,
 )
+from sync_new_drama_ids import ROOT, load_env_file, sync_remote_watchcount_if_newer, upload_watchcount_file
 
 
 CACHE_WINDOW = timedelta(hours=1)
@@ -215,13 +216,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--platform", choices=("all", "missevan", "manbo"), default="all")
     parser.add_argument("--missevan", nargs="+", help="只刷新指定猫耳 dramaId，可传多个")
     parser.add_argument("--manbo", nargs="+", help="只刷新指定漫播 dramaId，可传多个")
+    parser.add_argument("--force", action="store_true", help="刷新前无条件拉取远端 watchcount latest")
+    parser.add_argument("--no-upload", action="store_true", help="刷新后不上传 watchcount 到 Upstash")
     args = parser.parse_args(argv)
+    load_env_file(ROOT / ".env")
 
     missevan_ids = {item.strip() for item in (args.missevan or []) if item.strip()}
     manbo_ids = {item.strip() for item in (args.manbo or []) if item.strip()}
     explicit_target_mode = bool(missevan_ids or manbo_ids)
     do_missevan = bool(missevan_ids or (not explicit_target_mode and args.platform in ("all", "missevan")))
     do_manbo = bool(manbo_ids or (not explicit_target_mode and args.platform in ("all", "manbo")))
+    refreshed_platforms: list[str] = []
+
+    if do_missevan:
+        sync_remote_watchcount_if_newer("missevan", MISSEVAN_COUNTS_PATH, force=args.force)
+    if do_manbo:
+        sync_remote_watchcount_if_newer("manbo", MANBO_COUNTS_PATH, force=args.force)
 
     if do_missevan and do_manbo and not explicit_target_mode and args.platform == "all":
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -236,6 +246,10 @@ def main(argv: list[str] | None = None) -> int:
                     if futures[future] == "missevan" and "HTTP_418" in str(exc):
                         return 2
                     raise
+        if not args.no_upload:
+            for platform in ("missevan", "manbo"):
+                path = MISSEVAN_COUNTS_PATH if platform == "missevan" else MANBO_COUNTS_PATH
+                upload_watchcount_file(platform, path)
         return 0
 
     if do_missevan:
@@ -245,9 +259,16 @@ def main(argv: list[str] | None = None) -> int:
             if "HTTP_418" not in str(exc):
                 raise
             return 2
+        refreshed_platforms.append("missevan")
 
     if do_manbo:
         run_manbo_refresh(manbo_ids or None)
+        refreshed_platforms.append("manbo")
+
+    if not args.no_upload:
+        for platform in refreshed_platforms:
+            path = MISSEVAN_COUNTS_PATH if platform == "missevan" else MANBO_COUNTS_PATH
+            upload_watchcount_file(platform, path)
 
     return 0
 

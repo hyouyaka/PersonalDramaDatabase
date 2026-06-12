@@ -19,7 +19,7 @@ from platform_sync import (
     normalize_match,
     save_json,
 )
-from sync_new_drama_ids import ROOT, configure_stdio, load_env_file, upstash_request
+from sync_new_drama_ids import ROOT, configure_stdio, load_env_file, sync_remote_watchcount_if_newer, upstash_request
 from sync_new_drama_ids import MANBO_INFO_KEY, MISSEVAN_INFO_KEY
 from sync_remote_libraries import fetch_cvid_map_payload, fetch_info_payload, write_payloads
 
@@ -334,6 +334,17 @@ def sync_remote_rank_inputs(
     return cvid_payload[1]
 
 
+def sync_remote_watchcount_inputs(
+    *,
+    missevan_counts_path: Path = MISSEVAN_COUNTS_PATH,
+    manbo_counts_path: Path = MANBO_COUNTS_PATH,
+    upstash=upstash_request,
+    force: bool = False,
+) -> None:
+    sync_remote_watchcount_if_newer("missevan", missevan_counts_path, upstash=upstash, force=force)
+    sync_remote_watchcount_if_newer("manbo", manbo_counts_path, upstash=upstash, force=force)
+
+
 def build_and_publish_cv_ranks(
     *,
     missevan_info_path: Path = MISSEVAN_INFO_PATH,
@@ -345,7 +356,14 @@ def build_and_publish_cv_ranks(
     upstash=upstash_request,
     generated_at: str | None = None,
     upload: bool = True,
+    force: bool = False,
 ) -> dict:
+    sync_remote_watchcount_inputs(
+        missevan_counts_path=missevan_counts_path,
+        manbo_counts_path=manbo_counts_path,
+        upstash=upstash,
+        force=force,
+    )
     missevan_cache = load_cache(missevan_counts_path)
     manbo_cache = load_cache(manbo_counts_path)
     generated = generated_at or latest_watch_count_updated_at(missevan_cache, manbo_cache) or now_iso()
@@ -373,6 +391,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build CV view-count rankings from local platform libraries")
     parser.add_argument("--no-upload", action="store_true", help="Only write ranks-cv.json locally")
     parser.add_argument("--date", help="Override the output date and Upstash date key (YYYY-MM-DD)")
+    parser.add_argument("--force", action="store_true", help="构建前无条件拉取远端 watchcount latest")
     return parser.parse_args(argv)
 
 
@@ -383,7 +402,7 @@ def main(argv: list[str] | None = None) -> int:
     generated_at = None
     if args.date:
         generated_at = f"{args.date}T00:00:00+00:00"
-    payload = build_and_publish_cv_ranks(generated_at=generated_at, upload=not args.no_upload)
+    payload = build_and_publish_cv_ranks(generated_at=generated_at, upload=not args.no_upload, force=args.force)
     rankings = payload.get("rankings") or {}
     missevan_count = len(rankings.get("missevan") or [])
     manbo_count = len(rankings.get("manbo") or [])

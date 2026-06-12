@@ -93,7 +93,10 @@ class BuildCvRanksTests(unittest.TestCase):
             }
             upstash = Mock(side_effect=["OK", "OK"])
 
-            with patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value=remote_map):
+            with (
+                patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value=remote_map),
+                patch.object(build_cv_ranks, "sync_remote_watchcount_inputs"),
+            ):
                 payload = build_cv_ranks.build_and_publish_cv_ranks(
                     missevan_info_path=missevan_info,
                     manbo_info_path=manbo_info,
@@ -164,7 +167,10 @@ class BuildCvRanksTests(unittest.TestCase):
                 self.assertEqual(kwargs["cvid_map_path"], cvid_map)
                 return remote_map
 
-            with patch.object(build_cv_ranks, "sync_remote_rank_inputs", side_effect=sync_inputs) as sync_remote:
+            with (
+                patch.object(build_cv_ranks, "sync_remote_rank_inputs", side_effect=sync_inputs) as sync_remote,
+                patch.object(build_cv_ranks, "sync_remote_watchcount_inputs"),
+            ):
                 payload = build_cv_ranks.build_and_publish_cv_ranks(
                     missevan_info_path=missevan_info,
                     manbo_info_path=manbo_info,
@@ -228,6 +234,8 @@ class BuildCvRanksTests(unittest.TestCase):
             }
             upstash = Mock(
                 side_effect=[
+                    None,
+                    None,
                     json.dumps(remote_manbo, ensure_ascii=False),
                     json.dumps(remote_missevan, ensure_ascii=False),
                     json.dumps(remote_map, ensure_ascii=False),
@@ -246,9 +254,11 @@ class BuildCvRanksTests(unittest.TestCase):
                 upload=False,
             )
 
-            self.assertEqual(upstash.call_args_list[0].args[0], ["GET", "manbo:info:v1"])
-            self.assertEqual(upstash.call_args_list[1].args[0], ["GET", "missevan:info:v1"])
-            self.assertEqual(upstash.call_args_list[2].args[0], ["GET", "cvid-map:v1"])
+            self.assertEqual(upstash.call_args_list[0].args[0], ["GET", "missevan:watchcount:latest"])
+            self.assertEqual(upstash.call_args_list[1].args[0], ["GET", "manbo:watchcount:latest"])
+            self.assertEqual(upstash.call_args_list[2].args[0], ["GET", "manbo:info:v1"])
+            self.assertEqual(upstash.call_args_list[3].args[0], ["GET", "missevan:info:v1"])
+            self.assertEqual(upstash.call_args_list[4].args[0], ["GET", "cvid-map:v1"])
             self.assertEqual(json.loads(manbo_info.read_text(encoding="utf-8")), remote_manbo)
             self.assertEqual(json.loads(missevan_info.read_text(encoding="utf-8")), remote_missevan)
             self.assertEqual(json.loads(cvid_map.read_text(encoding="utf-8")), remote_map)
@@ -298,7 +308,10 @@ class BuildCvRanksTests(unittest.TestCase):
             )
             cvid_map = self.write_json(tmp, "map.json", {})
 
-            with patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value={}):
+            with (
+                patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value={}),
+                patch.object(build_cv_ranks, "sync_remote_watchcount_inputs"),
+            ):
                 payload = build_cv_ranks.build_and_publish_cv_ranks(
                     missevan_info_path=missevan_info,
                     manbo_info_path=manbo_info,
@@ -356,6 +369,79 @@ class BuildCvRanksTests(unittest.TestCase):
         self.assertEqual(len(payload["rankings"]["manbo"]), 30)
         self.assertEqual(payload["rankings"]["missevan"][0]["cvName"], "猫耳CV00")
         self.assertEqual(payload["rankings"]["manbo"][0]["cvName"], "漫播CV00")
+
+    def test_syncs_remote_watchcounts_before_loading_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missevan_info = self.write_json(
+                tmp,
+                "missevan.json",
+                {"100": {"dramaId": 100, "title": "猫耳剧", "maincvs": [11], "cvnames": {"11": "猫耳名"}}},
+            )
+            manbo_info = self.write_json(tmp, "manbo.json", {"version": 1, "records": []})
+            missevan_counts = self.write_json(
+                tmp,
+                "missevan-counts.json",
+                {"_meta": {"updated_at": "2026-06-10T08:00:00+00:00"}, "counts": {"100": {"view_count": 100}}},
+            )
+            manbo_counts = self.write_json(tmp, "manbo-counts.json", {"_meta": {}, "counts": {}})
+            cvid_map = self.write_json(tmp, "map.json", {})
+
+            def sync_watchcounts(**kwargs):
+                self.assertEqual(kwargs["missevan_counts_path"], missevan_counts)
+                self.assertEqual(kwargs["manbo_counts_path"], manbo_counts)
+                self.assertFalse(kwargs["force"])
+                missevan_counts.write_text(
+                    json.dumps(
+                        {"_meta": {"updated_at": "2026-06-11T08:00:00+00:00"}, "counts": {"100": {"view_count": 250}}},
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+
+            with (
+                patch.object(build_cv_ranks, "sync_remote_watchcount_inputs", side_effect=sync_watchcounts) as sync_remote,
+                patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value={}),
+            ):
+                payload = build_cv_ranks.build_and_publish_cv_ranks(
+                    missevan_info_path=missevan_info,
+                    manbo_info_path=manbo_info,
+                    missevan_counts_path=missevan_counts,
+                    manbo_counts_path=manbo_counts,
+                    cvid_map_path=cvid_map,
+                    output_path=Path(tmp) / "ranks-cv.json",
+                    upload=False,
+                )
+
+            sync_remote.assert_called_once()
+            self.assertEqual(payload["rankings"]["missevan"][0]["totalViewCount"], 250)
+            self.assertEqual(payload["generated_at"], "2026-06-11T08:00:00+00:00")
+
+    def test_force_is_passed_to_watchcount_sync_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missevan_info = self.write_json(tmp, "missevan.json", {})
+            manbo_info = self.write_json(tmp, "manbo.json", {"version": 1, "records": []})
+            missevan_counts = self.write_json(tmp, "missevan-counts.json", {"_meta": {}, "counts": {}})
+            manbo_counts = self.write_json(tmp, "manbo-counts.json", {"_meta": {}, "counts": {}})
+            cvid_map = self.write_json(tmp, "map.json", {})
+
+            with (
+                patch.object(build_cv_ranks, "sync_remote_watchcount_inputs") as sync_watchcounts,
+                patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value={}) as sync_rank_inputs,
+            ):
+                build_cv_ranks.build_and_publish_cv_ranks(
+                    missevan_info_path=missevan_info,
+                    manbo_info_path=manbo_info,
+                    missevan_counts_path=missevan_counts,
+                    manbo_counts_path=manbo_counts,
+                    cvid_map_path=cvid_map,
+                    output_path=Path(tmp) / "ranks-cv.json",
+                    upload=False,
+                    force=True,
+                )
+
+        sync_watchcounts.assert_called_once()
+        self.assertTrue(sync_watchcounts.call_args.kwargs["force"])
+        self.assertNotIn("force", sync_rank_inputs.call_args.kwargs)
 
 
 if __name__ == "__main__":

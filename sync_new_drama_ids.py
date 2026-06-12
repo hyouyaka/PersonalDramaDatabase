@@ -27,6 +27,10 @@ MANBO_INFO_KEY = "manbo:info:v1"
 MISSEVAN_INFO_KEY = "missevan:info:v1"
 CVID_MAP_KEY = "cvid-map:v1"
 SERIES_INFO_KEY = "drama:series-info:v1"
+WATCHCOUNT_KEY_PREFIXES = {
+    "missevan": "missevan:watchcount",
+    "manbo": "manbo:watchcount",
+}
 INFO_UPLOAD_MIN_COUNTS = {
     MISSEVAN_INFO_KEY: 100,
     MANBO_INFO_KEY: 50,
@@ -258,6 +262,98 @@ def decode_remote_json_payload(key: str, raw: object) -> object:
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"{key} contains invalid JSON: {exc}") from exc
     return raw
+
+
+def parse_remote_iso_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def watchcount_key(platform: str, suffix: str) -> str:
+    prefix = WATCHCOUNT_KEY_PREFIXES.get(platform)
+    if prefix is None:
+        raise RuntimeError(f"Unsupported watchcount platform: {platform}")
+    return f"{prefix}:{suffix}"
+
+
+def assert_watchcount_payload_is_safe(key: str, payload: object) -> None:
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Refusing to use {key}: expected a JSON object.")
+    if not isinstance(payload.get("_meta"), dict):
+        raise RuntimeError(f"Refusing to use {key}: missing _meta object.")
+    if not isinstance(payload.get("counts"), dict):
+        raise RuntimeError(f"Refusing to use {key}: missing counts object.")
+
+
+def watchcount_updated_at(payload: object) -> datetime | None:
+    if not isinstance(payload, dict):
+        return None
+    return parse_remote_iso_datetime(((payload.get("_meta") or {}).get("updated_at")))
+
+
+def load_watchcount_payload(path: Path) -> dict:
+    payload = load_json(path, {"_meta": {"updated_at": None}, "counts": {}})
+    if not isinstance(payload, dict):
+        return {"_meta": {"updated_at": None}, "counts": {}}
+    payload.setdefault("_meta", {"updated_at": None})
+    payload.setdefault("counts", {})
+    return payload
+
+
+def decode_remote_watchcount_payload(key: str, raw: object) -> dict:
+    payload = decode_remote_json_payload(key, raw)
+    assert_watchcount_payload_is_safe(key, payload)
+    return payload
+
+
+def sync_remote_watchcount_if_newer(
+    platform: str,
+    path: Path,
+    *,
+    upstash=upstash_request,
+    force: bool = False,
+) -> bool:
+    key = watchcount_key(platform, "latest")
+    local_payload = load_watchcount_payload(path)
+    try:
+        remote_payload = decode_remote_watchcount_payload(key, upstash(["GET", key]))
+    except RemoteJsonMissing:
+        print(f"[skip] {key}: remote value is empty or missing")
+        return False
+
+    local_updated = watchcount_updated_at(local_payload)
+    remote_updated = watchcount_updated_at(remote_payload)
+    should_download = force or (remote_updated is not None and (local_updated is None or remote_updated > local_updated))
+    if not should_download:
+        print(f"[skip] {key}: local watchcount is up to date")
+        return False
+
+    backup_path = write_json_work_copy(path, remote_payload)
+    if backup_path is not None:
+        print(f"[backup] {path.name} -> {backup_path}")
+    print(f"[ok] downloaded {key} -> {path.name}")
+    return True
+
+
+def upload_watchcount_file(platform: str, path: Path, *, upstash=upstash_request) -> None:
+    payload = load_watchcount_payload(path)
+    latest_key = watchcount_key(platform, "latest")
+    assert_watchcount_payload_is_safe(latest_key, payload)
+    updated_at = watchcount_updated_at(payload) or datetime.now(timezone.utc)
+    date_key = watchcount_key(platform, updated_at.astimezone(timezone.utc).date().isoformat())
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    for key in (date_key, latest_key):
+        result = upstash(["SET", key, encoded])
+        if result != "OK":
+            raise RuntimeError(f"Failed to upload {path.name} to {key}: {result!r}")
+        print(f"[ok] uploaded {path.name} -> {key} ({len(encoded)} bytes)")
 
 
 def write_json_work_copy(path: Path, payload: object) -> Path | None:
