@@ -20,7 +20,8 @@ from platform_sync import (
     save_json,
 )
 from sync_new_drama_ids import ROOT, configure_stdio, load_env_file, upstash_request
-from sync_remote_libraries import fetch_cvid_map_payload
+from sync_new_drama_ids import MANBO_INFO_KEY, MISSEVAN_INFO_KEY
+from sync_remote_libraries import fetch_cvid_map_payload, fetch_info_payload, write_payloads
 
 
 HERE = Path(__file__).resolve().parent
@@ -316,6 +317,23 @@ def sync_remote_cvid_map(*, cvid_map_path: Path = COMBINED_CVID_MAP_PATH, upstas
     return payload
 
 
+def sync_remote_rank_inputs(
+    *,
+    missevan_info_path: Path = MISSEVAN_INFO_PATH,
+    manbo_info_path: Path = MANBO_INFO_PATH,
+    cvid_map_path: Path = COMBINED_CVID_MAP_PATH,
+    upstash=upstash_request,
+) -> dict:
+    payloads = [
+        fetch_info_payload(MANBO_INFO_KEY, manbo_info_path, upstash=upstash),
+        fetch_info_payload(MISSEVAN_INFO_KEY, missevan_info_path, upstash=upstash),
+    ]
+    cvid_payload = fetch_cvid_map_payload(path=cvid_map_path, upstash=upstash)
+    payloads.append(cvid_payload)
+    write_payloads(payloads)
+    return cvid_payload[1]
+
+
 def build_and_publish_cv_ranks(
     *,
     missevan_info_path: Path = MISSEVAN_INFO_PATH,
@@ -331,7 +349,12 @@ def build_and_publish_cv_ranks(
     missevan_cache = load_cache(missevan_counts_path)
     manbo_cache = load_cache(manbo_counts_path)
     generated = generated_at or latest_watch_count_updated_at(missevan_cache, manbo_cache) or now_iso()
-    cvid_map = sync_remote_cvid_map(cvid_map_path=cvid_map_path, upstash=upstash)
+    cvid_map = sync_remote_rank_inputs(
+        missevan_info_path=missevan_info_path,
+        manbo_info_path=manbo_info_path,
+        cvid_map_path=cvid_map_path,
+        upstash=upstash,
+    )
     payload = build_cv_ranks_payload(
         missevan_store=load_json(missevan_info_path, {}),
         manbo_store=load_json(manbo_info_path, {"records": []}),
