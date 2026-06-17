@@ -21,6 +21,8 @@ ONGOING_KEYS = {
     "missevan": "ongoing:missevan",
     "manbo": "ongoing:manbo",
 }
+MISSEVAN_WEEKDAY_CACHE_KEY = "ongoing:missevan:weekday-cache:v1"
+MISSEVAN_WEEKDAY_CACHE_TTL_DAYS = 14
 MISSEVAN_SUMMERDRAMA_URL = "https://www.missevan.com/dramaapi/summerdrama"
 MISSEVAN_TIMELINE_URL = "https://app.missevan.com/drama/timeline"
 MISSEVAN_SOUND_PAGE_URL = "https://www.missevan.com/sound/m?order=0&id=17&p={page}"
@@ -33,6 +35,23 @@ MANBO_TIME_DETAIL_URL = (
 BLOCKED_UPDATE_TITLE_WORDS = ("福利", "小剧场", "生日")
 MISSEVAN_DAILY_VIEW_THRESHOLD = 100
 MISSEVAN_DAILY_COMMENT_THRESHOLD = 20
+MISSEVAN_WEEKDAY_BY_LABEL = {
+    "一": 1,
+    "二": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "日": 7,
+    "天": 7,
+}
+MISSEVAN_LABEL_BY_WEEKDAY = {
+    value: key for key, value in MISSEVAN_WEEKDAY_BY_LABEL.items() if key != "天"
+}
+
+
+class MissevanTodayFallbackError(RuntimeError):
+    """Raised when today's empty timeline bucket cannot be safely backfilled."""
 
 
 def load_env_file(path: Path) -> None:
@@ -51,6 +70,13 @@ load_env_file(HERE / ".env")
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def iso_for_now(now: datetime | None = None) -> str:
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return current.astimezone(timezone.utc).isoformat()
 
 
 def safe_int(value: object, default: int = 0) -> int:
@@ -91,11 +117,65 @@ def upstash_request(command: list[object]) -> object:
     return payload.get("result")
 
 
+def load_upstash_json(key: str, *, upstash: Callable[[list[object]], object] = upstash_request) -> object:
+    result = upstash(["GET", key])
+    if result in (None, ""):
+        return None
+    if isinstance(result, str):
+        return json.loads(result)
+    return result
+
+
+def set_upstash_json(
+    key: str,
+    payload: dict,
+    *,
+    upstash: Callable[[list[object]], object] = upstash_request,
+) -> None:
+    result = upstash(["SET", key, json.dumps(payload, ensure_ascii=False)])
+    if result != "OK":
+        raise RuntimeError(f"Failed to upload {key}: {result!r}")
+
+
 def make_record(drama_id: object, update_type: str) -> dict[str, object]:
     return {
         "dramaId": str(drama_id),
         "updateType": update_type,
     }
+
+
+def records_to_map(records: list[dict[str, object]]) -> dict[str, dict[str, object]]:
+    mapped: dict[str, dict[str, object]] = {}
+    for record in records:
+        drama_id = str(record.get("dramaId") or "").strip()
+        if drama_id:
+            mapped[drama_id] = dict(record)
+    return mapped
+
+
+def records_from_map(records: object) -> list[dict[str, object]]:
+    if not isinstance(records, dict):
+        return []
+    result: list[dict[str, object]] = []
+    for key, record in records.items():
+        if isinstance(record, dict):
+            drama_id = record.get("dramaId") or key
+            if drama_id not in (None, ""):
+                result.append(make_record(drama_id, str(record.get("updateType") or "weekly")))
+        elif key not in (None, ""):
+            result.append(make_record(key, "weekly"))
+    return result
+
+
+def dedupe_records(records: list[dict[str, object]]) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for record in records:
+        drama_id = str(record.get("dramaId") or "").strip()
+        if drama_id and drama_id not in seen:
+            seen.add(drama_id)
+            result.append(dict(record))
+    return result
 
 
 def merge_records(
@@ -190,58 +270,371 @@ def request_missevan_timeline_json() -> dict | None:
     return data
 
 
-def parse_missevan_timeline_weekly_records(payload: dict) -> list[dict[str, object]]:
+def parse_missevan_weekday(value: object) -> int | None:
+    if value not in (None, ""):
+        numeric = safe_int(value, -1)
+        if 1 <= numeric <= 7:
+            return numeric
+    text = str(value or "").strip()
+    for prefix in ("星期", "周"):
+        if text.startswith(prefix):
+            text = text[len(prefix) :].strip()
+    if text in MISSEVAN_WEEKDAY_BY_LABEL:
+        return MISSEVAN_WEEKDAY_BY_LABEL[text]
+    return None
+
+
+def parse_missevan_group_weekday(group: dict) -> int | None:
+    if "weekday" in group:
+        weekday = parse_missevan_weekday(group.get("weekday"))
+        if weekday is not None:
+            return weekday
+    return parse_missevan_weekday(group.get("date_week"))
+
+
+def parse_missevan_timeline_group_records(group: dict) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for drama in group.get("dramas") or []:
+        if not isinstance(drama, dict):
+            continue
+        if safe_int(drama.get("pay_type"), -1) == 0:
+            continue
+        drama_id = drama.get("id")
+        if drama_id not in (None, ""):
+            records.append(make_record(drama_id, "weekly"))
+    return records
+
+
+def parse_missevan_timeline_weekly_buckets(payload: dict) -> list[dict[str, object]]:
+    buckets: list[dict[str, object]] = []
+    info = payload.get("info") or []
+    if not isinstance(info, list):
+        return buckets
+    for group in info:
+        if not isinstance(group, dict):
+            continue
+        weekday = parse_missevan_group_weekday(group)
+        buckets.append(
+            {
+                "weekday": weekday,
+                "dateWeek": str(group.get("date_week") or "").strip(),
+                "isToday": safe_int(group.get("is_today")) == 1,
+                "records": parse_missevan_timeline_group_records(group),
+            }
+        )
+    return buckets
+
+
+def parse_iso_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def fresh_missevan_cache_records(
+    weekday_cache: object,
+    weekday: int | None,
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, object]]:
+    if weekday is None or not isinstance(weekday_cache, dict):
+        return []
+    buckets = weekday_cache.get("buckets")
+    if not isinstance(buckets, dict):
+        return []
+    bucket = buckets.get(str(weekday))
+    if not isinstance(bucket, dict):
+        return []
+    observed_at = parse_iso_datetime(bucket.get("observedAt"))
+    if observed_at is None:
+        return []
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    age = current.astimezone(timezone.utc) - observed_at
+    if age > timedelta(days=MISSEVAN_WEEKDAY_CACHE_TTL_DAYS):
+        return []
+    return records_from_map(bucket.get("records"))
+
+
+def parse_missevan_timeline_weekly_records(
+    payload: dict,
+    *,
+    weekday_cache: object | None = None,
+    now: datetime | None = None,
+) -> list[dict[str, object]]:
+    weekly: list[dict[str, object]] = []
+    for bucket in parse_missevan_timeline_weekly_buckets(payload):
+        records = bucket.get("records")
+        if isinstance(records, list) and records:
+            weekly.extend(records)
+            continue
+        if bucket.get("isToday"):
+            weekly.extend(
+                fresh_missevan_cache_records(
+                    weekday_cache,
+                    bucket.get("weekday") if isinstance(bucket.get("weekday"), int) else None,
+                    now=now,
+                )
+            )
+    return dedupe_records(weekly)
+
+
+def build_missevan_weekday_cache_from_timeline(
+    payload: dict,
+    *,
+    existing_cache: object | None = None,
+    now: datetime | None = None,
+) -> dict:
+    current_iso = iso_for_now(now)
+    cache: dict[str, object] = {
+        "version": 1,
+        "platform": "missevan",
+        "updatedAt": current_iso,
+        "buckets": {},
+    }
+    if isinstance(existing_cache, dict) and isinstance(existing_cache.get("buckets"), dict):
+        cache["buckets"] = {
+            str(key): dict(value)
+            for key, value in existing_cache.get("buckets", {}).items()
+            if isinstance(value, dict)
+        }
+    buckets = cache["buckets"]
+    assert isinstance(buckets, dict)
+    for bucket in parse_missevan_timeline_weekly_buckets(payload):
+        weekday = bucket.get("weekday")
+        records = bucket.get("records")
+        if not isinstance(weekday, int) or not isinstance(records, list) or not records:
+            continue
+        date_week = str(bucket.get("dateWeek") or "").strip() or MISSEVAN_LABEL_BY_WEEKDAY.get(weekday, "")
+        buckets[str(weekday)] = {
+            "weekday": weekday,
+            "dateWeek": date_week,
+            "observedAt": current_iso,
+            "records": records_to_map(records),
+        }
+    return cache
+
+
+def current_beijing_weekday(*, now: datetime | None = None) -> int:
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return current.astimezone(BEIJING_TZ).isoweekday()
+
+
+def parse_missevan_summerdrama_group_records(group: object) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    if not isinstance(group, list):
+        return records
+    for item in group:
+        if not isinstance(item, dict):
+            continue
+        if safe_int(item.get("pay_type"), -1) == 0:
+            continue
+        drama_id = item.get("id")
+        if drama_id not in (None, ""):
+            records.append(make_record(drama_id, "weekly"))
+    return records
+
+
+def parse_missevan_summerdrama_records(payload: dict) -> list[dict[str, object]]:
     weekly: list[dict[str, object]] = []
     info = payload.get("info") or []
     if not isinstance(info, list):
         return weekly
     for group in info:
-        if not isinstance(group, dict):
-            continue
-        for drama in group.get("dramas") or []:
-            if not isinstance(drama, dict):
-                continue
-            if safe_int(drama.get("pay_type"), -1) == 0:
-                continue
-            drama_id = drama.get("id")
-            if drama_id not in (None, ""):
-                weekly.append(make_record(drama_id, "weekly"))
-    return weekly
+        weekly.extend(parse_missevan_summerdrama_group_records(group))
+    return dedupe_records(weekly)
+
+
+def parse_missevan_summerdrama_weekly_buckets(
+    payload: dict,
+    *,
+    current_weekday: int,
+) -> dict[int, list[dict[str, object]]]:
+    info = payload.get("info") or []
+    if not isinstance(info, list):
+        return {}
+    buckets: dict[int, list[dict[str, object]]] = {}
+    for index, group in enumerate(info):
+        weekday = ((current_weekday - 2 + index) % 7) + 1
+        buckets[weekday] = parse_missevan_summerdrama_group_records(group)
+    return buckets
+
+
+def parse_missevan_summerdrama_weekday_records(
+    payload: dict,
+    weekday: int,
+    *,
+    current_weekday: int | None = None,
+) -> list[dict[str, object]]:
+    active_weekday = current_weekday or current_beijing_weekday()
+    buckets = parse_missevan_summerdrama_weekly_buckets(payload, current_weekday=active_weekday)
+    return buckets.get(weekday, [])
+
+
+def timeline_today_empty_weekday(payload: dict) -> int | None:
+    for bucket in parse_missevan_timeline_weekly_buckets(payload):
+        records = bucket.get("records")
+        if bucket.get("isToday") and (not isinstance(records, list) or not records):
+            weekday = bucket.get("weekday")
+            return weekday if isinstance(weekday, int) else None
+    return None
+
+
+def load_missevan_weekday_cache(
+    *,
+    upstash: Callable[[list[object]], object] = upstash_request,
+) -> object:
+    return load_upstash_json(MISSEVAN_WEEKDAY_CACHE_KEY, upstash=upstash)
+
+
+def save_missevan_weekday_cache(
+    cache: dict,
+    *,
+    upstash: Callable[[list[object]], object] = upstash_request,
+) -> None:
+    set_upstash_json(MISSEVAN_WEEKDAY_CACHE_KEY, cache, upstash=upstash)
+
+
+def parse_missevan_seed_spec(spec: str) -> tuple[int, list[str]]:
+    weekday_text, separator, ids_text = spec.partition(":")
+    if not separator:
+        raise ValueError(f"Invalid seed spec {spec!r}; expected WEEKDAY:DRAMA_ID[,DRAMA_ID...]")
+    weekday = parse_missevan_weekday(weekday_text)
+    if weekday is None:
+        raise ValueError(f"Invalid weekday in seed spec {spec!r}; expected 1-7 or 一/二/三/四/五/六/日")
+    drama_ids = [item.strip() for item in ids_text.split(",") if item.strip()]
+    if not drama_ids:
+        raise ValueError(f"Invalid seed spec {spec!r}; expected at least one drama ID")
+    return weekday, drama_ids
+
+
+def seed_missevan_weekday_cache(
+    specs: list[str],
+    *,
+    upstash: Callable[[list[object]], object] = upstash_request,
+    now: datetime | None = None,
+) -> dict:
+    current_iso = iso_for_now(now)
+    existing = load_missevan_weekday_cache(upstash=upstash)
+    cache: dict[str, object] = {
+        "version": 1,
+        "platform": "missevan",
+        "updatedAt": current_iso,
+        "buckets": {},
+    }
+    if isinstance(existing, dict) and isinstance(existing.get("buckets"), dict):
+        cache["buckets"] = {
+            str(key): dict(value)
+            for key, value in existing.get("buckets", {}).items()
+            if isinstance(value, dict)
+        }
+    buckets = cache["buckets"]
+    assert isinstance(buckets, dict)
+    for spec in specs:
+        weekday, drama_ids = parse_missevan_seed_spec(spec)
+        existing_bucket = buckets.get(str(weekday))
+        existing_records = (
+            records_to_map(records_from_map(existing_bucket.get("records")))
+            if isinstance(existing_bucket, dict)
+            else {}
+        )
+        records = {
+            **existing_records,
+            **records_to_map([make_record(drama_id, "weekly") for drama_id in drama_ids]),
+        }
+        buckets[str(weekday)] = {
+            "weekday": weekday,
+            "dateWeek": (
+                str(existing_bucket.get("dateWeek") or "").strip()
+                if isinstance(existing_bucket, dict)
+                else ""
+            )
+            or MISSEVAN_LABEL_BY_WEEKDAY.get(weekday, ""),
+            "observedAt": current_iso,
+            "records": records,
+        }
+    save_missevan_weekday_cache(cache, upstash=upstash)
+    print(f"[ok] seeded {MISSEVAN_WEEKDAY_CACHE_KEY}: {len(specs)} bucket(s)")
+    return cache
 
 
 def fetch_missevan_weekly_records(
     requester: MissevanRequester,
     *,
     fetch_timeline: Callable[[], dict | None] = request_missevan_timeline_json,
+    sync_weekday_cache: bool = True,
+    now: datetime | None = None,
 ) -> list[dict[str, object]]:
     try:
         timeline = fetch_timeline()
         if timeline:
-            records = parse_missevan_timeline_weekly_records(timeline)
+            weekday_cache = None
+            cache_load_failed = False
+            try:
+                weekday_cache = load_missevan_weekday_cache()
+            except Exception as exc:
+                cache_load_failed = True
+                print(f"  [missevan] WARN: weekday cache load failed: {exc}")
+            timeline_records = parse_missevan_timeline_weekly_records(timeline, weekday_cache=None, now=now)
+            if not timeline_records:
+                records = []
+            else:
+                records = timeline_records
+            today_empty_weekday = timeline_today_empty_weekday(timeline)
+            if records and today_empty_weekday is not None:
+                cache_records = fresh_missevan_cache_records(weekday_cache, today_empty_weekday, now=now)
+                if cache_records:
+                    records = dedupe_records(timeline_records + cache_records)
+                else:
+                    try:
+                        summerdrama = requester.request_json(MISSEVAN_SUMMERDRAMA_URL)
+                    except Exception as exc:
+                        raise MissevanTodayFallbackError(
+                            "Missevan today timeline bucket is empty and summerdrama fallback failed."
+                        ) from exc
+                    summer_records = parse_missevan_summerdrama_weekday_records(
+                        summerdrama,
+                        today_empty_weekday,
+                        current_weekday=current_beijing_weekday(now=now),
+                    )
+                    if not summer_records:
+                        raise MissevanTodayFallbackError(
+                            "Missevan today timeline bucket is empty and summerdrama has no records for today."
+                        )
+                    records = dedupe_records(timeline_records + summer_records)
+            if sync_weekday_cache and not cache_load_failed and timeline_records:
+                try:
+                    next_cache = build_missevan_weekday_cache_from_timeline(
+                        timeline,
+                        existing_cache=weekday_cache,
+                        now=now,
+                    )
+                    save_missevan_weekday_cache(next_cache)
+                except Exception as exc:
+                    print(f"  [missevan] WARN: weekday cache save failed: {exc}")
             if records:
                 print(f"  [missevan] timeline weekly records={len(records)}")
                 return records
             print("  [missevan] WARN: timeline returned no weekly records; falling back to summerdrama")
+    except MissevanTodayFallbackError:
+        raise
     except Exception as exc:
         print(f"  [missevan] WARN: timeline fetch failed; falling back to summerdrama: {exc}")
 
     data = requester.request_json(MISSEVAN_SUMMERDRAMA_URL)
-    info = data.get("info") or []
-    weekly: list[dict[str, object]] = []
-    if not isinstance(info, list):
-        return weekly
-    for group in info:
-        if not isinstance(group, list):
-            continue
-        for item in group:
-            if not isinstance(item, dict):
-                continue
-            if safe_int(item.get("pay_type"), -1) == 0:
-                continue
-            drama_id = item.get("id")
-            if drama_id not in (None, ""):
-                weekly.append(make_record(drama_id, "weekly"))
-    return weekly
+    return parse_missevan_summerdrama_records(data)
 
 
 def parse_missevan_sound_entries(html: str) -> list[dict[str, object]]:
@@ -347,9 +740,13 @@ def fetch_missevan_daily_drama_ids(
     return drama_ids
 
 
-def fetch_missevan_records(requester: MissevanRequester | None = None) -> dict[str, dict[str, object]]:
+def fetch_missevan_records(
+    requester: MissevanRequester | None = None,
+    *,
+    sync_weekday_cache: bool = True,
+) -> dict[str, dict[str, object]]:
     active_requester = requester or MissevanRequester()
-    weekly = fetch_missevan_weekly_records(active_requester)
+    weekly = fetch_missevan_weekly_records(active_requester, sync_weekday_cache=sync_weekday_cache)
     sound_ids = collect_missevan_daily_sound_ids(requester=active_requester)
     daily_ids = fetch_missevan_daily_drama_ids(active_requester, sound_ids)
     daily = [make_record(drama_id, "daily") for drama_id in daily_ids]
@@ -448,14 +845,24 @@ def main() -> None:
     platform_group.add_argument("--missevan-only", action="store_true", help="Only process Missevan")
     platform_group.add_argument("--manbo-only", action="store_true", help="Only process Manbo")
     parser.add_argument("--dry-run", action="store_true", help="Print summary without uploading to Upstash")
+    parser.add_argument(
+        "--seed-missevan-weekday-cache",
+        action="append",
+        default=[],
+        metavar="WEEKDAY:DRAMA_ID[,DRAMA_ID...]",
+        help="Seed one Missevan weekday cache bucket, e.g. 3:93038 for Wednesday.",
+    )
     args = parser.parse_args()
 
     do_missevan = not args.manbo_only
     do_manbo = not args.missevan_only
 
+    if args.seed_missevan_weekday_cache:
+        seed_missevan_weekday_cache(args.seed_missevan_weekday_cache)
+
     if do_missevan:
         print("=== Fetching Missevan ongoing dramas ===")
-        records = fetch_missevan_records()
+        records = fetch_missevan_records(sync_weekday_cache=not args.dry_run)
         upload_payload("missevan", build_payload("missevan", records), dry_run=args.dry_run)
 
     if do_manbo:
