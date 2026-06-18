@@ -91,7 +91,14 @@ class BuildCvRanksTests(unittest.TestCase):
                     "avatar": "https://avatar.test/canonical.jpg",
                 }
             }
-            upstash = Mock(side_effect=["OK", "OK"])
+            def upstash(command: list[object]) -> object:
+                if command[0] == "GET":
+                    return None
+                if command[0] == "SET":
+                    return "OK"
+                raise AssertionError(command)
+
+            upstash = Mock(side_effect=upstash)
 
             with (
                 patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value=remote_map),
@@ -112,10 +119,11 @@ class BuildCvRanksTests(unittest.TestCase):
             self.assertEqual(payload["date"], "2026-06-10")
             self.assertEqual(payload["generated_at"], "2026-06-10T12:00:00+00:00")
             self.assertEqual(payload["source"]["scope"], "all")
-            self.assertEqual(payload["version"], 2)
+            self.assertEqual(payload["version"], 3)
             self.assertEqual(payload["missevanDramaCount"], 2)
             self.assertEqual(payload["manboDramaCount"], 1)
             self.assertEqual(set(payload["rankings"]), {"missevan", "manbo"})
+            self.assertEqual(set(payload["paidRankings"]), {"missevan", "manbo"})
 
             missevan_cv = payload["rankings"]["missevan"][0]
             self.assertEqual(missevan_cv["cvName"], "Canonical CV")
@@ -124,6 +132,8 @@ class BuildCvRanksTests(unittest.TestCase):
             self.assertEqual(missevan_cv["workCount"], 1)
             self.assertEqual([work["dramaId"] for work in missevan_cv["works"]], ["100"])
             self.assertEqual(missevan_cv["works"][0]["cover"], "m-cover")
+            self.assertIs(missevan_cv["works"][0]["isPaid"], False)
+            self.assertEqual(payload["paidRankings"]["missevan"], [])
 
             manbo_cv = payload["rankings"]["manbo"][0]
             self.assertEqual(manbo_cv["cvName"], "Canonical CV")
@@ -132,9 +142,285 @@ class BuildCvRanksTests(unittest.TestCase):
             self.assertEqual(manbo_cv["workCount"], 1)
             self.assertEqual([work["dramaId"] for work in manbo_cv["works"]], ["200"])
             self.assertEqual(manbo_cv["works"][0]["cover"], "mb-cover")
+            self.assertIs(manbo_cv["works"][0]["isPaid"], True)
+            self.assertEqual(payload["paidRankings"]["manbo"][0]["totalViewCount"], 60)
             self.assertEqual(json.loads(output.read_text(encoding="utf-8")), payload)
             self.assertEqual(upstash.call_args_list[0].args[0][0:2], ["SET", "ranks:cv:2026-06-10"])
             self.assertEqual(upstash.call_args_list[1].args[0][0:2], ["SET", "ranks:cv:latest"])
+
+    def test_builds_paid_rankings_from_platform_paid_flags(self) -> None:
+        missevan_store = {
+            "100": {
+                "dramaId": 100,
+                "title": "猫耳免费剧",
+                "needpay": False,
+                "is_member": False,
+                "maincvs": [11],
+                "cvnames": {"11": "同一CV"},
+            },
+            "101": {
+                "dramaId": 101,
+                "title": "猫耳会员剧",
+                "needpay": False,
+                "is_member": True,
+                "maincvs": [11],
+                "cvnames": {"11": "同一CV"},
+            },
+            "102": {
+                "dramaId": 102,
+                "title": "猫耳付费剧",
+                "needpay": True,
+                "is_member": False,
+                "maincvs": [11],
+                "cvnames": {"11": "同一CV"},
+            },
+        }
+        manbo_store = {
+            "records": [
+                {
+                    "dramaId": "200",
+                    "name": "漫播免费剧",
+                    "needpay": False,
+                    "vipFree": 0,
+                    "mainCvIds": [22],
+                    "mainCvNicknames": ["漫播CV"],
+                },
+                {
+                    "dramaId": "201",
+                    "name": "漫播会员剧",
+                    "needpay": False,
+                    "vipFree": 1,
+                    "mainCvIds": [22],
+                    "mainCvNicknames": ["漫播CV"],
+                },
+                {
+                    "dramaId": "202",
+                    "name": "漫播付费剧",
+                    "needpay": True,
+                    "vipFree": 0,
+                    "mainCvIds": [22],
+                    "mainCvNicknames": ["漫播CV"],
+                },
+            ]
+        }
+
+        payload = build_cv_ranks.build_cv_ranks_payload(
+            missevan_store=missevan_store,
+            manbo_store=manbo_store,
+            missevan_counts={
+                "100": {"view_count": 100},
+                "101": {"view_count": 40},
+                "102": {"view_count": 60},
+            },
+            manbo_counts={
+                "200": {"view_count": 30},
+                "201": {"view_count": 70},
+                "202": {"view_count": 50},
+            },
+            cvid_map={},
+            generated_at="2026-06-10T12:00:00+00:00",
+        )
+
+        self.assertEqual(payload["rankings"]["missevan"][0]["totalViewCount"], 200)
+        self.assertEqual(payload["paidRankings"]["missevan"][0]["totalViewCount"], 100)
+        self.assertEqual(
+            [work["dramaId"] for work in payload["paidRankings"]["missevan"][0]["works"]],
+            ["102", "101"],
+        )
+        self.assertEqual(payload["rankings"]["manbo"][0]["totalViewCount"], 150)
+        self.assertEqual(payload["paidRankings"]["manbo"][0]["totalViewCount"], 120)
+        self.assertEqual(
+            [work["dramaId"] for work in payload["paidRankings"]["manbo"][0]["works"]],
+            ["201", "202"],
+        )
+
+    def test_build_cv_trend_payload_keeps_latest_works_and_prunes_to_50_dates(self) -> None:
+        old_dates = [f"2026-04-{day:02d}" for day in range(1, 51)]
+        current = {
+            "version": 1,
+            "kind": "cv",
+            "platform": "missevan",
+            "updated_at": "2026-05-20T00:00:00+00:00",
+            "dates": old_dates,
+            "cvs": {
+                "同一CV": {
+                    "cvName": "同一CV",
+                    "avatar": "old-avatar",
+                    "works": [{"dramaId": "old", "viewCount": 1}],
+                    "samples": {
+                        date: {
+                            "generated_at": f"{date}T00:00:00+00:00",
+                            "metrics": {"totalViewCount": idx, "paidViewCount": idx // 2},
+                            "ranks": {"total": idx},
+                            "works": [{"dramaId": "must-not-survive"}],
+                        }
+                        for idx, date in enumerate(old_dates, 1)
+                    },
+                },
+                "过期CV": {
+                    "cvName": "过期CV",
+                    "samples": {
+                        "2026-04-01": {
+                            "metrics": {"totalViewCount": 1, "paidViewCount": 0},
+                            "ranks": {"total": 2},
+                        }
+                    },
+                },
+            },
+        }
+        total_ranking = [
+            {
+                "cvName": "同一CV",
+                "avatar": "new-avatar",
+                "totalViewCount": 300,
+                "rank": 1,
+                "workCount": 2,
+                "works": [
+                    {"platform": "missevan", "dramaId": "101", "title": "新剧", "viewCount": 200, "isPaid": True},
+                    {"platform": "missevan", "dramaId": "100", "title": "免费剧", "viewCount": 100, "isPaid": False},
+                ],
+            },
+            {
+                "cvName": "新CV",
+                "avatar": "",
+                "totalViewCount": 50,
+                "rank": 2,
+                "workCount": 1,
+                "works": [
+                    {"platform": "missevan", "dramaId": "102", "title": "新CV剧", "viewCount": 50, "isPaid": False}
+                ],
+            },
+        ]
+        paid_ranking = [
+            {
+                "cvName": "同一CV",
+                "avatar": "new-avatar",
+                "totalViewCount": 200,
+                "rank": 1,
+                "workCount": 1,
+                "works": [
+                    {"platform": "missevan", "dramaId": "101", "title": "新剧", "viewCount": 200, "isPaid": True}
+                ],
+            }
+        ]
+
+        payload = build_cv_ranks.build_cv_trend_payload(
+            current,
+            "missevan",
+            "2026-06-10",
+            total_ranking,
+            paid_ranking,
+            generated_at="2026-06-10T12:00:00+00:00",
+        )
+
+        self.assertEqual(len(payload["dates"]), 50)
+        self.assertNotIn("2026-04-01", payload["dates"])
+        self.assertIn("2026-06-10", payload["dates"])
+        self.assertNotIn("过期CV", payload["cvs"])
+        cv = payload["cvs"]["同一CV"]
+        self.assertEqual(cv["avatar"], "new-avatar")
+        self.assertEqual([work["dramaId"] for work in cv["works"]], ["101", "100"])
+        self.assertEqual(cv["samples"]["2026-06-10"]["metrics"], {"totalViewCount": 300, "paidViewCount": 200})
+        self.assertEqual(cv["samples"]["2026-06-10"]["ranks"], {"total": 1, "paid": 1})
+        older_sample = cv["samples"]["2026-04-50"]
+        self.assertEqual(older_sample["metrics"], {"totalViewCount": 50, "paidViewCount": 25})
+        self.assertNotIn("works", older_sample)
+
+    def test_build_and_publish_uploads_cv_trends_after_rank_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missevan_info = self.write_json(
+                tmp,
+                "missevan.json",
+                {
+                    "100": {
+                        "dramaId": 100,
+                        "title": "猫耳会员剧",
+                        "needpay": False,
+                        "is_member": True,
+                        "maincvs": [11],
+                        "cvnames": {"11": "猫耳名"},
+                    }
+                },
+            )
+            manbo_info = self.write_json(
+                tmp,
+                "manbo.json",
+                {
+                    "version": 1,
+                    "records": [
+                        {
+                            "dramaId": "200",
+                            "name": "漫播免费剧",
+                            "needpay": False,
+                            "vipFree": 0,
+                            "mainCvIds": [22],
+                            "mainCvNicknames": ["漫播名"],
+                        }
+                    ],
+                },
+            )
+            missevan_counts = self.write_json(tmp, "missevan-counts.json", {"_meta": {}, "counts": {"100": {"view_count": 100}}})
+            manbo_counts = self.write_json(tmp, "manbo-counts.json", {"_meta": {}, "counts": {"200": {"view_count": 60}}})
+            cvid_map = self.write_json(tmp, "map.json", {})
+            commands: list[list[object]] = []
+
+            def fake_upstash(command: list[object]) -> object:
+                commands.append(command)
+                if command[:2] in (["GET", "ranks:trend:cv:missevan"], ["GET", "ranks:trend:cv:manbo"]):
+                    return None
+                if command[0] == "SET":
+                    return "OK"
+                raise AssertionError(command)
+
+            with (
+                patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value={}),
+                patch.object(build_cv_ranks, "sync_remote_watchcount_inputs"),
+                patch("builtins.print"),
+            ):
+                build_cv_ranks.build_and_publish_cv_ranks(
+                    missevan_info_path=missevan_info,
+                    manbo_info_path=manbo_info,
+                    missevan_counts_path=missevan_counts,
+                    manbo_counts_path=manbo_counts,
+                    cvid_map_path=cvid_map,
+                    output_path=Path(tmp) / "ranks-cv.json",
+                    upstash=fake_upstash,
+                    generated_at="2026-06-10T12:00:00+00:00",
+                    upload=True,
+                )
+
+            self.assertEqual(commands[0][0:2], ["SET", "ranks:cv:2026-06-10"])
+            self.assertEqual(commands[1][0:2], ["SET", "ranks:cv:latest"])
+            self.assertEqual(commands[2][0:2], ["GET", "ranks:trend:cv:missevan"])
+            self.assertEqual(commands[3][0:2], ["SET", "ranks:trend:cv:missevan"])
+            self.assertEqual(commands[4][0:2], ["GET", "ranks:trend:cv:manbo"])
+            self.assertEqual(commands[5][0:2], ["SET", "ranks:trend:cv:manbo"])
+            missevan_trend = json.loads(commands[3][2])
+            self.assertEqual(missevan_trend["cvs"]["猫耳名"]["samples"]["2026-06-10"]["metrics"]["paidViewCount"], 100)
+            manbo_trend = json.loads(commands[5][2])
+            self.assertEqual(manbo_trend["cvs"]["漫播名"]["samples"]["2026-06-10"]["metrics"]["paidViewCount"], 0)
+
+    def test_upload_cv_trends_does_not_overwrite_when_current_read_fails(self) -> None:
+        commands: list[list[object]] = []
+
+        def fake_upstash(command: list[object]) -> object:
+            commands.append(command)
+            if command[:2] == ["GET", "ranks:trend:cv:missevan"]:
+                raise RuntimeError("temporary read failure")
+            if command[0] == "SET":
+                raise AssertionError("trend should not be overwritten after read failure")
+            raise AssertionError(command)
+
+        with self.assertRaisesRegex(RuntimeError, "Failed to load ranks:trend:cv:missevan"):
+            build_cv_ranks.upload_cv_trends(
+                history_date="2026-06-10",
+                generated_at="2026-06-10T12:00:00+00:00",
+                full_rankings={"missevan": [], "manbo": []},
+                full_paid_rankings={"missevan": [], "manbo": []},
+                upstash=fake_upstash,
+            )
+
+        self.assertEqual(commands, [["GET", "ranks:trend:cv:missevan"]])
 
     def test_no_upload_still_syncs_remote_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
