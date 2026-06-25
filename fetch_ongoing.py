@@ -588,32 +588,34 @@ def fetch_missevan_weekly_records(
                 cache_load_failed = True
                 print(f"  [missevan] WARN: weekday cache load failed: {exc}")
             timeline_records = parse_missevan_timeline_weekly_records(timeline, weekday_cache=None, now=now)
-            if not timeline_records:
-                records = []
-            else:
-                records = timeline_records
             today_empty_weekday = timeline_today_empty_weekday(timeline)
-            if records and today_empty_weekday is not None:
+            cache_records: list[dict[str, object]] = []
+            summer_records: list[dict[str, object]] = []
+            records = timeline_records
+            if timeline_records and today_empty_weekday is not None:
                 cache_records = fresh_missevan_cache_records(weekday_cache, today_empty_weekday, now=now)
-                if cache_records:
-                    records = dedupe_records(timeline_records + cache_records)
-                else:
-                    try:
-                        summerdrama = requester.request_json(MISSEVAN_SUMMERDRAMA_URL)
-                    except Exception as exc:
+            if timeline_records:
+                try:
+                    summerdrama = requester.request_json(MISSEVAN_SUMMERDRAMA_URL)
+                    summer_records = parse_missevan_summerdrama_records(summerdrama)
+                except Exception as exc:
+                    if today_empty_weekday is not None and not cache_records:
                         raise MissevanTodayFallbackError(
                             "Missevan today timeline bucket is empty and summerdrama fallback failed."
                         ) from exc
-                    summer_records = parse_missevan_summerdrama_weekday_records(
-                        summerdrama,
-                        today_empty_weekday,
-                        current_weekday=current_beijing_weekday(now=now),
-                    )
-                    if not summer_records:
-                        raise MissevanTodayFallbackError(
-                            "Missevan today timeline bucket is empty and summerdrama has no records for today."
+                    print(f"  [missevan] WARN: summerdrama merge failed; continuing with timeline: {exc}")
+                else:
+                    if today_empty_weekday is not None and not cache_records:
+                        summer_today_records = parse_missevan_summerdrama_weekday_records(
+                            summerdrama,
+                            today_empty_weekday,
+                            current_weekday=current_beijing_weekday(now=now),
                         )
-                    records = dedupe_records(timeline_records + summer_records)
+                        if not summer_today_records:
+                            raise MissevanTodayFallbackError(
+                                "Missevan today timeline bucket is empty and summerdrama has no records for today."
+                            )
+                records = dedupe_records(timeline_records + cache_records + summer_records)
             if sync_weekday_cache and not cache_load_failed and timeline_records:
                 try:
                     next_cache = build_missevan_weekday_cache_from_timeline(

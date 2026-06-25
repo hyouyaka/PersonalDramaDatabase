@@ -385,6 +385,116 @@ class MissevanWeekdayCacheTests(unittest.TestCase):
 
         self.assertEqual(records, [{"dramaId": "93038", "updateType": "weekly"}])
 
+    def test_timeline_records_merge_with_all_summerdrama_records(self):
+        timeline = {
+            "info": [
+                {
+                    "date_week": "三",
+                    "date_day": 17,
+                    "is_today": 1,
+                    "dramas": [{"id": 101, "pay_type": 2}],
+                },
+            ]
+        }
+        requester = FakeUrlRequester(
+            {
+                fetch_ongoing.MISSEVAN_SUMMERDRAMA_URL: {
+                    "info": [
+                        [{"id": 201, "pay_type": 2}],
+                        [{"id": 202, "pay_type": 2}],
+                    ]
+                },
+            }
+        )
+
+        with patch.object(fetch_ongoing, "load_missevan_weekday_cache", return_value=None):
+            with patch("builtins.print"):
+                records = fetch_ongoing.fetch_missevan_weekly_records(
+                    requester,
+                    fetch_timeline=lambda: timeline,
+                    sync_weekday_cache=False,
+                    now=datetime(2026, 6, 17, 1, tzinfo=timezone.utc),
+                )
+
+        self.assertEqual(
+            records,
+            [
+                {"dramaId": "101", "updateType": "weekly"},
+                {"dramaId": "201", "updateType": "weekly"},
+                {"dramaId": "202", "updateType": "weekly"},
+            ],
+        )
+        self.assertEqual(requester.urls, [fetch_ongoing.MISSEVAN_SUMMERDRAMA_URL])
+
+    def test_timeline_records_take_precedence_when_summerdrama_has_duplicate_drama_id(self):
+        timeline = {
+            "info": [
+                {
+                    "date_week": "三",
+                    "date_day": 17,
+                    "is_today": 1,
+                    "dramas": [{"id": 101, "pay_type": 2}],
+                },
+            ]
+        }
+        requester = FakeUrlRequester(
+            {
+                fetch_ongoing.MISSEVAN_SUMMERDRAMA_URL: {
+                    "info": [
+                        [
+                            {"id": 101, "pay_type": 2},
+                            {"id": 202, "pay_type": 2},
+                        ],
+                    ]
+                },
+            }
+        )
+
+        with patch.object(fetch_ongoing, "load_missevan_weekday_cache", return_value=None):
+            with patch("builtins.print"):
+                records = fetch_ongoing.fetch_missevan_weekly_records(
+                    requester,
+                    fetch_timeline=lambda: timeline,
+                    sync_weekday_cache=False,
+                    now=datetime(2026, 6, 17, 1, tzinfo=timezone.utc),
+                )
+
+        self.assertEqual(
+            records,
+            [
+                {"dramaId": "101", "updateType": "weekly"},
+                {"dramaId": "202", "updateType": "weekly"},
+            ],
+        )
+
+    def test_timeline_success_continues_when_summerdrama_request_fails_and_today_is_not_empty(self):
+        timeline = {
+            "info": [
+                {
+                    "date_week": "三",
+                    "date_day": 17,
+                    "is_today": 1,
+                    "dramas": [{"id": 101, "pay_type": 2}],
+                },
+            ]
+        }
+        requester = FakeUrlRequester(
+            {
+                fetch_ongoing.MISSEVAN_SUMMERDRAMA_URL: RuntimeError("summerdrama down"),
+            }
+        )
+
+        with patch.object(fetch_ongoing, "load_missevan_weekday_cache", return_value=None):
+            with patch("builtins.print"):
+                records = fetch_ongoing.fetch_missevan_weekly_records(
+                    requester,
+                    fetch_timeline=lambda: timeline,
+                    sync_weekday_cache=False,
+                    now=datetime(2026, 6, 17, 1, tzinfo=timezone.utc),
+                )
+
+        self.assertEqual(records, [{"dramaId": "101", "updateType": "weekly"}])
+
     def test_today_empty_timeline_uses_summerdrama_when_cache_load_fails(self):
         timeline = {
             "info": [
@@ -416,10 +526,57 @@ class MissevanWeekdayCacheTests(unittest.TestCase):
             records,
             [
                 {"dramaId": "301", "updateType": "weekly"},
+                {"dramaId": "201", "updateType": "weekly"},
                 {"dramaId": "93038", "updateType": "weekly"},
             ],
         )
         self.assertEqual(requester.urls, [fetch_ongoing.MISSEVAN_SUMMERDRAMA_URL])
+
+    def test_today_empty_timeline_merges_cache_and_all_summerdrama_records(self):
+        timeline = {
+            "info": [
+                {"date_week": "二", "date_day": 16, "is_today": 0, "dramas": [{"id": 301, "pay_type": 2}]},
+                {"date_week": "三", "date_day": 17, "is_today": 1, "dramas": []},
+            ]
+        }
+        cache = {
+            "buckets": {
+                "3": {
+                    "observedAt": "2026-06-10T04:00:00+00:00",
+                    "records": {
+                        "93038": {"dramaId": "93038", "updateType": "weekly"},
+                    },
+                }
+            }
+        }
+        requester = FakeUrlRequester(
+            {
+                fetch_ongoing.MISSEVAN_SUMMERDRAMA_URL: {
+                    "info": [
+                        [{"id": 201, "pay_type": 2}],
+                        [{"id": 93038, "pay_type": 2}],
+                    ]
+                },
+            }
+        )
+
+        with patch.object(fetch_ongoing, "load_missevan_weekday_cache", return_value=cache):
+            with patch("builtins.print"):
+                records = fetch_ongoing.fetch_missevan_weekly_records(
+                    requester,
+                    fetch_timeline=lambda: timeline,
+                    sync_weekday_cache=False,
+                    now=datetime(2026, 6, 17, 1, tzinfo=timezone.utc),
+                )
+
+        self.assertEqual(
+            records,
+            [
+                {"dramaId": "301", "updateType": "weekly"},
+                {"dramaId": "93038", "updateType": "weekly"},
+                {"dramaId": "201", "updateType": "weekly"},
+            ],
+        )
 
     def test_today_empty_timeline_uses_summerdrama_when_cache_is_stale(self):
         timeline = {
@@ -462,11 +619,12 @@ class MissevanWeekdayCacheTests(unittest.TestCase):
             records,
             [
                 {"dramaId": "301", "updateType": "weekly"},
+                {"dramaId": "201", "updateType": "weekly"},
                 {"dramaId": "93038", "updateType": "weekly"},
             ],
         )
 
-    def test_today_non_empty_timeline_does_not_fetch_summerdrama(self):
+    def test_today_non_empty_timeline_fetches_and_merges_summerdrama(self):
         timeline = {
             "info": [
                 {
@@ -477,7 +635,15 @@ class MissevanWeekdayCacheTests(unittest.TestCase):
                 },
             ]
         }
-        requester = FakeUrlRequester({})
+        requester = FakeUrlRequester(
+            {
+                fetch_ongoing.MISSEVAN_SUMMERDRAMA_URL: {
+                    "info": [
+                        [{"id": 201, "pay_type": 2}],
+                    ]
+                },
+            }
+        )
 
         with patch.object(fetch_ongoing, "load_missevan_weekday_cache", return_value=None):
             with patch("builtins.print"):
@@ -488,8 +654,14 @@ class MissevanWeekdayCacheTests(unittest.TestCase):
                     now=datetime(2026, 6, 17, 1, tzinfo=timezone.utc),
                 )
 
-        self.assertEqual(records, [{"dramaId": "101", "updateType": "weekly"}])
-        self.assertEqual(requester.urls, [])
+        self.assertEqual(
+            records,
+            [
+                {"dramaId": "101", "updateType": "weekly"},
+                {"dramaId": "201", "updateType": "weekly"},
+            ],
+        )
+        self.assertEqual(requester.urls, [fetch_ongoing.MISSEVAN_SUMMERDRAMA_URL])
 
     def test_today_empty_timeline_raises_when_summerdrama_has_no_today_records(self):
         timeline = {
