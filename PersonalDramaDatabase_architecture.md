@@ -57,9 +57,10 @@ flowchart LR
         T --> D
         T --> U[missevan:info:v1 / manbo:info:v1]
         V[fetch_ongoing.py] --> W[ongoing:missevan / ongoing:manbo]
-        X[fetch_rank_data.py] --> Y[ranks:partial:*]
-        X --> Z[ranks:list:* / ranks:metrics:* / ranks:index]
-        X --> AA[ranks:latest]
+        X[fetch_rank_data.py] --> Y[ranks:latest]
+        X --> Z[ranks:trend:*]
+        AC[build_cv_ranks.py] --> AD[ranks:cv:latest]
+        AC --> AE[ranks:trend:cv:*]
         W --> X
     end
 
@@ -313,13 +314,14 @@ flowchart LR
 
 这是当前最复杂的远端数据管线，职责包括：
 
-- 先从 Upstash partial + 最近 metrics 初始化 store；失败时回退本地 `ranks.json`
+- 先从 Upstash `ranks:latest` 初始化完整 store；失败时回退本地 `ranks.json`
 - 并行抓取双平台榜单列表
 - 从 Upstash 读取 ongoing IDs，并在 stale 过滤前合并进来，确保“脱榜但仍在更新”的剧继续刷新
 - 按 12 小时缓存窗口筛选需要补抓 detail 的剧目；`--force` 时忽略这个窗口
 - 默认随 detail 一起更新弹幕 UID 统计
 - 输出本地 `ranks.json`
-- 上传 remote partial / history / full store
+- 将当次 list/metrics 快照只保留在内存中，用于合并 trend 聚合
+- 上传完整 latest 与 trend 聚合，并渐进清理旧日期 key
 
 普通模式下的具体语义：
 
@@ -340,16 +342,22 @@ flowchart LR
 
 当前 remote 输出分层如下：
 
-- `ranks:partial:{platform}`：每个平台最新局部 shard
-- `ranks:list:{date}:{platform}`：按天存榜单列表历史
-- `ranks:metrics:{date}:{platform}`：按天存 drama metrics 历史
-- `ranks:index`：历史日期索引，默认保留 90 天
 - `ranks:latest`：合并后的完整最新 store
+- `ranks:trend:{platform}`：普通榜单趋势聚合，内部保留最近 90 个日期样本
+- `ranks:trend:peak:missevan`：猫耳巅峰榜趋势聚合，内部保留最近 90 个日期样本
+- `ranks:cv:latest`：最新 CV 榜单
+- `ranks:trend:cv:{platform}`：CV 趋势聚合，内部保留最近 50 个日期样本
+- `ranks:meta`：普通榜单与 CV 榜单的发布完成时间
+
+不再创建 `ranks:partial:*`、`ranks:index`、`ranks:list:{date}:*`、
+`ranks:metrics:{date}:*` 和 `ranks:cv:{date}`。普通与 CV 发布成功后分别扫描并删除
+最多 20 个旧日期 key；固定的 partial/index key 由普通发布直接删除。
 
 这个脚本还支持：
 
 - `--skip-danmaku`
 - `--only-danmaku`
+- `--repair-null-danmaku`（只检查和更新 latest + trend）
 - `--missevan-only` / `--manbo-only`
 - 漫播付费弹幕 benchmark 模式
 
@@ -399,7 +407,7 @@ GUI 现在不是一个简单 launcher，而是一个桌面工作台：
 
 1. `fetch_ongoing.py` 更新 `ongoing:*`
 2. `fetch_rank_data.py` 抓取榜单、详情、弹幕统计
-3. 本地 `ranks.json` 与 Upstash `ranks:*`/`ranks:latest` 同步刷新
+3. 本地 `ranks.json` 与 Upstash `ranks:latest` / `ranks:trend:*` 同步刷新
 
 这里 ongoing 的作用不是单独出报表，而是给 rank pipeline 提供“保活 ID 集合”。
 

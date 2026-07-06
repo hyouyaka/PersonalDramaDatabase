@@ -103,6 +103,7 @@ class BuildCvRanksTests(unittest.TestCase):
             with (
                 patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value=remote_map),
                 patch.object(build_cv_ranks, "sync_remote_watchcount_inputs"),
+                patch.object(build_cv_ranks, "run_cleanup_best_effort") as cleanup,
             ):
                 payload = build_cv_ranks.build_and_publish_cv_ranks(
                     missevan_info_path=missevan_info,
@@ -145,8 +146,16 @@ class BuildCvRanksTests(unittest.TestCase):
             self.assertIs(manbo_cv["works"][0]["isPaid"], True)
             self.assertEqual(payload["paidRankings"]["manbo"][0]["totalViewCount"], 60)
             self.assertEqual(json.loads(output.read_text(encoding="utf-8")), payload)
-            self.assertEqual(upstash.call_args_list[0].args[0][0:2], ["SET", "ranks:cv:2026-06-10"])
-            self.assertEqual(upstash.call_args_list[1].args[0][0:2], ["SET", "ranks:cv:latest"])
+            written_keys = [
+                call.args[0][1]
+                for call in upstash.call_args_list
+                if call.args[0][0] == "SET"
+            ]
+            self.assertEqual(
+                written_keys,
+                ["ranks:cv:latest", "ranks:trend:cv:missevan", "ranks:trend:cv:manbo"],
+            )
+            cleanup.assert_called_once()
 
     def test_builds_paid_rankings_from_platform_paid_flags(self) -> None:
         missevan_store = {
@@ -375,6 +384,7 @@ class BuildCvRanksTests(unittest.TestCase):
             with (
                 patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value={}),
                 patch.object(build_cv_ranks, "sync_remote_watchcount_inputs"),
+                patch.object(build_cv_ranks, "run_cleanup_best_effort") as cleanup,
                 patch("builtins.print"),
             ):
                 build_cv_ranks.build_and_publish_cv_ranks(
@@ -389,16 +399,16 @@ class BuildCvRanksTests(unittest.TestCase):
                     upload=True,
                 )
 
-            self.assertEqual(commands[0][0:2], ["SET", "ranks:cv:2026-06-10"])
-            self.assertEqual(commands[1][0:2], ["SET", "ranks:cv:latest"])
-            self.assertEqual(commands[2][0:2], ["GET", "ranks:trend:cv:missevan"])
-            self.assertEqual(commands[3][0:2], ["SET", "ranks:trend:cv:missevan"])
-            self.assertEqual(commands[4][0:2], ["GET", "ranks:trend:cv:manbo"])
-            self.assertEqual(commands[5][0:2], ["SET", "ranks:trend:cv:manbo"])
-            missevan_trend = json.loads(commands[3][2])
+            self.assertEqual(commands[0][0:2], ["SET", "ranks:cv:latest"])
+            self.assertEqual(commands[1][0:2], ["GET", "ranks:trend:cv:missevan"])
+            self.assertEqual(commands[2][0:2], ["SET", "ranks:trend:cv:missevan"])
+            self.assertEqual(commands[3][0:2], ["GET", "ranks:trend:cv:manbo"])
+            self.assertEqual(commands[4][0:2], ["SET", "ranks:trend:cv:manbo"])
+            missevan_trend = json.loads(commands[2][2])
             self.assertEqual(missevan_trend["cvs"]["猫耳名"]["samples"]["2026-06-10"]["metrics"]["paidViewCount"], 100)
-            manbo_trend = json.loads(commands[5][2])
+            manbo_trend = json.loads(commands[4][2])
             self.assertEqual(manbo_trend["cvs"]["漫播名"]["samples"]["2026-06-10"]["metrics"]["paidViewCount"], 0)
+            cleanup.assert_called_once()
 
     def test_upload_cv_trends_does_not_overwrite_when_current_read_fails(self) -> None:
         commands: list[list[object]] = []

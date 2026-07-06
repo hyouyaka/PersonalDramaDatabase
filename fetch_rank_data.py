@@ -27,6 +27,7 @@ from platform_sync import (
     request_manbo_json,
     save_json as _save_json,
 )
+from rank_key_cleanup import cleanup_legacy_normal_rank_keys, run_cleanup_best_effort
 
 # ---------------------------------------------------------------------------
 # .env loading
@@ -51,7 +52,7 @@ HERE = Path(__file__).resolve().parent
 RANKS_PATH = HERE / "ranks.json"
 SERIES_INFO_PATH = HERE / "drama-series-info.json"
 CACHE_WINDOW = timedelta(hours=12)
-RANK_HISTORY_RETENTION_DAYS = 90
+RANK_TREND_RETENTION_DATES = 90
 SAVE_LOCK = threading.Lock()
 LOCAL_TIMEZONE = datetime.now().astimezone().tzinfo or timezone.utc
 
@@ -64,10 +65,6 @@ PLATFORMS = ("missevan", "manbo")
 TREND_KEYS = {
     "missevan": "ranks:trend:missevan",
     "manbo": "ranks:trend:manbo",
-}
-RANK_PARTIAL_KEYS = {
-    "missevan": "ranks:partial:missevan",
-    "manbo": "ranks:partial:manbo",
 }
 ONGOING_KEYS = {
     "missevan": "ongoing:missevan",
@@ -257,39 +254,6 @@ def platform_store(value: object) -> dict:
     return {"ranks": {}, "dramas": {}}
 
 
-def build_rank_partial_payload(store: dict, platform: str, *, generated_at: str | None = None) -> dict:
-    if platform not in RANK_PARTIAL_KEYS:
-        raise ValueError(f"Unsupported platform: {platform}")
-    return {
-        "version": 1,
-        "platform": platform,
-        "updated_at": generated_at or now_iso(),
-        "data": platform_store(store.get(platform)),
-    }
-
-
-def upload_rank_partials(store: dict, platforms: tuple[str, ...] | list[str]) -> None:
-    generated_at = now_iso()
-    for platform in platforms:
-        key = RANK_PARTIAL_KEYS[platform]
-        payload = json.dumps(build_rank_partial_payload(store, platform, generated_at=generated_at), ensure_ascii=False)
-        result = upstash_request(["SET", key, payload])
-        if result != "OK":
-            raise RuntimeError(f"Failed to upload {key}: {result!r}")
-        print(f"[ok] uploaded {key} ({len(payload)} bytes)")
-
-
-def load_rank_partial(platform: str) -> dict | None:
-    raw = upstash_request(["GET", RANK_PARTIAL_KEYS[platform]])
-    payload = decode_upstash_json(raw)
-    if not isinstance(payload, dict):
-        return None
-    if payload.get("platform") != platform:
-        return None
-    data = payload.get("data")
-    return platform_store(data) if isinstance(data, dict) else None
-
-
 def load_remote_full_ranks() -> dict | None:
     payload = decode_upstash_json(upstash_request(["GET", "ranks:latest"]))
     return payload if isinstance(payload, dict) else None
@@ -304,97 +268,40 @@ def load_series_info() -> dict:
     return load_json(SERIES_INFO_PATH, {})
 
 
-def merge_rank_partials(
-    partials: dict[str, dict | None],
-    *,
-    fallback_store: dict | None = None,
-    local_store: dict | None = None,
-    generated_at: str | None = None,
-) -> dict:
-    merged = init_ranks_store()
-    merged["_meta"] = dict((fallback_store or {}).get("_meta") or {})
-    merged["_meta"]["updated_at"] = generated_at or now_iso()
-    for platform in PLATFORMS:
-        source = partials.get(platform)
-        if source is None and isinstance(fallback_store, dict):
-            source = fallback_store.get(platform)
-        if source is None and isinstance(local_store, dict):
-            source = local_store.get(platform)
-        merged[platform] = platform_store(source)
-    return sanitize_rank_store(merged)
-
-
-def merge_remote_rank_partials(local_store: dict | None = None) -> dict:
-    partials = {platform: load_rank_partial(platform) for platform in PLATFORMS}
-    return merge_rank_partials(
-        partials,
-        fallback_store=load_remote_full_ranks(),
-        local_store=local_store,
-    )
-
-
-def merge_and_upload_remote_ranks(local_store: dict | None = None) -> dict:
-    merged = merge_remote_rank_partials(local_store)
-    upload_full_ranks(merged)
-    return merged
-
-
 def upload_rank_outputs(store: dict, platforms: tuple[str, ...] | list[str]) -> dict:
-    upload_rank_partials(store, platforms)
-    upload_rank_history(store, platforms=platforms)
-    return merge_and_upload_remote_ranks(store)
-
-
-def latest_rank_history_date() -> str | None:
-    try:
-        index = load_rank_history_index()
-    except Exception as exc:
-        print(f"  [upstash] WARN: failed to load ranks:index: {exc}")
-        return None
-    dates = [str(value) for value in (index.get("dates") or []) if value not in (None, "")]
-    return max(dates) if dates else None
-
-
-def load_rank_metrics(platform: str, history_date: str) -> dict[str, dict]:
-    payload = _load_upstash_json(f"ranks:metrics:{history_date}:{platform}")
-    if not isinstance(payload, dict):
-        return {}
-    dramas = payload.get("dramas")
-    if not isinstance(dramas, dict):
-        return {}
-    return {
-        str(drama_id): dict(entry)
-        for drama_id, entry in dramas.items()
-        if isinstance(entry, dict)
-    }
-
-
-def load_remote_platform_store_for_fetch(platform: str) -> dict | None:
-    partial = load_rank_partial(platform)
-    history_date = latest_rank_history_date()
-    if partial is None and history_date is None:
-        return None
-    metrics = load_rank_metrics(platform, history_date) if history_date else {}
-    partial_store = platform_store(partial)
-    if partial is None and not metrics:
-        return None
-    return {
-        "ranks": partial_store.get("ranks") or {},
-        "dramas": metrics if metrics else (partial_store.get("dramas") or {}),
-    }
+    generated_at = now_iso()
+    history_date = generated_at[:10]
+    payloads = build_rank_snapshot_payloads(
+        store,
+        platforms=platforms,
+        history_date=history_date,
+        generated_at=generated_at,
+    )
+    if "missevan" in platforms:
+        upload_missevan_peak_trend(
+            store,
+            history_date=history_date,
+            generated_at=generated_at,
+        )
+    for platform in platforms:
+        snapshot = payloads[platform]
+        upload_rank_trend_snapshot(
+            platform,
+            history_date,
+            snapshot["metrics"],
+            snapshot["list"],
+            generated_at=generated_at,
+        )
+    upload_full_ranks(store)
+    run_cleanup_best_effort(lambda: cleanup_legacy_normal_rank_keys(upstash_request))
+    return store
 
 
 def load_initial_rank_store() -> dict:
     try:
-        remote = init_ranks_store()
-        loaded_any = False
-        for platform in PLATFORMS:
-            platform_store_remote = load_remote_platform_store_for_fetch(platform)
-            if platform_store_remote is not None:
-                remote[platform] = platform_store(platform_store_remote)
-                loaded_any = True
-        if loaded_any:
-            print("  [upstash] loaded initial ranks store from remote partials/metrics")
+        remote = load_remote_full_ranks()
+        if isinstance(remote, dict):
+            print("  [upstash] loaded initial ranks store from ranks:latest")
             return sanitize_rank_store(remote)
     except Exception as exc:
         print(f"  [upstash] WARN: failed to load remote initial ranks store: {exc}")
@@ -667,12 +574,21 @@ def build_rank_trend_payload(
         for entry in dramas.values()
         for sample_date in (entry.get("samples") or {})
     }
+    kept_dates = set(sorted(dates)[-RANK_TREND_RETENTION_DATES:])
+    for drama_id, entry in list(dramas.items()):
+        entry["samples"] = {
+            sample_date: sample
+            for sample_date, sample in entry["samples"].items()
+            if sample_date in kept_dates
+        }
+        if not entry["samples"]:
+            dramas.pop(drama_id)
 
     return {
         "version": 1,
         "platform": platform,
         "updated_at": generated_at,
-        "dates": sorted(dates),
+        "dates": sorted(kept_dates),
         "dramas": dramas,
     }
 
@@ -703,45 +619,6 @@ def upload_rank_trend_snapshot(
         raise RuntimeError(f"Failed to upload {key}: {result!r}")
     print(f"[ok] uploaded {key} ({len(encoded)} bytes, date={history_date})")
     return payload
-
-
-def backfill_rank_trends_from_history(platforms: tuple[str, ...] | list[str] = PLATFORMS) -> dict[str, dict]:
-    index = load_rank_history_index()
-    dates = [str(value) for value in (index.get("dates") or []) if value not in (None, "")]
-    payloads: dict[str, dict] = {}
-    generated_at = now_iso()
-    for platform in platforms:
-        if platform not in TREND_KEYS:
-            raise ValueError(f"Unsupported platform: {platform}")
-        payload: dict | None = None
-        for history_date in dates:
-            metrics_payload = _load_upstash_json_strict(f"ranks:metrics:{history_date}:{platform}")
-            list_payload = _load_upstash_json_strict(f"ranks:list:{history_date}:{platform}")
-            payload = build_rank_trend_payload(
-                payload,
-                platform,
-                history_date,
-                metrics_payload if isinstance(metrics_payload, dict) else None,
-                list_payload if isinstance(list_payload, dict) else None,
-                generated_at=generated_at,
-                pruned_dates=(),
-            )
-        if payload is None:
-            payload = {
-                "version": 1,
-                "platform": platform,
-                "updated_at": generated_at,
-                "dates": [],
-                "dramas": {},
-            }
-        key = TREND_KEYS[platform]
-        encoded = json.dumps(payload, ensure_ascii=False)
-        result = upstash_request(["SET", key, encoded])
-        if result != "OK":
-            raise RuntimeError(f"Failed to upload {key}: {result!r}")
-        print(f"[ok] backfilled {key} ({len(encoded)} bytes, dates={len(payload.get('dates') or [])})")
-        payloads[platform] = payload
-    return payloads
 
 
 def build_missevan_peak_trend_payload(
@@ -797,13 +674,23 @@ def build_missevan_peak_trend_payload(
         }
         series_payload[name] = entry
 
+    kept_dates = set(sorted(dates)[-RANK_TREND_RETENTION_DATES:])
+    for name, entry in list(series_payload.items()):
+        entry["samples"] = {
+            sample_date: sample
+            for sample_date, sample in (entry.get("samples") or {}).items()
+            if sample_date in kept_dates
+        }
+        if not entry["samples"]:
+            series_payload.pop(name)
+
     return {
         "version": 1,
         "platform": "missevan",
         "rank": "peak",
         "metric": "view_count",
         "updated_at": generated_at,
-        "dates": sorted(dates),
+        "dates": sorted(kept_dates),
         "series": series_payload,
     }
 
@@ -856,157 +743,23 @@ def backfill_missevan_peak_trend_from_latest() -> str:
     return history_date
 
 
-def build_rank_history_payloads(
+def build_rank_snapshot_payloads(
     store: dict,
     *,
     platforms: tuple[str, ...] | list[str] = PLATFORMS,
     history_date: str | None = None,
     generated_at: str | None = None,
-) -> dict[str, dict]:
+) -> dict[str, dict[str, dict]]:
     generated = generated_at or now_iso()
     if history_date is None:
         history_date = generated[:10]
-    payloads: dict[str, dict] = {}
+    payloads: dict[str, dict[str, dict]] = {}
     for platform in platforms:
-        payloads[f"ranks:list:{history_date}:{platform}"] = _build_rank_list_payload(store, platform, history_date, generated)
-        payloads[f"ranks:metrics:{history_date}:{platform}"] = _build_metric_payload(store, platform, history_date, generated)
+        payloads[platform] = {
+            "list": _build_rank_list_payload(store, platform, history_date, generated),
+            "metrics": _build_metric_payload(store, platform, history_date, generated),
+        }
     return payloads
-
-
-def update_rank_history_index(
-    current: dict | None,
-    history_date: str,
-    *,
-    now: str | None = None,
-    retention_days: int = RANK_HISTORY_RETENTION_DAYS,
-) -> tuple[dict, list[str]]:
-    dates = []
-    if isinstance(current, dict):
-        dates = [str(value) for value in (current.get("dates") or [])]
-    previous_dates = set(dates)
-    dates.append(history_date)
-    dates = sorted(set(dates))[-retention_days:]
-    pruned_dates = sorted(previous_dates - set(dates))
-    return {
-        "version": 1,
-        "dates": dates,
-        "updated_at": now or now_iso(),
-    }, pruned_dates
-
-
-def load_rank_history_index() -> dict:
-    raw = upstash_request(["GET", "ranks:index"])
-    if raw in (None, ""):
-        return {"version": 1, "dates": [], "updated_at": None}
-    if isinstance(raw, str):
-        return json.loads(raw)
-    if isinstance(raw, dict):
-        return raw
-    raise RuntimeError(f"Unsupported payload type for ranks:index: {type(raw).__name__}")
-
-
-def update_rank_history_index_atomic(
-    history_date: str,
-    *,
-    generated_at: str,
-    retention_days: int = RANK_HISTORY_RETENTION_DAYS,
-) -> list[str]:
-    script = r'''
-local raw = redis.call("GET", KEYS[1])
-local current = {version = 1, dates = {}, updated_at = nil}
-if raw and raw ~= false and raw ~= "" then
-  current = cjson.decode(raw)
-  current["dates"] = current["dates"] or {}
-end
-
-local seen = {}
-local dates = {}
-for _, value in ipairs(current["dates"] or {}) do
-  local text = tostring(value)
-  if not seen[text] then
-    seen[text] = true
-    table.insert(dates, text)
-  end
-end
-
-local history_date = tostring(ARGV[1])
-if not seen[history_date] then
-  seen[history_date] = true
-  table.insert(dates, history_date)
-end
-
-table.sort(dates)
-local retention_days = tonumber(ARGV[3]) or 90
-local pruned = {}
-while #dates > retention_days do
-  table.insert(pruned, table.remove(dates, 1))
-end
-
-local updated = {version = 1, dates = dates, updated_at = tostring(ARGV[2])}
-redis.call("SET", KEYS[1], cjson.encode(updated))
-return cjson.encode(pruned)
-'''
-    raw = upstash_request([
-        "EVAL",
-        script,
-        1,
-        "ranks:index",
-        history_date,
-        generated_at,
-        str(retention_days),
-    ])
-    pruned = decode_upstash_json(raw, [])
-    return [str(value) for value in pruned] if isinstance(pruned, list) else []
-
-
-def upload_rank_history(
-    store: dict,
-    *,
-    platforms: tuple[str, ...] | list[str] = PLATFORMS,
-    retention_days: int = RANK_HISTORY_RETENTION_DAYS,
-) -> None:
-    generated_at = now_iso()
-    history_date = generated_at[:10]
-    payloads = build_rank_history_payloads(
-        store,
-        platforms=platforms,
-        history_date=history_date,
-        generated_at=generated_at,
-    )
-    pruned_dates = update_rank_history_index_atomic(
-        history_date,
-        generated_at=generated_at,
-        retention_days=retention_days,
-    )
-    for key, value in payloads.items():
-        payload = json.dumps(value, ensure_ascii=False)
-        result = upstash_request(["SET", key, payload])
-        if result != "OK":
-            raise RuntimeError(f"Failed to upload {key}: {result!r}")
-    if "missevan" in platforms:
-        upload_missevan_peak_trend(
-            store,
-            history_date=history_date,
-            generated_at=generated_at,
-            pruned_dates=pruned_dates,
-        )
-    for platform in platforms:
-        upload_rank_trend_snapshot(
-            platform,
-            history_date,
-            payloads.get(f"ranks:metrics:{history_date}:{platform}"),
-            payloads.get(f"ranks:list:{history_date}:{platform}"),
-            generated_at=generated_at,
-            pruned_dates=pruned_dates,
-        )
-    for old_date in pruned_dates:
-        for platform in PLATFORMS:
-            upstash_request(["DEL", f"ranks:list:{old_date}:{platform}"])
-            upstash_request(["DEL", f"ranks:metrics:{old_date}:{platform}"])
-    print(
-        f"[ok] uploaded rank history shards to Upstash "
-        f"({len(payloads)} keys, date={history_date}, platforms={','.join(platforms)})"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -2246,14 +1999,21 @@ def is_empty_danmaku_value(value: object) -> bool:
     return False
 
 
-def resolve_repair_history_date(explicit_date: str | None) -> str:
-    if explicit_date:
-        return str(explicit_date)
-    index = load_rank_history_index()
-    dates = [str(value) for value in (index.get("dates") or []) if value not in (None, "")]
-    if not dates:
-        raise RuntimeError("No rank history date found in ranks:index; pass --date YYYY-MM-DD.")
-    return max(dates)
+def resolve_repair_history_date(platform: str) -> str:
+    if platform not in TREND_KEYS:
+        raise ValueError(f"Unsupported platform: {platform}")
+    trend = _load_upstash_json_strict(TREND_KEYS[platform])
+    dates = [
+        str(value)
+        for value in ((trend or {}).get("dates") or [])
+        if value not in (None, "")
+    ] if isinstance(trend, dict) else []
+    if dates:
+        return max(dates)
+    latest = _load_upstash_json("ranks:latest")
+    if isinstance(latest, dict):
+        return _history_date_from_store_meta(latest)[0]
+    raise RuntimeError(f"No rank trend date or ranks:latest timestamp found for {platform}.")
 
 
 def _add_repair_source(targets: set[str], sources: dict[str, list[str]], drama_id: str, source: str) -> None:
@@ -2291,11 +2051,6 @@ def _merge_rank_memberships(target: dict[str, set[str]], source: dict[str, set[s
 
 def _manbo_rank_memberships_from_payloads(payloads: dict[str, object], history_date: str) -> dict[str, set[str]]:
     memberships: dict[str, set[str]] = {}
-
-    partial = payloads.get("partial")
-    partial_data = partial.get("data") if isinstance(partial, dict) else None
-    if isinstance(partial_data, dict):
-        _merge_rank_memberships(memberships, _collect_rank_memberships(partial_data.get("ranks")))
 
     latest = payloads.get("latest")
     latest_manbo = latest.get("manbo") if isinstance(latest, dict) else None
@@ -2345,8 +2100,6 @@ def collect_null_danmaku_ids_from_layers(
         raise ValueError(f"Unsupported platform: {platform}")
 
     payloads: dict[str, object] = {
-        "metrics": _load_upstash_json_strict(f"ranks:metrics:{history_date}:{platform}"),
-        "partial": _load_upstash_json_strict(RANK_PARTIAL_KEYS[platform]),
         "latest": _load_upstash_json_strict("ranks:latest"),
         "trend": _load_upstash_json_strict(TREND_KEYS[platform]),
     }
@@ -2354,21 +2107,6 @@ def collect_null_danmaku_ids_from_layers(
         payloads["ongoing"] = _load_upstash_json(ONGOING_KEYS[platform])
     targets: set[str] = set()
     sources: dict[str, list[str]] = {}
-
-    metrics = payloads.get("metrics")
-    metric_dramas = metrics.get("dramas") if isinstance(metrics, dict) else None
-    if isinstance(metric_dramas, dict):
-        for drama_id, entry in metric_dramas.items():
-            if _entry_has_empty_danmaku(entry):
-                _add_repair_source(targets, sources, str(drama_id), "metrics")
-
-    partial = payloads.get("partial")
-    partial_data = partial.get("data") if isinstance(partial, dict) else None
-    partial_dramas = partial_data.get("dramas") if isinstance(partial_data, dict) else None
-    if isinstance(partial_dramas, dict):
-        for drama_id, entry in partial_dramas.items():
-            if _entry_has_empty_danmaku(entry):
-                _add_repair_source(targets, sources, str(drama_id), "partial")
 
     latest = payloads.get("latest")
     latest_platform = latest.get(platform) if isinstance(latest, dict) else None
@@ -2402,15 +2140,6 @@ def collect_null_danmaku_ids_from_layers(
 
 def _payload_drama_entry(payloads: dict[str, object], layer: str, platform: str, drama_id: str) -> dict | None:
     payload = payloads.get(layer)
-    if layer == "metrics" and isinstance(payload, dict):
-        dramas = payload.get("dramas")
-        entry = dramas.get(drama_id) if isinstance(dramas, dict) else None
-        return entry if isinstance(entry, dict) else None
-    if layer == "partial" and isinstance(payload, dict):
-        data = payload.get("data")
-        dramas = data.get("dramas") if isinstance(data, dict) else None
-        entry = dramas.get(drama_id) if isinstance(dramas, dict) else None
-        return entry if isinstance(entry, dict) else None
     if layer == "latest" and isinstance(payload, dict):
         platform_payload = payload.get(platform)
         dramas = platform_payload.get("dramas") if isinstance(platform_payload, dict) else None
@@ -2425,7 +2154,7 @@ def _payload_drama_entry(payloads: dict[str, object], layer: str, platform: str,
 
 def _source_metric_entry(payloads: dict[str, object], platform: str, history_date: str, drama_id: str) -> dict:
     merged: dict[str, object] = {}
-    for layer in ("metrics", "partial", "latest", "trend"):
+    for layer in ("latest", "trend"):
         entry = _payload_drama_entry(payloads, layer, platform, drama_id)
         if not isinstance(entry, dict):
             continue
@@ -2449,40 +2178,6 @@ def _source_metric_entry(payloads: dict[str, object], platform: str, history_dat
                 merged[field] = value
     merged.setdefault("name", drama_id)
     return merged
-
-
-def _ensure_repair_metrics_payload(payload: object, platform: str, history_date: str, generated_at: str) -> dict:
-    if isinstance(payload, dict):
-        result = payload
-    else:
-        result = {}
-    result["version"] = result.get("version") or 1
-    result["date"] = result.get("date") or history_date
-    result["platform"] = result.get("platform") or platform
-    result["generated_at"] = generated_at
-    result.setdefault("dramas", {})
-    if not isinstance(result["dramas"], dict):
-        result["dramas"] = {}
-    return result
-
-
-def _ensure_repair_partial_payload(payload: object, platform: str, generated_at: str) -> dict:
-    if isinstance(payload, dict):
-        result = payload
-    else:
-        result = {}
-    result["version"] = result.get("version") or 1
-    result["platform"] = result.get("platform") or platform
-    result["updated_at"] = generated_at
-    data = result.get("data")
-    if not isinstance(data, dict):
-        data = {}
-        result["data"] = data
-    data.setdefault("ranks", {})
-    data.setdefault("dramas", {})
-    if not isinstance(data["dramas"], dict):
-        data["dramas"] = {}
-    return result
 
 
 def _ensure_repair_latest_payload(payload: object, generated_at: str) -> dict:
@@ -2526,13 +2221,6 @@ def write_repaired_danmaku_layers(
         return
 
     generated_at = now_iso()
-    metrics_payload = _ensure_repair_metrics_payload(
-        loaded_payloads.get("metrics"),
-        platform,
-        history_date,
-        generated_at,
-    )
-    partial_payload = _ensure_repair_partial_payload(loaded_payloads.get("partial"), platform, generated_at)
     latest_payload = _ensure_repair_latest_payload(loaded_payloads.get("latest"), generated_at)
     trend_payload = _ensure_repair_trend_payload(
         loaded_payloads.get("trend"),
@@ -2541,29 +2229,13 @@ def write_repaired_danmaku_layers(
         generated_at,
     )
 
-    metric_dramas = metrics_payload["dramas"]
-    partial_dramas = partial_payload["data"]["dramas"]
     latest_dramas = latest_payload[platform]["dramas"]
     trend_dramas = trend_payload["dramas"]
 
     for drama_id, count in sorted(repaired_counts.items()):
         source_entry = _source_metric_entry(loaded_payloads, platform, history_date, drama_id)
 
-        metric_entry = metric_dramas.setdefault(drama_id, dict(source_entry))
-        if isinstance(metric_entry, dict):
-            for field, value in source_entry.items():
-                metric_entry.setdefault(field, value)
-            metric_entry["danmaku_uid_count"] = count
-            metric_entry["fetched_at"] = generated_at
-
-        partial_entry = partial_dramas.setdefault(drama_id, dict(metric_entry if isinstance(metric_entry, dict) else source_entry))
-        if isinstance(partial_entry, dict):
-            for field, value in source_entry.items():
-                partial_entry.setdefault(field, value)
-            partial_entry["danmaku_uid_count"] = count
-            partial_entry["fetched_at"] = generated_at
-
-        latest_entry = latest_dramas.setdefault(drama_id, dict(metric_entry if isinstance(metric_entry, dict) else source_entry))
+        latest_entry = latest_dramas.setdefault(drama_id, dict(source_entry))
         if isinstance(latest_entry, dict):
             for field, value in source_entry.items():
                 latest_entry.setdefault(field, value)
@@ -2595,8 +2267,6 @@ def write_repaired_danmaku_layers(
             sample_metrics["danmaku_uid_count"] = count
 
     writes = (
-        (f"ranks:metrics:{history_date}:{platform}", metrics_payload),
-        (RANK_PARTIAL_KEYS[platform], partial_payload),
         ("ranks:latest", latest_payload),
         (TREND_KEYS[platform], trend_payload),
     )
@@ -2698,13 +2368,13 @@ def repair_null_danmaku_for_platform(
 
 def repair_null_danmaku_mode(
     *,
-    history_date: str,
     platforms: tuple[str, ...] | list[str],
     attempts: int,
     dry_run: bool,
 ) -> dict[str, dict[str, object]]:
     results: dict[str, dict[str, object]] = {}
     for platform in platforms:
+        history_date = resolve_repair_history_date(platform)
         results[platform] = repair_null_danmaku_for_platform(
             platform,
             history_date,
@@ -2805,9 +2475,7 @@ def main() -> None:
     parser.add_argument("--benchmark-page-concurrency", type=int, default=MANBO_DANMAKU_PAGE_CONCURRENCY, help="Global page concurrency for Manbo benchmark")
     parser.add_argument("--benchmark-page-size", type=int, default=MANBO_DANMAKU_PAGE_SIZE, help="Page size for Manbo benchmark")
     parser.add_argument("--backfill-missevan-peak-trend-from-latest", action="store_true", help="Backfill Missevan peak view-count trend from ranks:latest")
-    parser.add_argument("--backfill-rank-trends-from-history", action="store_true", help="Backfill normal rank trends from ranks:index history shards")
     parser.add_argument("--repair-null-danmaku", action="store_true", help="Repair empty danmaku UID counts across Upstash rank layers")
-    parser.add_argument("--date", help="History date to repair, defaults to latest date from ranks:index")
     parser.add_argument("--repair-attempts", type=int, default=DANMAKU_DRAMA_RETRY_ATTEMPTS, help="Retry rounds for failed danmaku repairs")
     parser.add_argument("--dry-run", action="store_true", help="List repair targets without fetching or writing")
     platform_group = parser.add_mutually_exclusive_group()
@@ -2825,9 +2493,7 @@ def main() -> None:
 
     if args.repair_null_danmaku:
         print("=== Repairing null danmaku UID counts ===")
-        history_date = resolve_repair_history_date(args.date)
         results = repair_null_danmaku_mode(
-            history_date=history_date,
             platforms=active_platforms,
             attempts=args.repair_attempts,
             dry_run=args.dry_run,
@@ -2840,16 +2506,6 @@ def main() -> None:
                 f"failed={len(result.get('failed') or [])}"
             )
         print("=== Done (repair-null-danmaku) ===")
-        return
-
-    if args.backfill_rank_trends_from_history:
-        print("=== Backfilling normal rank trends from history shards ===")
-        payloads = backfill_rank_trends_from_history(active_platforms)
-        for platform, payload in payloads.items():
-            print(
-                f"[ok] backfilled {TREND_KEYS[platform]}: "
-                f"dates={len(payload.get('dates') or [])}, dramas={len(payload.get('dramas') or {})}"
-            )
         return
 
     if args.backfill_missevan_peak_trend_from_latest:

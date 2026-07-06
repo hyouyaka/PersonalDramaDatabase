@@ -50,6 +50,7 @@ PersonalDramaDatabase_architecture.md
 /DramasByCV.sqlite
 /DramasByCV_merged.xlsx
 recovery_backups/
+/logs/
 backfill_vip_fields.py
 /backfill_cv_avatars.py
 /backfill_missevan_covers.py

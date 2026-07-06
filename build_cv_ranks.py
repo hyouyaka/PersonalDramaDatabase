@@ -22,6 +22,7 @@ from platform_sync import (
 from sync_new_drama_ids import ROOT, configure_stdio, load_env_file, sync_remote_watchcount_if_newer, upstash_request
 from sync_new_drama_ids import MANBO_INFO_KEY, MISSEVAN_INFO_KEY
 from sync_remote_libraries import fetch_cvid_map_payload, fetch_info_payload, write_payloads
+from rank_key_cleanup import cleanup_legacy_cv_rank_keys, run_cleanup_best_effort
 
 
 HERE = Path(__file__).resolve().parent
@@ -501,11 +502,11 @@ def build_cv_trend_payload(
 
 def upload_cv_ranks(payload: dict, *, upstash=upstash_request) -> None:
     encoded = json.dumps(payload, ensure_ascii=False)
-    for key in (f"ranks:cv:{payload['date']}", "ranks:cv:latest"):
-        result = upstash(["SET", key, encoded])
-        if result != "OK":
-            raise RuntimeError(f"Failed to upload {key}: {result!r}")
-        print(f"[ok] uploaded {key} ({len(encoded)} bytes)")
+    key = "ranks:cv:latest"
+    result = upstash(["SET", key, encoded])
+    if result != "OK":
+        raise RuntimeError(f"Failed to upload {key}: {result!r}")
+    print(f"[ok] uploaded {key} ({len(encoded)} bytes)")
 
 
 def load_cv_trend_payload(platform: str, *, upstash=upstash_request) -> dict | None:
@@ -633,13 +634,14 @@ def build_and_publish_cv_ranks(
             full_paid_rankings=full_paid_rankings,
             upstash=upstash,
         )
+        run_cleanup_best_effort(lambda: cleanup_legacy_cv_rank_keys(upstash))
     return payload
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build CV view-count rankings from local platform libraries")
     parser.add_argument("--no-upload", action="store_true", help="Only write ranks-cv.json locally")
-    parser.add_argument("--date", help="Override the output date and Upstash date key (YYYY-MM-DD)")
+    parser.add_argument("--date", help="Override the output and aggregate sample date (YYYY-MM-DD)")
     parser.add_argument("--force", action="store_true", help="构建前无条件拉取远端 watchcount latest")
     return parser.parse_args(argv)
 
