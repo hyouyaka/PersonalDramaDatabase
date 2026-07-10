@@ -229,6 +229,22 @@ class QueueReadyTests(unittest.TestCase):
         without_cover["cover"] = ""
         self.assertFalse(sync_new_drama_ids.is_missevan_ready(without_cover))
 
+    def test_missevan_ready_counts_name_only_main_cv(self) -> None:
+        record = {
+            "title": "猫耳剧",
+            "type": 4,
+            "catalog": 89,
+            "author": "作者",
+            "createTime": "",
+            "cover": "https://example.test/cover.jpg",
+            "is_member": True,
+            "maincvs": [3946],
+            "cvnames": {"3946": "辰朔"},
+            "fallbackCvNames": ["林风"],
+        }
+
+        self.assertTrue(sync_new_drama_ids.is_missevan_ready(record))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,7 @@ from platform_sync import (
     iter_missevan_nodes,
     load_cache,
     load_json,
+    missevan_main_cv_entries,
     normalize,
     normalize_match,
 )
@@ -191,8 +192,9 @@ def build_rows() -> list[dict]:
         base_title = base_series_title(title_value)
         genre = GENRE_BY_TYPE.get(int(node.get("type") or 0), "")
         catalog_name = MISSEVAN_CATALOG_NAME_BY_ID.get(catalog, "") if catalog is not None else ""
-        for cv_id in [int(item) for item in (node.get("maincvs") or [])]:
-            raw_name = normalize((node.get("cvnames") or {}).get(str(cv_id)))
+        for cv_entry in missevan_main_cv_entries(node):
+            cv_id = cv_entry["cv_id"]
+            raw_name = normalize(cv_entry["display_name"])
             cv_name = resolve_cv_name(raw_name, cv_id, platform="猫耳", missevan_ids=missevan_ids, manbo_ids=manbo_ids, name_index=name_index)
             key = (cv_name, "猫耳", catalog, base_title)
             bucket = buckets.setdefault(
@@ -212,7 +214,7 @@ def build_rows() -> list[dict]:
             drama_id = str(node.get("dramaId") or "").strip()
             if drama_id and drama_id not in bucket["drama_ids"]:
                 bucket["drama_ids"].append(drama_id)
-            role_name = normalize((node.get("cvroles") or {}).get(str(cv_id), ""))
+            role_name = normalize(cv_entry["role_name"])
             if role_name:
                 bucket["role_names"].append(role_name)
             create_month = normalize(node.get("createTime"))

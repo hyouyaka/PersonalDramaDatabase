@@ -17,6 +17,7 @@ from platform_sync import (
     SERIES_INFO_PATH,
     iter_missevan_nodes,
     load_json,
+    missevan_main_cv_entries,
     normalize,
 )
 
@@ -521,7 +522,7 @@ def is_missevan_ready(record: dict | None) -> bool:
         return False
     if "is_member" not in record:
         return False
-    return len(record.get("maincvs") or []) >= 2
+    return len(missevan_main_cv_entries(record)) >= 2
 
 
 def is_manbo_ready(record: dict | None) -> bool:

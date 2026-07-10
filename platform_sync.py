@@ -262,6 +262,53 @@ def safe_int(value: object, default: int = 0) -> int:
         return default
 
 
+def missevan_main_cv_entries(node: dict) -> list[dict]:
+    """Return numeric and name-only Missevan main CVs in display order."""
+    cvnames = node.get("cvnames") or {}
+    cvroles = node.get("cvroles") or {}
+    entries: list[dict] = []
+    seen_ids: set[int] = set()
+    seen_names: set[str] = set()
+
+    for raw_cv_id in node.get("maincvs") or []:
+        try:
+            cv_id = int(raw_cv_id)
+        except (TypeError, ValueError):
+            continue
+        if cv_id in seen_ids:
+            continue
+        seen_ids.add(cv_id)
+        display_name = normalize(cvnames.get(str(raw_cv_id)) or cvnames.get(str(cv_id)))
+        name_key = normalize_match(display_name)
+        if name_key:
+            seen_names.add(name_key)
+        entries.append(
+            {
+                "cv_id": cv_id,
+                "display_name": display_name,
+                "role_name": normalize(cvroles.get(str(raw_cv_id)) or cvroles.get(str(cv_id))),
+                "name_only": False,
+            }
+        )
+
+    fallback_roles = node.get("fallbackCvRoles") or {}
+    for raw_name in node.get("fallbackCvNames") or []:
+        display_name = normalize(raw_name)
+        name_key = normalize_match(display_name)
+        if not display_name or name_key in seen_names:
+            continue
+        seen_names.add(name_key)
+        entries.append(
+            {
+                "cv_id": None,
+                "display_name": display_name,
+                "role_name": normalize(fallback_roles.get(raw_name) or fallback_roles.get(display_name)),
+                "name_only": True,
+            }
+        )
+    return entries
+
+
 def to_beijing_month(ts: int | float | None, *, milliseconds: bool = False) -> str:
     if ts in (None, "", 0):
         return ""

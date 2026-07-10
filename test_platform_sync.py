@@ -6,6 +6,27 @@ import requests
 import platform_sync
 
 
+class MissevanLogicalMainCvTests(unittest.TestCase):
+    def test_combines_numeric_and_name_only_main_cvs(self) -> None:
+        entries = platform_sync.missevan_main_cv_entries(
+            {
+                "maincvs": [3946],
+                "cvnames": {"3946": "辰朔"},
+                "cvroles": {"3946": "秦越"},
+                "fallbackCvNames": ["林风", "辰朔"],
+                "fallbackCvRoles": {"林风": "季南溪"},
+            }
+        )
+
+        self.assertEqual(
+            entries,
+            [
+                {"cv_id": 3946, "display_name": "辰朔", "role_name": "秦越", "name_only": False},
+                {"cv_id": None, "display_name": "林风", "role_name": "季南溪", "name_only": True},
+            ],
+        )
+
+
 class ManboCvEntryTests(unittest.TestCase):
     def test_build_manbo_cv_entries_uses_top_level_cv_id_when_profile_id_missing(self) -> None:
         entries = platform_sync.build_manbo_cv_entries(

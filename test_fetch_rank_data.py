@@ -1100,6 +1100,32 @@ class ManboCvLookupTests(unittest.TestCase):
         self.assertEqual(store["manbo"]["dramas"]["drama-1"]["maincvs"], ["规范名甲", "接口昵称乙"])
 
 
+class MissevanCvLookupTests(unittest.TestCase):
+    def test_lookup_cvs_includes_name_only_main_cv(self) -> None:
+        store = {
+            "missevan": {"dramas": {"94602": {"name": "测试剧"}}},
+            "manbo": {"dramas": {}},
+        }
+
+        def load_remote(key: str):
+            if key == "missevan:info:v1":
+                return {
+                    "94602": {
+                        "maincvs": [3946],
+                        "cvnames": {"3946": "辰朔"},
+                        "fallbackCvNames": ["林风"],
+                    }
+                }
+            if key == "manbo:info:v1":
+                return {"records": []}
+            raise AssertionError(key)
+
+        with patch.object(fetch_rank_data, "_load_upstash_json", side_effect=load_remote), patch("builtins.print"):
+            fetch_rank_data.lookup_cvs(store)
+
+        self.assertEqual(store["missevan"]["dramas"]["94602"]["maincvs"], ["辰朔", "林风"])
+
+
 class ManboDanmakuStabilityTests(unittest.TestCase):
     def _manbo_page_requester(self, pages: dict[tuple[str, int], dict]):
         def request_json(url: str) -> dict:

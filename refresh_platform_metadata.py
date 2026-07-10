@@ -7,7 +7,7 @@ from copy import deepcopy
 from urllib.parse import quote
 
 from clean_manbo_pricing import MANBO_PRICING_EXCLUSIONS, classify_manbo_pricing
-from cvid_map_tools import load_combined_map, save_combined_map
+from cvid_map_tools import ensure_name_only_cv_entry, load_combined_map, save_combined_map
 from platform_sync import (
     GENRE_BY_TYPE,
     MANBO_CATALOG_NAME_ALIASES,
@@ -32,6 +32,7 @@ from platform_sync import (
     iter_missevan_nodes,
     load_cache,
     load_json,
+    missevan_main_cv_entries,
     normalize,
     normalize_match,
     pick_first_episode_month,
@@ -431,13 +432,26 @@ def apply_missevan_intro_cv_fallback(
     unresolved_names: list[str] = []
     unresolved_roles: dict[str, str] = {}
     changed_map = False
+    existing_main_entries = missevan_main_cv_entries(node)
+    existing_by_name: dict[str, list[dict]] = {}
+    for entry in existing_main_entries:
+        if entry["cv_id"] is None:
+            continue
+        name_key = normalize_match(entry["display_name"])
+        if name_key:
+            existing_by_name.setdefault(name_key, []).append(entry)
 
     for idx, candidate in enumerate(candidates):
         display_name = normalize(candidate.get("display_name"))
         role_name = normalize(candidate.get("role_name"))
         if not display_name:
             continue
-        cv_id, mapped_name = missevan_cv_id_from_combined_map(display_name, active_map)
+        existing_matches = existing_by_name.get(normalize_match(display_name), [])
+        if len(existing_matches) == 1:
+            cv_id = int(existing_matches[0]["cv_id"])
+            mapped_name = normalize(existing_matches[0]["display_name"])
+        else:
+            cv_id, mapped_name = missevan_cv_id_from_combined_map(display_name, active_map)
         final_name = mapped_name or display_name
         if cv_id is None and search_func is not None:
             found = search_func(display_name)
@@ -448,6 +462,8 @@ def apply_missevan_intro_cv_fallback(
                     upsert_missevan_cv_map_entry(active_map, final_name, cv_id)
                     changed_map = True
         if cv_id is None:
+            if update_combined_map and ensure_name_only_cv_entry(active_map, display_name):
+                changed_map = True
             if display_name not in unresolved_names:
                 unresolved_names.append(display_name)
                 if role_name:
@@ -463,9 +479,37 @@ def apply_missevan_intro_cv_fallback(
             }
         )
 
-    if resolved_entries:
-        updated_node["maincvs"] = [int(entry["cv_id"]) for entry in resolved_entries]
-        cvroles, cvnames = _missevan_cv_maps(resolved_entries, _get_missevan_cv_name_map())
+    limit = 4 if int(node.get("type") or 0) == 3 else 2
+    final_resolved_entries: list[dict] = []
+    seen_cv_ids: set[int] = set()
+    for entry in resolved_entries:
+        cv_id = int(entry["cv_id"])
+        if cv_id in seen_cv_ids or len(final_resolved_entries) >= limit:
+            continue
+        seen_cv_ids.add(cv_id)
+        final_resolved_entries.append(entry)
+    for entry in existing_main_entries:
+        cv_id = entry["cv_id"]
+        if cv_id is None or cv_id in seen_cv_ids or len(final_resolved_entries) >= limit:
+            continue
+        seen_cv_ids.add(cv_id)
+        final_resolved_entries.append(
+            {
+                "index": len(final_resolved_entries),
+                "cv_id": cv_id,
+                "display_name": entry["display_name"],
+                "role_name": entry["role_name"],
+                "raw_role_name": entry["role_name"],
+            }
+        )
+
+    fallback_slots = max(limit - len(final_resolved_entries), 0)
+    unresolved_names = unresolved_names[:fallback_slots]
+    unresolved_roles = {name: unresolved_roles[name] for name in unresolved_names if name in unresolved_roles}
+
+    if final_resolved_entries:
+        updated_node["maincvs"] = [int(entry["cv_id"]) for entry in final_resolved_entries]
+        cvroles, cvnames = _missevan_cv_maps(final_resolved_entries, _get_missevan_cv_name_map())
         updated_node["cvnames"] = cvnames
         updated_node["cvroles"] = cvroles
     if unresolved_names:
@@ -481,6 +525,25 @@ def apply_missevan_intro_cv_fallback(
 
 def sound_infos_have_cvs(*sound_infos: dict) -> bool:
     return any(bool((info or {}).get("cvs")) for info in sound_infos)
+
+
+def should_try_missevan_intro_cv_fallback(
+    node: dict,
+    info: dict,
+    sound_infos: list[dict],
+    fallback_sound_ids: list[str],
+    *,
+    required_main_cvs: int = 0,
+) -> bool:
+    if not fallback_sound_ids:
+        return False
+    if required_main_cvs > 0 and len(missevan_main_cv_entries(node)) < required_main_cvs:
+        return True
+    return (
+        not missevan_main_cv_entries(node)
+        and not (info.get("cvs") or [])
+        and not sound_infos_have_cvs(*sound_infos)
+    )
 
 
 def fetch_missevan_intro_cv_candidates(requester: MissevanRequester, sound_ids: list[str]) -> list[dict]:
@@ -802,11 +865,12 @@ def refresh_missevan(*, target_drama_ids: set[str] | None = None, force: bool = 
             updated_node = apply_missevan_merged_sound_maincvs(updated_node, drama_id, base_entries, maincv_preview_sound_infos) if used_preview_sound else updated_node
             updated_node = apply_missevan_sound_maincvs(updated_node, drama_id, base_entries, episode_sound_info)
         fallback_sound_ids = missevan_intro_fallback_sound_ids(preview_sound_id_list, sound_id, first_episode_sound_id)
-        should_try_intro_cv_fallback = (
-            not (updated_node.get("maincvs") or [])
-            and not (info.get("cvs") or [])
-            and not sound_infos_have_cvs(sound_info, *preview_sound_infos, episode_sound_info)
-            and bool(fallback_sound_ids)
+        should_try_intro_cv_fallback = should_try_missevan_intro_cv_fallback(
+            updated_node,
+            info,
+            [sound_info, *preview_sound_infos, episode_sound_info],
+            fallback_sound_ids,
+            required_main_cvs=2 if should_fill_two_maincvs else 0,
         )
         if should_try_intro_cv_fallback:
             try:

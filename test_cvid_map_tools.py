@@ -30,6 +30,31 @@ class AvatarHelperTests(unittest.TestCase):
 
 
 class UpdateCombinedMapAvatarTests(unittest.TestCase):
+    def test_name_only_cv_is_created_idempotently_and_can_gain_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            map_path = Path(tmp) / "missevan&manbo-cvid-map.json"
+            map_path.write_text("{}", encoding="utf-8")
+            name_only_store = {
+                "94602": {
+                    "dramaId": "94602",
+                    "fallbackCvNames": ["林风"],
+                    "fallbackCvRoles": {"林风": "季南溪"},
+                }
+            }
+            with patch.object(cvid_map_tools, "COMBINED_CVID_MAP_PATH", map_path):
+                first = cvid_map_tools.update_combined_cvid_map(name_only_store, {"records": []})
+                second = cvid_map_tools.update_combined_cvid_map(name_only_store, {"records": []})
+                upgraded = cvid_map_tools.update_combined_cvid_map(
+                    {"94602": {"dramaId": "94602", "maincvs": [777], "cvnames": {"777": "林风"}}},
+                    {"records": []},
+                )
+                saved = cvid_map_tools.load_json(map_path, {})
+
+        self.assertEqual(first["created"], 1)
+        self.assertEqual(second["unchanged"], 1)
+        self.assertEqual(upgraded["updated"], 1)
+        self.assertEqual(saved["林风"]["missevanCvId"], 777)
+
     def test_created_missevan_cv_gets_avatar(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             map_path = Path(tmp) / "missevan&manbo-cvid-map.json"

@@ -8,6 +8,7 @@ from platform_sync import (
     MissevanRequester,
     iter_missevan_nodes,
     load_json,
+    missevan_main_cv_entries,
     normalize,
     normalize_match,
     request_manbo_json,
@@ -124,6 +125,37 @@ class ObservedCV:
     aliases: list[str]
 
 
+def ensure_name_only_cv_entry(combined_map: dict, display_name: object) -> bool:
+    key = normalize(display_name)
+    if not key:
+        return False
+    norm = normalize_match(key)
+    matches = {
+        existing_key
+        for existing_key, payload in (combined_map or {}).items()
+        if norm
+        in {
+            normalize_match(candidate)
+            for candidate in [existing_key, payload.get("displayName"), *(payload.get("aliases") or [])]
+            if normalize_match(candidate)
+        }
+    }
+    if matches:
+        return False
+    combined_map[key] = {
+        "cvId": None,
+        "missevanCvId": None,
+        "manboCvId": None,
+        "displayName": key,
+        "aliases": [],
+        "avatar": "",
+        "source": "observed",
+        "updatedAt": utc_now(),
+        "notes": "猫耳搜索未命中，以显示名称识别",
+    }
+    return True
+
+
 def _nickname_variants(value: object) -> list[str]:
     text = normalize(value)
     if not text:
@@ -161,11 +193,11 @@ def collect_observed_cvs(
         drama_id = str(node.get("dramaId") or "").strip()
         if missevan_drama_ids is not None and drama_id not in missevan_drama_ids:
             continue
-        cvnames = node.get("cvnames") or {}
-        for cv_id in node.get("maincvs") or []:
-            raw_name = normalize(cvnames.get(str(cv_id)))
+        for entry in missevan_main_cv_entries(node):
+            cv_id = entry["cv_id"]
+            raw_name = normalize(entry["display_name"])
             aliases = _nickname_variants(raw_name)
-            observed.append(ObservedCV("猫耳", raw_name or f"猫耳CV_{cv_id}", int(cv_id), aliases))
+            observed.append(ObservedCV("猫耳", raw_name or f"猫耳CV_{cv_id}", cv_id, aliases))
     for record in (manbo_store.get("records") or []):
         drama_id = str(record.get("dramaId") or "").strip()
         if manbo_drama_ids is not None and drama_id not in manbo_drama_ids:
@@ -239,7 +271,7 @@ def update_combined_cvid_map(
             payload = dict(current[key])
             if item.platform == "猫耳":
                 existing = payload.get("missevanCvId", payload.get("cvId"))
-                if existing not in (None, "") and int(existing) != int(item.platform_cv_id):
+                if item.platform_cv_id is not None and existing not in (None, "") and int(existing) != int(item.platform_cv_id):
                     ambiguous.append(f"{item.platform}:{item.display_name}")
                     continue
                 next_cv_id = int(item.platform_cv_id) if item.platform_cv_id is not None else payload.get("cvId")
@@ -249,7 +281,7 @@ def update_combined_cvid_map(
                 payload["missevanCvId"] = next_missevan_cv_id
             else:
                 existing = payload.get("manboCvId")
-                if existing not in (None, "") and int(existing) != int(item.platform_cv_id):
+                if item.platform_cv_id is not None and existing not in (None, "") and int(existing) != int(item.platform_cv_id):
                     ambiguous.append(f"{item.platform}:{item.display_name}")
                     continue
                 next_manbo_cv_id = int(item.platform_cv_id) if item.platform_cv_id is not None else payload.get("manboCvId")
@@ -295,7 +327,7 @@ def update_combined_cvid_map(
             "avatar": "",
             "source": "observed",
             "updatedAt": now,
-            "notes": "",
+            "notes": "猫耳搜索未命中，以显示名称识别" if item.platform == "猫耳" and item.platform_cv_id is None else "",
         }
         payload["avatar"] = payload_avatar(payload, avatar_lookup=avatar_lookup, force=force_avatar)
         current[key] = payload

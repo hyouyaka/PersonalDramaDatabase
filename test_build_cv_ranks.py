@@ -8,6 +8,34 @@ import build_cv_ranks
 
 
 class BuildCvRanksTests(unittest.TestCase):
+    def test_name_only_cv_gets_own_ranking_bucket(self) -> None:
+        buckets: dict[str, dict] = {}
+        paid_buckets: dict[str, dict] = {}
+        cvid_map = {"林风": {"displayName": "林风", "missevanCvId": None, "avatar": ""}}
+        missevan_ids, manbo_ids, name_index, avatar_index = build_cv_ranks.build_map_indexes(cvid_map)
+
+        build_cv_ranks.collect_missevan_works(
+            buckets,
+            paid_buckets=paid_buckets,
+            store={
+                "94602": {
+                    "dramaId": 94602,
+                    "title": "测试剧",
+                    "needpay": True,
+                    "maincvs": [3946],
+                    "cvnames": {"3946": "辰朔"},
+                    "fallbackCvNames": ["林风"],
+                }
+            },
+            counts={"94602": {"view_count": 100}},
+            missevan_ids=missevan_ids,
+            manbo_ids=manbo_ids,
+            name_index=name_index,
+            avatar_index=avatar_index,
+        )
+
+        self.assertEqual(buckets["林风"]["totalViewCount"], 100)
+        self.assertEqual(buckets["林风"]["works"][0]["mainCvs"], ["辰朔", "林风"])
     def write_json(self, tmp: str, name: str, payload: dict) -> Path:
         path = Path(tmp) / name
         path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")

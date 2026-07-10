@@ -23,6 +23,7 @@ from platform_sync import (
     MISSEVAN_CATALOG_NAME_BY_ID,
     MissevanRequester,
     load_json,
+    missevan_main_cv_entries,
     normalize,
     request_manbo_json,
     save_json as _save_json,
@@ -1925,9 +1926,10 @@ def lookup_cvs(store: dict) -> None:
     for drama_id, entry in missevan_dramas.items():
         node = missevan_info.get(str(drama_id))
         if node:
-            cvnames = node.get("cvnames") or {}
-            maincvs_ids = node.get("maincvs") or []
-            entry["maincvs"] = [cvnames.get(str(cid), str(cid)) for cid in maincvs_ids] or None
+            entry["maincvs"] = [
+                cv_entry["display_name"] or str(cv_entry["cv_id"])
+                for cv_entry in missevan_main_cv_entries(node)
+            ] or None
             update_metadata_fields(
                 entry,
                 catalog_name=catalog_name_from_missevan(node),

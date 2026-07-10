@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock, patch
 
 import refresh_platform_metadata
 
@@ -69,6 +70,83 @@ class MissevanCvMapEntryTests(unittest.TestCase):
 
         self.assertIn("avatar", combined_map["CV A"])
         self.assertEqual(combined_map["CV A"]["avatar"], "")
+
+    def test_intro_search_miss_creates_name_only_cv_entry(self) -> None:
+        combined_map = {}
+        with patch.object(refresh_platform_metadata, "save_combined_map") as save_map:
+            updated = refresh_platform_metadata.apply_missevan_intro_cv_fallback(
+                {"maincvs": []},
+                "94602",
+                [{"role_name": "季南溪", "display_name": "林风"}],
+                combined_map=combined_map,
+                search_cv=Mock(return_value=None),
+            )
+
+        self.assertEqual(updated["fallbackCvNames"], ["林风"])
+        self.assertEqual(updated["fallbackCvRoles"], {"林风": "季南溪"})
+        self.assertIsNone(combined_map["林风"]["missevanCvId"])
+        self.assertEqual(combined_map["林风"]["notes"], "猫耳搜索未命中，以显示名称识别")
+        save_map.assert_called_once_with(combined_map)
+
+    def test_intro_fallback_merges_numeric_and_name_only_main_cv(self) -> None:
+        combined_map = {}
+        with patch.object(refresh_platform_metadata, "save_combined_map"):
+            updated = refresh_platform_metadata.apply_missevan_intro_cv_fallback(
+                {
+                    "type": 4,
+                    "maincvs": [11],
+                    "cvnames": {"11": "已知CV"},
+                    "cvroles": {"11": "角色甲"},
+                },
+                "drama-1",
+                [
+                    {"role_name": "角色甲", "display_name": "已知CV"},
+                    {"role_name": "角色乙", "display_name": "未知CV"},
+                ],
+                combined_map=combined_map,
+                search_cv=Mock(return_value=None),
+            )
+
+        self.assertEqual(updated["maincvs"], [11])
+        self.assertEqual(updated["cvroles"], {"11": "角色甲"})
+        self.assertEqual(updated["fallbackCvNames"], ["未知CV"])
+        self.assertEqual(updated["fallbackCvRoles"], {"未知CV": "角色乙"})
+        self.assertNotIn("已知CV", combined_map)
+        self.assertIn("未知CV", combined_map)
+
+    def test_partial_structured_main_cvs_still_trigger_intro_fallback(self) -> None:
+        self.assertTrue(
+            refresh_platform_metadata.should_try_missevan_intro_cv_fallback(
+                {"maincvs": [11], "cvnames": {"11": "已知CV"}},
+                {"cvs": [{"cv_info": {"id": 11}}]},
+                [{"cvs": [{"cv_info": {"id": 11}}]}],
+                ["preview-1"],
+                required_main_cvs=2,
+            )
+        )
+
+    def test_intro_fallback_keeps_numeric_cv_when_multiple_names_are_unresolved(self) -> None:
+        combined_map = {}
+        with patch.object(refresh_platform_metadata, "save_combined_map"):
+            updated = refresh_platform_metadata.apply_missevan_intro_cv_fallback(
+                {
+                    "type": 4,
+                    "maincvs": [11],
+                    "cvnames": {"11": "已知CV"},
+                    "cvroles": {"11": "角色甲"},
+                },
+                "drama-1",
+                [
+                    {"role_name": "角色乙", "display_name": "未知CV乙"},
+                    {"role_name": "角色丙", "display_name": "未知CV丙"},
+                ],
+                combined_map=combined_map,
+                search_cv=Mock(return_value=None),
+            )
+
+        self.assertEqual(updated["maincvs"], [11])
+        self.assertEqual(updated["fallbackCvNames"], ["未知CV乙"])
+        self.assertNotIn("未知CV丙", updated["fallbackCvRoles"])
 
 
 class MissevanIntroCvCandidateTests(unittest.TestCase):

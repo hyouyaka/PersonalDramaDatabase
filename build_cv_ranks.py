@@ -15,6 +15,7 @@ from platform_sync import (
     iter_missevan_nodes,
     load_cache,
     load_json,
+    missevan_main_cv_entries,
     normalize,
     normalize_match,
     save_json,
@@ -151,13 +152,11 @@ def resolve_cv_name(
 
 
 def missevan_main_cv_names(node: dict) -> list[str]:
-    cvnames = node.get("cvnames") or {}
-    names: list[str] = []
-    for cv_id in node.get("maincvs") or []:
-        name = normalize(cvnames.get(str(cv_id)))
-        if name:
-            names.append(name)
-    return names
+    return [
+        normalize(entry["display_name"])
+        for entry in missevan_main_cv_entries(node)
+        if normalize(entry["display_name"])
+    ]
 
 
 def manbo_main_cv_names(record: dict) -> list[str]:
@@ -210,10 +209,9 @@ def collect_missevan_works(
             "viewCount": view_count,
             "isPaid": is_paid,
         }
-        cvnames = node.get("cvnames") or {}
-        for raw_cv_id in node.get("maincvs") or []:
-            cv_id = safe_int_or_none(raw_cv_id)
-            raw_name = cvnames.get(str(raw_cv_id))
+        for cv_entry in missevan_main_cv_entries(node):
+            cv_id = cv_entry["cv_id"]
+            raw_name = cv_entry["display_name"]
             cv_name = resolve_cv_name(
                 raw_name,
                 cv_id,
