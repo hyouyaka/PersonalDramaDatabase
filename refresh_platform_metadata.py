@@ -710,7 +710,9 @@ def fetch_missevan_episode_intro_rows(
 def is_missevan_preview_intro_title(title: object) -> bool:
     text = normalize(title)
     lowered = text.casefold()
-    return any(keyword in text for keyword in ("预告", "先导", "主题曲")) or "pv" in lowered
+    return any(keyword in text for keyword in ("预告", "先导", "主题曲")) or any(
+        keyword in lowered for keyword in ("pv", "kv")
+    )
 
 
 def collect_missevan_episode_intro_candidates(

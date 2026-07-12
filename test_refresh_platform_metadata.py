@@ -497,8 +497,9 @@ class MissevanBatchIntroTests(unittest.TestCase):
         rows = [
             {"sound_id": 10, "title": "先导篇", "intro": "<p>配音组</p><p>角色甲：已有CV</p>"},
             {"sound_id": 20, "title": "主题曲", "intro": "<p>配音组</p><p>角色乙：CV乙</p>"},
-            {"sound_id": 30, "title": "pv预告", "intro": "<p>配音组</p><p>角色丙：CV丙</p>"},
-            {"sound_id": 40, "title": "普通正剧", "intro": "<p>配音组</p><p>角色丁：CV丁</p>"},
+            {"sound_id": 30, "title": "kv角色展", "intro": "<p>配音组</p><p>角色丙：CV丙</p>"},
+            {"sound_id": 40, "title": "PV预告", "intro": "<p>配音组</p><p>角色丁：CV丁</p>"},
+            {"sound_id": 50, "title": "普通正剧", "intro": "<p>配音组</p><p>角色戊：CV戊</p>"},
         ]
 
         candidates = refresh_platform_metadata.collect_missevan_episode_intro_candidates(
@@ -508,6 +509,10 @@ class MissevanBatchIntroTests(unittest.TestCase):
         )
 
         self.assertEqual([item["display_name"] for item in candidates], ["CV乙", "CV丙"])
+
+    def test_preview_title_matches_kv_case_insensitively(self) -> None:
+        self.assertTrue(refresh_platform_metadata.is_missevan_preview_intro_title("角色KV"))
+        self.assertTrue(refresh_platform_metadata.is_missevan_preview_intro_title("角色kv"))
 
     def test_all_age_keeps_direct_cvs_then_fills_showcase_and_preview_to_four(self) -> None:
         combined_map = {}
