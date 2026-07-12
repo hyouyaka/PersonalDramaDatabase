@@ -234,6 +234,11 @@ def normalize(value: object) -> str:
     return " ".join(str(value).split()).strip()
 
 
+def is_numeric_drama_id(value: object) -> bool:
+    text = normalize(value)
+    return bool(text) and text.isascii() and text.isdigit()
+
+
 def normalize_match(value: object) -> str:
     return re.sub(r"\s+", "", normalize(value)).casefold()
 
@@ -307,6 +312,47 @@ def missevan_main_cv_entries(node: dict) -> list[dict]:
             }
         )
     return entries
+
+
+def replace_missevan_main_cv_ids(store: dict, replacements: dict[int, int]) -> set[str]:
+    normalized_replacements = {int(old): int(new) for old, new in replacements.items() if int(old) != int(new)}
+    affected_drama_ids: set[str] = set()
+    if not normalized_replacements:
+        return affected_drama_ids
+
+    for _title, _season, node in iter_missevan_nodes(store or {}):
+        original_ids = node.get("maincvs") or []
+        next_ids: list[int] = []
+        changed = False
+        cvnames = dict(node.get("cvnames") or {})
+        cvroles = dict(node.get("cvroles") or {})
+        for raw_id in original_ids:
+            try:
+                old_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            new_id = normalized_replacements.get(old_id, old_id)
+            changed = changed or new_id != old_id
+            if new_id not in next_ids:
+                next_ids.append(new_id)
+            if new_id != old_id:
+                old_key = str(old_id)
+                new_key = str(new_id)
+                old_name = cvnames.pop(old_key, None)
+                old_role = cvroles.pop(old_key, None)
+                if old_name and not cvnames.get(new_key):
+                    cvnames[new_key] = old_name
+                if old_role and not cvroles.get(new_key):
+                    cvroles[new_key] = old_role
+        if not changed:
+            continue
+        node["maincvs"] = next_ids
+        node["cvnames"] = cvnames
+        node["cvroles"] = cvroles
+        drama_id = normalize(node.get("dramaId"))
+        if drama_id:
+            affected_drama_ids.add(drama_id)
+    return affected_drama_ids
 
 
 def to_beijing_month(ts: int | float | None, *, milliseconds: bool = False) -> str:

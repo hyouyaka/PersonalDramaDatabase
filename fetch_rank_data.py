@@ -23,6 +23,7 @@ from platform_sync import (
     MISSEVAN_CATALOG_NAME_BY_ID,
     MissevanRequester,
     load_json,
+    is_numeric_drama_id,
     missevan_main_cv_entries,
     normalize,
     request_manbo_json,
@@ -180,6 +181,16 @@ def append_new_drama_ids_atomic(missevan_ids: list[str], manbo_ids: list[str]) -
     """Atomically merge new drama IDs into Upstash queue."""
     if not missevan_ids and not manbo_ids:
         return
+    invalid_missevan = [str(value) for value in missevan_ids if not is_numeric_drama_id(value)]
+    invalid_manbo = [str(value) for value in manbo_ids if not is_numeric_drama_id(value)]
+    if invalid_missevan or invalid_manbo:
+        print(
+            "[warn] ignored invalid drama IDs:",
+            f"missevan={invalid_missevan}",
+            f"manbo={invalid_manbo}",
+        )
+    missevan_ids = [str(value) for value in missevan_ids if is_numeric_drama_id(value)]
+    manbo_ids = [str(value) for value in manbo_ids if is_numeric_drama_id(value)]
     script = r'''
 local raw = redis.call("GET", KEYS[1])
 local queue = {missevan = {}, manbo = {}}
@@ -194,14 +205,14 @@ local function merge(field, additions_json)
   local merged = {}
   for _, value in ipairs(queue[field] or {}) do
     local text = tostring(value)
-    if not seen[text] then
+    if string.match(text, "^%d+$") and not seen[text] then
       seen[text] = true
       table.insert(merged, text)
     end
   end
   for _, value in ipairs(cjson.decode(additions_json)) do
     local text = tostring(value)
-    if not seen[text] then
+    if string.match(text, "^%d+$") and not seen[text] then
       seen[text] = true
       table.insert(merged, text)
     end
@@ -1924,6 +1935,11 @@ def lookup_cvs(store: dict) -> None:
 
     # Missevan CV lookup
     for drama_id, entry in missevan_dramas.items():
+        if not is_numeric_drama_id(drama_id):
+            print(f"  [upstash] WARN: ignored invalid 猫耳 dramaId={drama_id!r}")
+            entry.setdefault("maincvs", None)
+            update_metadata_fields(entry, catalog_name=None, pay_status=None, create_time=None)
+            continue
         node = missevan_info.get(str(drama_id))
         if node:
             entry["maincvs"] = [
@@ -1936,6 +1952,8 @@ def lookup_cvs(store: dict) -> None:
                 pay_status=pay_status_from_metadata(node),
                 create_time=metadata_create_time(node),
             )
+            if not normalize(node.get("cover")):
+                new_missevan.append(str(drama_id))
         else:
             entry.setdefault("maincvs", None)
             update_metadata_fields(entry, catalog_name=None, pay_status=None, create_time=None)
@@ -1943,6 +1961,11 @@ def lookup_cvs(store: dict) -> None:
 
     # Manbo CV lookup
     for drama_id, entry in manbo_dramas.items():
+        if not is_numeric_drama_id(drama_id):
+            print(f"  [upstash] WARN: ignored invalid 漫播 dramaId={drama_id!r}")
+            entry.setdefault("maincvs", None)
+            update_metadata_fields(entry, catalog_name=None, pay_status=None, create_time=None)
+            continue
         record = manbo_by_id.get(drama_id)
         if record:
             entry["maincvs"] = manbo_main_cv_names(record)
@@ -1952,6 +1975,8 @@ def lookup_cvs(store: dict) -> None:
                 pay_status=pay_status_from_metadata(record),
                 create_time=metadata_create_time(record),
             )
+            if not normalize(record.get("cover")):
+                new_manbo.append(drama_id)
         else:
             entry.setdefault("maincvs", None)
             update_metadata_fields(entry, catalog_name=None, pay_status=None, create_time=None)

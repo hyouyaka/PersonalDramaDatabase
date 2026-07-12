@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -12,10 +13,12 @@ import requests
 
 from platform_sync import (
     COMBINED_CVID_MAP_PATH,
+    MANBO_COUNTS_PATH,
     MANBO_INFO_PATH,
     MISSEVAN_INFO_PATH,
     SERIES_INFO_PATH,
     iter_missevan_nodes,
+    is_numeric_drama_id,
     load_json,
     missevan_main_cv_entries,
     normalize,
@@ -37,6 +40,14 @@ INFO_UPLOAD_MIN_COUNTS = {
     MANBO_INFO_KEY: 50,
 }
 ALLOW_SMALL_INFO_UPLOAD_ENV = "ALLOW_SMALL_INFO_UPLOAD"
+INVALID_MANBO_ID_CLEANUP_SCRIPT = """
+local current = redis.call('GET', KEYS[1])
+if not current or redis.sha1hex(current) ~= ARGV[1] then
+  return 0
+end
+redis.call('SET', KEYS[1], ARGV[2])
+return 1
+"""
 
 
 class RemoteJsonMissing(RuntimeError):
@@ -90,17 +101,23 @@ def load_queue() -> dict[str, list[str]]:
         raise RuntimeError(f"Unsupported payload type for {QUEUE_KEY}: {type(raw).__name__}")
     if not isinstance(data, dict):
         raise RuntimeError(f"{QUEUE_KEY} must be a JSON object.")
+    raw_manbo = normalize_ids(data.get("manbo") or [], numeric_only=False)
+    raw_missevan = normalize_ids(data.get("missevan") or [], numeric_only=False)
+    invalid_manbo = [value for value in raw_manbo if not is_numeric_drama_id(value)]
+    invalid_missevan = [value for value in raw_missevan if not is_numeric_drama_id(value)]
+    if invalid_manbo or invalid_missevan:
+        print(f"[warn] ignored invalid queue IDs: manbo={invalid_manbo} missevan={invalid_missevan}")
     return {
-        "manbo": normalize_ids(data.get("manbo") or []),
-        "missevan": normalize_ids(data.get("missevan") or []),
+        "manbo": [value for value in raw_manbo if is_numeric_drama_id(value)],
+        "missevan": [value for value in raw_missevan if is_numeric_drama_id(value)],
     }
 
 
-def normalize_ids(values: list[object]) -> list[str]:
+def normalize_ids(values: list[object], *, numeric_only: bool = True) -> list[str]:
     out: list[str] = []
     for value in values:
         item = normalize(value)
-        if item and item not in out:
+        if item and (not numeric_only or is_numeric_drama_id(item)) and item not in out:
             out.append(item)
     return out
 
@@ -320,12 +337,15 @@ def sync_remote_watchcount_if_newer(
     *,
     upstash=upstash_request,
     force: bool = False,
+    require_remote: bool = False,
 ) -> bool:
     key = watchcount_key(platform, "latest")
     local_payload = load_watchcount_payload(path)
     try:
         remote_payload = decode_remote_watchcount_payload(key, upstash(["GET", key]))
     except RemoteJsonMissing:
+        if require_remote:
+            raise RuntimeError(f"Refusing to continue: {key} is empty or missing")
         print(f"[skip] {key}: remote value is empty or missing")
         return False
 
@@ -536,6 +556,8 @@ def is_manbo_ready(record: dict | None) -> bool:
         return False
     if not normalize(record.get("genre")):
         return False
+    if not normalize(record.get("cover")):
+        return False
     if "vipFree" not in record:
         return False
     return len(record.get("mainCvNicknames") or []) >= 2
@@ -546,8 +568,16 @@ def prune_queue(queue: dict[str, list[str]]) -> dict[str, list[str]]:
     manbo_store = load_json(MANBO_INFO_PATH, {"records": []})
     missevan_index = build_missevan_index(missevan_store)
     manbo_index = build_manbo_index(manbo_store)
-    remaining_missevan = [drama_id for drama_id in queue.get("missevan", []) if not is_missevan_ready(missevan_index.get(drama_id))]
-    remaining_manbo = [drama_id for drama_id in queue.get("manbo", []) if not is_manbo_ready(manbo_index.get(drama_id))]
+    remaining_missevan = [
+        drama_id
+        for drama_id in queue.get("missevan", [])
+        if is_numeric_drama_id(drama_id) and not is_missevan_ready(missevan_index.get(drama_id))
+    ]
+    remaining_manbo = [
+        drama_id
+        for drama_id in queue.get("manbo", [])
+        if is_numeric_drama_id(drama_id) and not is_manbo_ready(manbo_index.get(drama_id))
+    ]
     return {"manbo": remaining_manbo, "missevan": remaining_missevan}
 
 
@@ -607,6 +637,94 @@ def backfill_rank_metadata(platforms: tuple[str, ...]) -> None:
     print("[ok] backfilled rank metadata")
 
 
+def cleanup_invalid_manbo_ids(
+    *,
+    upstash=upstash_request,
+    info_path: Path = MANBO_INFO_PATH,
+    counts_path: Path = MANBO_COUNTS_PATH,
+    backup_dir: Path | None = None,
+) -> dict[str, int]:
+    target_dir = backup_dir or (ROOT / "recovery_backups")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    specs = (
+        (QUEUE_KEY, "queue"),
+        (MANBO_INFO_KEY, "info"),
+        (watchcount_key("manbo", "latest"), "watchcount"),
+    )
+    cleaned_payloads: dict[str, dict] = {}
+    removed: dict[str, int] = {}
+    for key, kind in specs:
+        raw = upstash(["GET", key])
+        if not isinstance(raw, str) or not raw:
+            raise RuntimeError(f"Refusing to clean {key}: remote payload is empty or unsupported")
+        payload = decode_remote_json_payload(key, raw)
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Refusing to clean {key}: expected a JSON object")
+        backup_path = target_dir / f"{stamp}_{key.replace(':', '-')}.json"
+        backup_path.write_text(raw, encoding="utf-8")
+
+        cleaned = dict(payload)
+        if kind == "queue":
+            values = list(payload.get("manbo") or [])
+            valid = [str(value) for value in values if is_numeric_drama_id(value)]
+            cleaned["manbo"] = list(dict.fromkeys(valid))
+            removed[kind] = len(values) - len(cleaned["manbo"])
+        elif kind == "info":
+            records = list(payload.get("records") or [])
+            cleaned["records"] = [
+                record
+                for record in records
+                if isinstance(record, dict) and is_numeric_drama_id(record.get("dramaId"))
+            ]
+            removed[kind] = len(records) - len(cleaned["records"])
+        else:
+            counts = payload.get("counts")
+            if not isinstance(counts, dict):
+                raise RuntimeError(f"Refusing to clean {key}: missing counts object")
+            cleaned["counts"] = {
+                str(drama_id): entry
+                for drama_id, entry in counts.items()
+                if is_numeric_drama_id(drama_id)
+            }
+            removed[kind] = len(counts) - len(cleaned["counts"])
+
+        encoded = json.dumps(cleaned, ensure_ascii=False, separators=(",", ":"))
+        result = upstash(
+            [
+                "EVAL",
+                INVALID_MANBO_ID_CLEANUP_SCRIPT,
+                1,
+                key,
+                hashlib.sha1(raw.encode("utf-8")).hexdigest(),
+                encoded,
+            ]
+        )
+        if int(result or 0) != 1:
+            raise RuntimeError(f"Refusing to clean {key}: remote payload changed concurrently")
+        verified_raw = upstash(["GET", key])
+        if not isinstance(verified_raw, str):
+            raise RuntimeError(f"Failed to verify cleaned {key}")
+        verified = decode_remote_json_payload(key, verified_raw)
+        if kind == "queue":
+            invalid = [value for value in (verified.get("manbo") or []) if not is_numeric_drama_id(value)]
+        elif kind == "info":
+            invalid = [
+                record.get("dramaId")
+                for record in (verified.get("records") or [])
+                if not isinstance(record, dict) or not is_numeric_drama_id(record.get("dramaId"))
+            ]
+        else:
+            invalid = [value for value in (verified.get("counts") or {}) if not is_numeric_drama_id(value)]
+        if invalid:
+            raise RuntimeError(f"Failed to clean {key}: invalid drama IDs remain: {invalid}")
+        cleaned_payloads[kind] = verified
+
+    write_json_work_copy(info_path, cleaned_payloads["info"])
+    write_json_work_copy(counts_path, cleaned_payloads["watchcount"])
+    return removed
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sync queued new drama IDs into platform info stores")
     parser.add_argument(
@@ -620,6 +738,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help=f"Upload local drama series info to {SERIES_INFO_KEY}",
     )
+    parser.add_argument(
+        "--cleanup-invalid-manbo-ids",
+        action="store_true",
+        help="Remove non-numeric 漫播 dramaIds from the active queue, info store, and latest watchcount",
+    )
     return parser.parse_args(argv)
 
 
@@ -627,6 +750,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args([] if argv is None else argv)
     configure_stdio()
     load_env_file(ROOT / ".env")
+    if args.cleanup_invalid_manbo_ids:
+        stats = cleanup_invalid_manbo_ids()
+        print("[ok] cleaned invalid 漫播 dramaIds:", json.dumps(stats, ensure_ascii=False))
+        return 0
     if args.upload_cv_map:
         upload_json_file(CVID_MAP_KEY, COMBINED_CVID_MAP_PATH)
     if args.upload_series_info:

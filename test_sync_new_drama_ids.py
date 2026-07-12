@@ -8,6 +8,17 @@ import sync_new_drama_ids
 
 
 class RemoteJsonBackupTests(unittest.TestCase):
+    def test_load_queue_filters_non_numeric_ids(self) -> None:
+        payload = {"manbo": ["200", "drama-1"], "missevan": ["100", "bad"]}
+        with unittest.mock.patch.object(
+            sync_new_drama_ids,
+            "upstash_request",
+            return_value=json.dumps(payload),
+        ), unittest.mock.patch("builtins.print"):
+            queue = sync_new_drama_ids.load_queue()
+
+        self.assertEqual(queue, {"manbo": ["200"], "missevan": ["100"]})
+
     def test_remote_missing_initializes_cv_map_from_local_backup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "cvid-map.json"
@@ -244,6 +255,87 @@ class QueueReadyTests(unittest.TestCase):
         }
 
         self.assertTrue(sync_new_drama_ids.is_missevan_ready(record))
+
+    def test_manbo_ready_requires_cover(self) -> None:
+        base = {
+            "name": "漫播剧",
+            "catalog": 1,
+            "createTime": "2026-06-10",
+            "genre": "广播剧",
+            "cover": "https://example.test/cover.jpg",
+            "vipFree": False,
+            "mainCvNicknames": ["甲", "乙"],
+        }
+
+        self.assertTrue(sync_new_drama_ids.is_manbo_ready(base))
+        without_cover = dict(base)
+        without_cover["cover"] = ""
+        self.assertFalse(sync_new_drama_ids.is_manbo_ready(without_cover))
+
+    def test_required_remote_watchcount_rejects_missing_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "counts.json"
+            path.write_text('{"_meta":{"updated_at":"2026-07-10T00:00:00+00:00"},"counts":{}}', encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "empty or missing"):
+                sync_new_drama_ids.sync_remote_watchcount_if_newer(
+                    "missevan",
+                    path,
+                    upstash=Mock(return_value=None),
+                    force=True,
+                    require_remote=True,
+                )
+
+
+class InvalidManboIdCleanupTests(unittest.TestCase):
+    def test_cleanup_removes_invalid_ids_from_active_remote_stores_and_local_copies(self) -> None:
+        remote = {
+            sync_new_drama_ids.QUEUE_KEY: json.dumps(
+                {"manbo": ["200", "drama-1"], "missevan": ["100"]}, ensure_ascii=False
+            ),
+            sync_new_drama_ids.MANBO_INFO_KEY: json.dumps(
+                {"version": 1, "records": [{"dramaId": "200"}, {"dramaId": "drama-1"}]}, ensure_ascii=False
+            ),
+            "manbo:watchcount:latest": json.dumps(
+                {"_meta": {}, "counts": {"200": {"view_count": 1}, "drama-1": {"view_count": None}}},
+                ensure_ascii=False,
+            ),
+        }
+
+        def fake_upstash(command):
+            if command[0] == "GET":
+                return remote[command[1]]
+            if command[0] == "EVAL":
+                key = command[3]
+                remote[key] = command[5]
+                return 1
+            raise AssertionError(command)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            info_path = Path(tmp) / "manbo-info.json"
+            counts_path = Path(tmp) / "manbo-counts.json"
+            stats = sync_new_drama_ids.cleanup_invalid_manbo_ids(
+                upstash=fake_upstash,
+                info_path=info_path,
+                counts_path=counts_path,
+                backup_dir=Path(tmp) / "backups",
+            )
+
+            self.assertEqual(stats, {"queue": 1, "info": 1, "watchcount": 1})
+            self.assertEqual(json.loads(remote[sync_new_drama_ids.QUEUE_KEY])["manbo"], ["200"])
+            self.assertEqual(json.loads(remote[sync_new_drama_ids.MANBO_INFO_KEY])["records"], [{"dramaId": "200"}])
+            self.assertEqual(list(json.loads(remote["manbo:watchcount:latest"])["counts"]), ["200"])
+            self.assertEqual(json.loads(info_path.read_text(encoding="utf-8"))["records"], [{"dramaId": "200"}])
+            self.assertEqual(list(json.loads(counts_path.read_text(encoding="utf-8"))["counts"]), ["200"])
+            self.assertEqual(len(list((Path(tmp) / "backups").glob("*.json"))), 3)
+
+    def test_cleanup_stops_on_compare_and_set_conflict(self) -> None:
+        queue = json.dumps({"manbo": ["drama-1"], "missevan": []})
+        upstash = Mock(side_effect=[queue, 0])
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(RuntimeError, "changed concurrently"):
+            sync_new_drama_ids.cleanup_invalid_manbo_ids(upstash=upstash, backup_dir=Path(tmp))
+
+        self.assertEqual(upstash.call_args_list[1].args[0][0], "EVAL")
 
 
 if __name__ == "__main__":

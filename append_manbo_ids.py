@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 
 from cvid_map_tools import BestEffortAvatarLookup, CvAvatarLookup, update_combined_cvid_map
-from platform_sync import load_json, MANBO_INFO_PATH, MISSEVAN_INFO_PATH
+from platform_sync import is_numeric_drama_id, load_json, MANBO_INFO_PATH, MISSEVAN_INFO_PATH
 from refresh_platform_metadata import upsert_manbo_drama_ids
 from sync_new_drama_ids import (
     MANBO_INFO_KEY,
@@ -20,6 +20,10 @@ def main(argv: list[str]) -> int:
     if not drama_ids:
         print("Usage: python append_manbo_ids.py <drama_id> [<drama_id> ...]")
         return 1
+    invalid_ids = [drama_id for drama_id in drama_ids if not is_numeric_drama_id(drama_id)]
+    if invalid_ids:
+        print("Invalid 漫播 dramaId (ASCII digits required):", ", ".join(invalid_ids))
+        return 1
     load_env_file(ROOT / ".env")
     download_info_file(MANBO_INFO_KEY, MANBO_INFO_PATH)
     target_drama_ids = set(drama_ids)
@@ -30,6 +34,11 @@ def main(argv: list[str]) -> int:
         1
         for record in records
         if str(record.get("dramaId") or "") in target_drama_ids and record.get("mainCvNames") is not None
+    )
+    synced_covers = sum(
+        1
+        for record in records
+        if str(record.get("dramaId") or "") in target_drama_ids and str(record.get("cover") or "").strip()
     )
     map_stats = update_combined_cvid_map(
         load_json(MISSEVAN_INFO_PATH, {}),
@@ -44,6 +53,7 @@ def main(argv: list[str]) -> int:
     print("漫播 processed:", stats["processed"])
     print("漫播 watch counts updated:", stats["processed"])
     print("漫播 mainCvNames synced:", synced_main_cv_names)
+    print("漫播 covers synced:", synced_covers)
     print("cvid map updated:", map_stats["updated"])
     print("cvid map created:", map_stats["created"])
     print("cvid map unchanged:", map_stats["unchanged"])

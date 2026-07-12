@@ -767,6 +767,118 @@ class BuildCvRanksTests(unittest.TestCase):
         self.assertTrue(sync_watchcounts.call_args.kwargs["force"])
         self.assertNotIn("force", sync_rank_inputs.call_args.kwargs)
 
+    def test_upload_forces_and_requires_remote_watchcounts_before_any_set(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = {
+                "missevan_info_path": self.write_json(tmp, "missevan.json", {}),
+                "manbo_info_path": self.write_json(tmp, "manbo.json", {"records": []}),
+                "missevan_counts_path": self.write_json(tmp, "missevan-counts.json", {"_meta": {}, "counts": {}}),
+                "manbo_counts_path": self.write_json(tmp, "manbo-counts.json", {"_meta": {}, "counts": {}}),
+                "cvid_map_path": self.write_json(tmp, "map.json", {}),
+                "output_path": Path(tmp) / "ranks-cv.json",
+            }
+            upstash = Mock()
+            with patch.object(build_cv_ranks, "sync_remote_watchcount_inputs", side_effect=RuntimeError("missing remote")) as sync:
+                with self.assertRaisesRegex(RuntimeError, "missing remote"):
+                    build_cv_ranks.build_and_publish_cv_ranks(**paths, upstash=upstash, upload=True)
+
+        self.assertTrue(sync.call_args.kwargs["force"])
+        self.assertTrue(sync.call_args.kwargs["require_remote"])
+        upstash.assert_not_called()
+
+    def test_cleanup_trend_samples_is_exact_and_idempotent(self) -> None:
+        incident = "2026-07-11T22:18:05+00:00"
+        payload = {
+            "updated_at": incident,
+            "dates": ["2026-07-10", "2026-07-11"],
+            "cvs": {
+                "甲": {
+                    "samples": {
+                        "2026-07-10": {"generated_at": "2026-07-10T04:06:41+00:00", "metrics": {"totalViewCount": 1}},
+                        "2026-07-11": {"generated_at": incident, "metrics": {"totalViewCount": 2}},
+                    }
+                },
+                "乙": {"samples": {"2026-07-11": {"generated_at": incident, "metrics": {"totalViewCount": 3}}}},
+                "丙": {"samples": {"2026-07-11": {"generated_at": "2026-07-11T23:00:00+00:00", "metrics": {"totalViewCount": 4}}}},
+                "原本为空": {"samples": {}, "works": []},
+                "格式异常": {"samples": None, "works": []},
+            },
+        }
+
+        cleaned, stats = build_cv_ranks.remove_cv_trend_samples_by_generated_at(payload, incident)
+        cleaned_twice, second_stats = build_cv_ranks.remove_cv_trend_samples_by_generated_at(cleaned, incident)
+
+        self.assertEqual(stats, {"removed_samples": 2, "removed_cvs": 1})
+        self.assertNotIn("乙", cleaned["cvs"])
+        self.assertIn("丙", cleaned["cvs"])
+        self.assertEqual(cleaned["cvs"]["原本为空"], {"samples": {}, "works": []})
+        self.assertEqual(cleaned["cvs"]["格式异常"], {"samples": None, "works": []})
+        self.assertEqual(cleaned["dates"], ["2026-07-10", "2026-07-11"])
+        self.assertEqual(cleaned["updated_at"], "2026-07-11T23:00:00+00:00")
+        self.assertEqual(cleaned_twice, cleaned)
+        self.assertEqual(second_stats, {"removed_samples": 0, "removed_cvs": 0})
+
+    def test_remote_cleanup_aborts_when_payload_changes_before_atomic_write(self) -> None:
+        incident = "2026-07-11T22:18:05+00:00"
+        original = json.dumps(
+            {
+                "updated_at": incident,
+                "dates": ["2026-07-11"],
+                "cvs": {"甲": {"samples": {"2026-07-11": {"generated_at": incident, "metrics": {"totalViewCount": 1}}}}},
+            },
+            ensure_ascii=False,
+        )
+        upstash = Mock(side_effect=[original, 0])
+
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(RuntimeError, "changed concurrently"):
+            build_cv_ranks.cleanup_remote_cv_trends_by_generated_at(
+                incident,
+                upstash=upstash,
+                backup_dir=Path(tmp),
+            )
+
+        command = upstash.call_args_list[1].args[0]
+        self.assertEqual(command[:4], ["EVAL", build_cv_ranks.CV_TREND_COMPARE_AND_SET_SCRIPT, 1, "ranks:trend:cv:missevan"])
+
+    def test_remote_cleanup_verification_tolerates_non_dict_cv_entries(self) -> None:
+        incident = "2026-07-11T22:18:05+00:00"
+        original = json.dumps(
+            {
+                "updated_at": incident,
+                "dates": ["2026-07-11"],
+                "cvs": {
+                    "异常条目": "legacy",
+                    "异常 samples": {"samples": ["legacy"]},
+                    "甲": {"samples": {"2026-07-11": {"generated_at": incident}}},
+                },
+            },
+            ensure_ascii=False,
+        )
+        stored = {build_cv_ranks.CV_TREND_KEYS[platform]: original for platform in build_cv_ranks.PLATFORMS}
+
+        def fake_upstash(command):
+            if command[0] == "GET":
+                key = command[1]
+                return stored[key]
+            if command[0] == "EVAL":
+                key = command[3]
+                stored[key] = command[5]
+                return 1
+            raise AssertionError(command)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            results = build_cv_ranks.cleanup_remote_cv_trends_by_generated_at(
+                incident,
+                upstash=fake_upstash,
+                backup_dir=Path(tmp),
+            )
+
+        self.assertEqual(results["missevan"]["removed_samples"], 1)
+        self.assertEqual(results["manbo"]["removed_samples"], 1)
+        cleaned = json.loads(stored[build_cv_ranks.CV_TREND_KEYS["missevan"]])
+        self.assertEqual(cleaned["cvs"]["异常条目"], "legacy")
+        self.assertEqual(cleaned["cvs"]["异常 samples"], {"samples": ["legacy"]})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,7 @@
 import json
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -1071,7 +1071,7 @@ class ManboCvLookupTests(unittest.TestCase):
             "missevan": {"dramas": {}},
             "manbo": {
                 "dramas": {
-                    "drama-1": {"name": "测试剧"},
+                    "201": {"name": "测试剧"},
                 }
             },
         }
@@ -1083,7 +1083,7 @@ class ManboCvLookupTests(unittest.TestCase):
                 return {
                     "records": [
                         {
-                            "dramaId": "drama-1",
+                            "dramaId": "201",
                             "mainCvNames": ["规范名甲", ""],
                             "mainCvNicknames": ["接口昵称甲", "接口昵称乙"],
                             "catalog": 1,
@@ -1097,7 +1097,7 @@ class ManboCvLookupTests(unittest.TestCase):
         with patch.object(fetch_rank_data, "_load_upstash_json", side_effect=load_remote), patch("builtins.print"):
             fetch_rank_data.lookup_cvs(store)
 
-        self.assertEqual(store["manbo"]["dramas"]["drama-1"]["maincvs"], ["规范名甲", "接口昵称乙"])
+        self.assertEqual(store["manbo"]["dramas"]["201"]["maincvs"], ["规范名甲", "接口昵称乙"])
 
 
 class MissevanCvLookupTests(unittest.TestCase):
@@ -1124,6 +1124,54 @@ class MissevanCvLookupTests(unittest.TestCase):
             fetch_rank_data.lookup_cvs(store)
 
         self.assertEqual(store["missevan"]["dramas"]["94602"]["maincvs"], ["辰朔", "林风"])
+
+    def test_lookup_cvs_queues_existing_records_with_missing_cover(self) -> None:
+        store = {
+            "missevan": {"dramas": {"100": {"name": "猫耳剧"}}},
+            "manbo": {"dramas": {"200": {"name": "漫播剧"}}},
+        }
+
+        def load_remote(key: str):
+            if key == "missevan:info:v1":
+                return {"100": {"cover": "", "maincvs": [1, 2], "cvnames": {"1": "甲", "2": "乙"}}}
+            if key == "manbo:info:v1":
+                return {"records": [{"dramaId": "200", "cover": "", "mainCvNames": ["丙", "丁"]}]}
+            raise AssertionError(key)
+
+        with (
+            patch.object(fetch_rank_data, "_load_upstash_json", side_effect=load_remote),
+            patch.object(fetch_rank_data, "append_new_drama_ids_atomic") as append_queue,
+            patch("builtins.print"),
+        ):
+            fetch_rank_data.lookup_cvs(store)
+
+        append_queue.assert_called_once_with(["100"], ["200"])
+
+    def test_lookup_cvs_does_not_queue_non_numeric_drama_ids(self) -> None:
+        store = {
+            "missevan": {"dramas": {}},
+            "manbo": {"dramas": {"drama-1": {"name": "测试占位"}, "200": {"name": "有效剧"}}},
+        }
+        with (
+            patch.object(fetch_rank_data, "_load_upstash_json", side_effect=[{}, {"records": []}]),
+            patch.object(fetch_rank_data, "append_new_drama_ids_atomic") as append_queue,
+            patch("builtins.print"),
+        ):
+            fetch_rank_data.lookup_cvs(store)
+
+        append_queue.assert_called_once_with([], ["200"])
+
+
+class QueueDramaIdValidationTests(unittest.TestCase):
+    def test_atomic_append_filters_invalid_inputs_and_cleans_existing_values_in_lua(self) -> None:
+        upstash = Mock(return_value='{"missevan":["100"],"manbo":["200"]}')
+        with patch.object(fetch_rank_data, "upstash_request", upstash), patch("builtins.print"):
+            fetch_rank_data.append_new_drama_ids_atomic(["100", "bad"], ["200", "drama-1"])
+
+        command = upstash.call_args.args[0]
+        self.assertEqual(json.loads(command[-2]), ["100"])
+        self.assertEqual(json.loads(command[-1]), ["200"])
+        self.assertIn('string.match(text, "^%d+$")', command[1])
 
 
 class ManboDanmakuStabilityTests(unittest.TestCase):

@@ -6,10 +6,27 @@ import append_missevan_ids
 
 
 class AppendInfoBackupTests(unittest.TestCase):
-    def test_append_missevan_downloads_only_missevan_info(self) -> None:
+    def test_append_manbo_rejects_non_numeric_id_before_any_remote_work(self) -> None:
+        with (
+            patch.object(append_manbo_ids, "load_env_file") as load_env,
+            patch.object(append_manbo_ids, "download_info_file") as download,
+            patch.object(append_manbo_ids, "upsert_manbo_drama_ids") as upsert,
+            patch("builtins.print"),
+        ):
+            result = append_manbo_ids.main(["append_manbo_ids.py", "drama-1"])
+
+        self.assertEqual(result, 1)
+        load_env.assert_not_called()
+        download.assert_not_called()
+        upsert.assert_not_called()
+
+    def test_append_missevan_downloads_info_and_current_cv_map(self) -> None:
         with (
             patch.object(append_missevan_ids, "load_env_file"),
             patch.object(append_missevan_ids, "download_info_file") as download,
+            patch.object(append_missevan_ids, "download_support_files") as download_support,
+            patch.object(append_missevan_ids, "seed_generated_missevan_cvid_registry", return_value=0),
+            patch.object(append_missevan_ids, "load_generated_missevan_cvid_replacements", return_value={}),
             patch.object(
                 append_missevan_ids,
                 "upsert_missevan_drama_ids",
@@ -19,7 +36,14 @@ class AppendInfoBackupTests(unittest.TestCase):
             patch.object(
                 append_missevan_ids,
                 "update_combined_cvid_map",
-                return_value={"updated": 0, "created": 0, "unchanged": 0, "ambiguous_count": 0, "ambiguous_samples": []},
+                return_value={
+                    "updated": 0,
+                    "created": 0,
+                    "unchanged": 0,
+                    "ambiguous_count": 0,
+                    "ambiguous_samples": [],
+                    "missevan_generated_replacements": {},
+                },
             ),
             patch.object(append_missevan_ids, "merge_and_upload_info_file"),
             patch("builtins.print"),
@@ -27,6 +51,7 @@ class AppendInfoBackupTests(unittest.TestCase):
             self.assertEqual(append_missevan_ids.main(["append_missevan_ids.py", "100"]), 0)
 
         download.assert_called_once_with(append_missevan_ids.MISSEVAN_INFO_KEY, append_missevan_ids.MISSEVAN_INFO_PATH)
+        download_support.assert_called_once_with()
 
     def test_append_manbo_downloads_only_manbo_info(self) -> None:
         with (
@@ -50,11 +75,21 @@ class AppendInfoBackupTests(unittest.TestCase):
         def fake_update(*args, avatar_lookup=None, **kwargs):
             self.assertIsNotNone(avatar_lookup)
             self.assertEqual(avatar_lookup("猫耳", 11), "")
-            return {"updated": 0, "created": 1, "unchanged": 0, "ambiguous_count": 0, "ambiguous_samples": []}
+            return {
+                "updated": 0,
+                "created": 1,
+                "unchanged": 0,
+                "ambiguous_count": 0,
+                "ambiguous_samples": [],
+                "missevan_generated_replacements": {},
+            }
 
         with (
             patch.object(append_missevan_ids, "load_env_file"),
             patch.object(append_missevan_ids, "download_info_file"),
+            patch.object(append_missevan_ids, "download_support_files"),
+            patch.object(append_missevan_ids, "seed_generated_missevan_cvid_registry", return_value=0),
+            patch.object(append_missevan_ids, "load_generated_missevan_cvid_replacements", return_value={}),
             patch.object(
                 append_missevan_ids,
                 "upsert_missevan_drama_ids",
@@ -69,6 +104,82 @@ class AppendInfoBackupTests(unittest.TestCase):
             self.assertEqual(append_missevan_ids.main(["append_missevan_ids.py", "100"]), 0)
 
         merge.assert_called_once_with(append_missevan_ids.MISSEVAN_INFO_KEY, append_missevan_ids.MISSEVAN_INFO_PATH, ["100"])
+
+    def test_append_missevan_uploads_all_dramas_affected_by_generated_id_upgrade(self) -> None:
+        map_stats = {
+            "updated": 1,
+            "created": 0,
+            "unchanged": 0,
+            "ambiguous_count": 0,
+            "ambiguous_samples": [],
+            "missevan_generated_replacements": {331111: 1234},
+        }
+        with (
+            patch.object(append_missevan_ids, "load_env_file"),
+            patch.object(append_missevan_ids, "download_info_file"),
+            patch.object(append_missevan_ids, "download_support_files"),
+            patch.object(append_missevan_ids, "seed_generated_missevan_cvid_registry", return_value=0),
+            patch.object(append_missevan_ids, "load_generated_missevan_cvid_replacements", return_value={}),
+            patch.object(
+                append_missevan_ids,
+                "upsert_missevan_drama_ids",
+                return_value={"processed": 1, "request_count": 0, "last_backoff_seconds": 0},
+            ),
+            patch.object(append_missevan_ids, "load_json", return_value={}),
+            patch.object(append_missevan_ids, "update_combined_cvid_map", return_value=map_stats),
+            patch.object(append_missevan_ids, "replace_missevan_main_cv_ids", return_value={"101"}) as migrate,
+            patch.object(append_missevan_ids, "save_missevan_store"),
+            patch.object(append_missevan_ids, "merge_and_upload_info_file") as merge,
+            patch("builtins.print"),
+        ):
+            self.assertEqual(append_missevan_ids.main(["append_missevan_ids.py", "100"]), 0)
+
+        migrate.assert_called_once_with({}, {331111: 1234})
+        merge.assert_called_once_with(
+            append_missevan_ids.MISSEVAN_INFO_KEY,
+            append_missevan_ids.MISSEVAN_INFO_PATH,
+            ["100", "101"],
+        )
+
+    def test_append_missevan_retries_persisted_generated_id_migration(self) -> None:
+        map_stats = {
+            "updated": 0,
+            "created": 0,
+            "unchanged": 0,
+            "ambiguous_count": 0,
+            "ambiguous_samples": [],
+            "missevan_generated_replacements": {331111: 1234},
+        }
+        with (
+            patch.object(append_missevan_ids, "load_env_file"),
+            patch.object(append_missevan_ids, "download_info_file"),
+            patch.object(append_missevan_ids, "download_support_files"),
+            patch.object(append_missevan_ids, "seed_generated_missevan_cvid_registry", return_value=0),
+            patch.object(
+                append_missevan_ids,
+                "load_generated_missevan_cvid_replacements",
+                return_value={331111: 1234},
+            ),
+            patch.object(
+                append_missevan_ids,
+                "upsert_missevan_drama_ids",
+                return_value={"processed": 1, "request_count": 0, "last_backoff_seconds": 0},
+            ),
+            patch.object(append_missevan_ids, "load_json", return_value={}),
+            patch.object(append_missevan_ids, "update_combined_cvid_map", return_value=map_stats),
+            patch.object(append_missevan_ids, "replace_missevan_main_cv_ids", return_value={"101"}) as migrate,
+            patch.object(append_missevan_ids, "save_missevan_store"),
+            patch.object(append_missevan_ids, "merge_and_upload_info_file") as merge,
+            patch("builtins.print"),
+        ):
+            self.assertEqual(append_missevan_ids.main(["append_missevan_ids.py", "100"]), 0)
+
+        migrate.assert_called_once_with({}, {331111: 1234})
+        merge.assert_called_once_with(
+            append_missevan_ids.MISSEVAN_INFO_KEY,
+            append_missevan_ids.MISSEVAN_INFO_PATH,
+            ["100", "101"],
+        )
 
 
 if __name__ == "__main__":

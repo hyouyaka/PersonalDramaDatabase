@@ -26,6 +26,23 @@ class MissevanLogicalMainCvTests(unittest.TestCase):
             ],
         )
 
+    def test_replaces_generated_ids_across_missevan_nodes(self) -> None:
+        store = {
+            "100": {
+                "dramaId": 100,
+                "maincvs": [331111, 22],
+                "cvnames": {"331111": "林风", "22": "其他"},
+                "cvroles": {"331111": "角色甲", "22": "角色乙"},
+            },
+            "101": {"dramaId": 101, "maincvs": [331111], "cvnames": {"331111": "林风"}},
+        }
+
+        affected = platform_sync.replace_missevan_main_cv_ids(store, {331111: 1234})
+
+        self.assertEqual(affected, {"100", "101"})
+        self.assertEqual(store["100"]["maincvs"], [1234, 22])
+        self.assertEqual(store["100"]["cvnames"]["1234"], "林风")
+        self.assertEqual(store["100"]["cvroles"]["1234"], "角色甲")
 
 class ManboCvEntryTests(unittest.TestCase):
     def test_build_manbo_cv_entries_uses_top_level_cv_id_when_profile_id_missing(self) -> None:

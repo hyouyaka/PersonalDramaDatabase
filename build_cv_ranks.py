@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from datetime import datetime, timezone
@@ -34,6 +35,14 @@ CV_TREND_KEYS = {
     "manbo": "ranks:trend:cv:manbo",
 }
 CV_TREND_RETENTION_DATES = 50
+CV_TREND_COMPARE_AND_SET_SCRIPT = """
+local current = redis.call('GET', KEYS[1])
+if not current or redis.sha1hex(current) ~= ARGV[1] then
+  return 0
+end
+redis.call('SET', KEYS[1], ARGV[2])
+return 1
+"""
 
 
 def now_iso() -> str:
@@ -551,6 +560,100 @@ def upload_cv_trends(
     return payloads
 
 
+def remove_cv_trend_samples_by_generated_at(payload: dict, generated_at: str) -> tuple[dict, dict[str, int]]:
+    cleaned = json.loads(json.dumps(payload, ensure_ascii=False))
+    cvs = cleaned.get("cvs")
+    if not isinstance(cvs, dict):
+        cvs = {}
+    removed_samples = 0
+    removed_cvs = 0
+    remaining_generated_at: list[str] = []
+    remaining_dates: set[str] = set()
+    kept_cvs: dict[str, object] = {}
+    for cv_name, raw_entry in cvs.items():
+        if not isinstance(raw_entry, dict):
+            kept_cvs[str(cv_name)] = raw_entry
+            continue
+        entry = dict(raw_entry)
+        samples = entry.get("samples")
+        if not isinstance(samples, dict):
+            kept_cvs[str(cv_name)] = entry
+            continue
+        kept_samples: dict[str, dict] = {}
+        removed_from_entry = 0
+        for date_key, sample in samples.items():
+            if isinstance(sample, dict) and sample.get("generated_at") == generated_at:
+                removed_samples += 1
+                removed_from_entry += 1
+                continue
+            kept_samples[str(date_key)] = sample
+            remaining_dates.add(str(date_key))
+            if isinstance(sample, dict) and normalize(sample.get("generated_at")):
+                remaining_generated_at.append(normalize(sample.get("generated_at")))
+        if removed_from_entry and not kept_samples:
+            removed_cvs += 1
+            continue
+        entry["samples"] = kept_samples
+        kept_cvs[str(cv_name)] = entry
+    cleaned["cvs"] = kept_cvs
+    cleaned["dates"] = sorted(remaining_dates)
+    cleaned["updated_at"] = max(remaining_generated_at) if remaining_generated_at else None
+    return cleaned, {"removed_samples": removed_samples, "removed_cvs": removed_cvs}
+
+
+def cleanup_remote_cv_trends_by_generated_at(
+    generated_at: str,
+    *,
+    upstash=upstash_request,
+    backup_dir: Path | None = None,
+) -> dict[str, dict[str, object]]:
+    target_dir = backup_dir or (ROOT / "recovery_backups")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    results: dict[str, dict[str, object]] = {}
+    for platform in PLATFORMS:
+        key = CV_TREND_KEYS[platform]
+        raw = upstash(["GET", key])
+        if not isinstance(raw, str) or not raw:
+            raise RuntimeError(f"Refusing to clean {key}: remote payload is empty or unsupported")
+        payload = json.loads(raw)
+        backup_path = target_dir / f"{stamp}_{key.replace(':', '-')}.json"
+        backup_path.write_text(raw, encoding="utf-8")
+        cleaned, stats = remove_cv_trend_samples_by_generated_at(payload, generated_at)
+        encoded = json.dumps(cleaned, ensure_ascii=False, separators=(",", ":"))
+        original_sha1 = hashlib.sha1(raw.encode("utf-8")).hexdigest()
+        result = upstash(["EVAL", CV_TREND_COMPARE_AND_SET_SCRIPT, 1, key, original_sha1, encoded])
+        if int(result or 0) != 1:
+            raise RuntimeError(f"Refusing to clean {key}: remote payload changed concurrently")
+        verified_raw = upstash(["GET", key])
+        if not isinstance(verified_raw, str) or hashlib.sha256(verified_raw.encode("utf-8")).hexdigest() != hashlib.sha256(
+            encoded.encode("utf-8")
+        ).hexdigest():
+            raise RuntimeError(f"Failed to verify cleaned {key}")
+        verified = json.loads(verified_raw)
+        residual = 0
+        for entry in (verified.get("cvs") or {}).values():
+            if not isinstance(entry, dict):
+                continue
+            samples = entry.get("samples")
+            if not isinstance(samples, dict):
+                continue
+            residual += sum(
+                1
+                for sample in samples.values()
+                if isinstance(sample, dict) and sample.get("generated_at") == generated_at
+            )
+        if residual:
+            raise RuntimeError(f"Failed to clean {key}: {residual} matching samples remain")
+        results[platform] = {
+            **stats,
+            "backup": str(backup_path),
+            "updated_at": verified.get("updated_at"),
+            "dates": verified.get("dates") or [],
+        }
+    return results
+
+
 def sync_remote_cvid_map(*, cvid_map_path: Path = COMBINED_CVID_MAP_PATH, upstash=upstash_request) -> dict:
     _path, payload = fetch_cvid_map_payload(path=cvid_map_path, upstash=upstash)
     save_json(cvid_map_path, payload)
@@ -581,9 +684,14 @@ def sync_remote_watchcount_inputs(
     manbo_counts_path: Path = MANBO_COUNTS_PATH,
     upstash=upstash_request,
     force: bool = False,
+    require_remote: bool = False,
 ) -> None:
-    sync_remote_watchcount_if_newer("missevan", missevan_counts_path, upstash=upstash, force=force)
-    sync_remote_watchcount_if_newer("manbo", manbo_counts_path, upstash=upstash, force=force)
+    sync_remote_watchcount_if_newer(
+        "missevan", missevan_counts_path, upstash=upstash, force=force, require_remote=require_remote
+    )
+    sync_remote_watchcount_if_newer(
+        "manbo", manbo_counts_path, upstash=upstash, force=force, require_remote=require_remote
+    )
 
 
 def build_and_publish_cv_ranks(
@@ -603,11 +711,18 @@ def build_and_publish_cv_ranks(
         missevan_counts_path=missevan_counts_path,
         manbo_counts_path=manbo_counts_path,
         upstash=upstash,
-        force=force,
+        force=force or upload,
+        require_remote=upload,
     )
     missevan_cache = load_cache(missevan_counts_path)
     manbo_cache = load_cache(manbo_counts_path)
     generated = generated_at or latest_watch_count_updated_at(missevan_cache, manbo_cache) or now_iso()
+    print(
+        "[inputs] watchcount updated_at:",
+        f"missevan={((missevan_cache.get('_meta') or {}).get('updated_at'))}",
+        f"manbo={((manbo_cache.get('_meta') or {}).get('updated_at'))}",
+        f"rank_date={generated[:10]}",
+    )
     cvid_map = sync_remote_rank_inputs(
         missevan_info_path=missevan_info_path,
         manbo_info_path=manbo_info_path,
@@ -641,6 +756,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-upload", action="store_true", help="Only write ranks-cv.json locally")
     parser.add_argument("--date", help="Override the output and aggregate sample date (YYYY-MM-DD)")
     parser.add_argument("--force", action="store_true", help="构建前无条件拉取远端 watchcount latest")
+    parser.add_argument(
+        "--cleanup-trend-generated-at",
+        help="Only remove CV trend samples whose generated_at exactly matches this value",
+    )
     return parser.parse_args(argv)
 
 
@@ -648,6 +767,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     configure_stdio()
     load_env_file(ROOT / ".env")
+    if args.cleanup_trend_generated_at:
+        results = cleanup_remote_cv_trends_by_generated_at(args.cleanup_trend_generated_at)
+        print("[ok] cleaned CV trends:", json.dumps(results, ensure_ascii=False))
+        return 0
     generated_at = None
     if args.date:
         generated_at = f"{args.date}T00:00:00+00:00"
