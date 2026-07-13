@@ -14,6 +14,7 @@ from platform_sync import (
     MISSEVAN_COUNTS_PATH,
     MISSEVAN_INFO_PATH,
     MissevanRequester,
+    all_sound_ids,
     iter_missevan_nodes,
     load_cache,
     load_json,
@@ -41,7 +42,7 @@ CACHE_WINDOW = timedelta(hours=1)
 UTC = timezone.utc
 MISSEVAN_BLOCKLIST = {"47639", "25812"}
 MISSEVAN_ARCHIVED_INFO_PATH = MISSEVAN_INFO_PATH.with_name("missevan-archived-drama.json")
-PRICING_PATCH_MAX_ATTEMPTS = 3
+INFO_PATCH_MAX_ATTEMPTS = 3
 INFO_COMPARE_AND_SET_SCRIPT = """
 local current = redis.call('GET', KEYS[1])
 if not current or redis.sha1hex(current) ~= ARGV[1] then
@@ -50,6 +51,12 @@ end
 redis.call('SET', KEYS[1], ARGV[2])
 return 1
 """
+
+
+class MissevanRefreshInterrupted(RuntimeError):
+    def __init__(self, message: str, stats: dict):
+        super().__init__(message)
+        self.stats = stats
 
 
 def missevan_pricing_observation(drama: dict) -> tuple[dict[str, object], bool]:
@@ -79,8 +86,39 @@ def manbo_pricing_observation(drama_id: str, payload: dict) -> tuple[dict[str, o
     return fields, complete
 
 
-def _apply_pricing_observations(platform: str, store: dict, observations: dict[str, dict[str, object]]) -> dict[str, int]:
-    stats = {"changed": 0, "free_to_paid": 0, "paid_to_free": 0, "membership_changed": 0}
+def manbo_sound_ids(payload: dict) -> list[str]:
+    sets = ((payload or {}).get("data") or {}).get("setRespList")
+    if not isinstance(sets, list):
+        return []
+    out: list[str] = []
+    for item in sets:
+        if not isinstance(item, dict):
+            continue
+        for field in (
+            "radioDramaSetIdStr",
+            "radioDramaSetId",
+            "dramaSetIdStr",
+            "dramaSetId",
+            "setId",
+            "sound_id",
+            "id",
+        ):
+            value = normalize(item.get(field))
+            if value:
+                if value not in out:
+                    out.append(value)
+                break
+    return out
+
+
+def _apply_info_observations(platform: str, store: dict, observations: dict[str, dict[str, object]]) -> dict[str, int]:
+    stats = {
+        "changed": 0,
+        "free_to_paid": 0,
+        "paid_to_free": 0,
+        "membership_changed": 0,
+        "sound_ids_changed": 0,
+    }
     if platform == "missevan":
         records = {
             str(node.get("dramaId") or ""): node
@@ -111,6 +149,8 @@ def _apply_pricing_observations(platform: str, store: dict, observations: dict[s
                     stats["paid_to_free"] += 1
             elif field in {"is_member", "vipFree"}:
                 stats["membership_changed"] += 1
+            elif field == "soundIds":
+                stats["sound_ids_changed"] += 1
             record[field] = value
             record_changed = True
         if record_changed:
@@ -118,23 +158,29 @@ def _apply_pricing_observations(platform: str, store: dict, observations: dict[s
     return stats
 
 
-def publish_pricing_observations(
+def publish_info_observations(
     platform: str,
     observations: dict[str, dict[str, object]],
     *,
     upstash=upstash_request,
-    max_attempts: int = PRICING_PATCH_MAX_ATTEMPTS,
+    max_attempts: int = INFO_PATCH_MAX_ATTEMPTS,
 ) -> dict[str, int]:
     if not observations:
-        return {"changed": 0, "free_to_paid": 0, "paid_to_free": 0, "membership_changed": 0}
+        return {
+            "changed": 0,
+            "free_to_paid": 0,
+            "paid_to_free": 0,
+            "membership_changed": 0,
+            "sound_ids_changed": 0,
+        }
     key = MISSEVAN_INFO_KEY if platform == "missevan" else MANBO_INFO_KEY
     path = MISSEVAN_INFO_PATH if platform == "missevan" else MANBO_INFO_PATH
     for _attempt in range(max_attempts):
         raw = upstash(["GET", key])
         if not isinstance(raw, str) or not raw:
-            raise RuntimeError(f"Refusing to update pricing: {key} is empty or unsupported")
+            raise RuntimeError(f"Refusing to update info: {key} is empty or unsupported")
         store = json.loads(raw)
-        stats = _apply_pricing_observations(platform, store, observations)
+        stats = _apply_info_observations(platform, store, observations)
         encoded = json.dumps(store, ensure_ascii=False, separators=(",", ":"))
         result = upstash(
             ["EVAL", INFO_COMPARE_AND_SET_SCRIPT, 1, key, hashlib.sha1(raw.encode("utf-8")).hexdigest(), encoded]
@@ -142,7 +188,7 @@ def publish_pricing_observations(
         if int(result or 0) == 1:
             save_json(path, store)
             return stats
-    raise RuntimeError(f"Refusing to update pricing: {key} changed concurrently {max_attempts} times")
+    raise RuntimeError(f"Refusing to update info: {key} changed concurrently {max_attempts} times")
 
 
 def parse_iso_datetime(value: object) -> datetime | None:
@@ -202,8 +248,20 @@ def refresh_missevan_watch_counts(*, target_ids: set[str] | None = None) -> dict
     skipped = 0
     archived = 0
     pricing_skipped = 0
-    pricing_observations: dict[str, dict[str, object]] = {}
+    info_observations: dict[str, dict[str, object]] = {}
     now = datetime.now(UTC)
+
+    def current_stats() -> dict:
+        return {
+            "processed": processed,
+            "skipped": skipped,
+            "archived": archived,
+            "request_count": requester.request_count,
+            "last_backoff_seconds": requester.last_backoff_seconds,
+            "pricing_checked": processed - pricing_skipped,
+            "pricing_skipped": pricing_skipped,
+            "info_observations": info_observations,
+        }
 
     drama_ids: list[str] = []
     drama_contexts: dict[str, list[tuple[str, str, dict]]] = {}
@@ -226,10 +284,12 @@ def refresh_missevan_watch_counts(*, target_ids: set[str] | None = None) -> dict
         print(f"[猫耳] 正在刷新 ID={drama_id} ({idx}/{len(drama_ids)})")
         try:
             payload = requester.request_json(f"https://www.missevan.com/dramaapi/getdrama?drama_id={drama_id}")
-        except RuntimeError:
+        except RuntimeError as exc:
             save_missevan_store(MISSEVAN_INFO_PATH, store)
             save_json(MISSEVAN_ARCHIVED_INFO_PATH, archive)
             save_cache(MISSEVAN_COUNTS_PATH, cache)
+            if "HTTP_418" in str(exc):
+                raise MissevanRefreshInterrupted(str(exc), current_stats()) from exc
             raise
         except Exception as exc:
             if is_http_403(exc):
@@ -246,10 +306,14 @@ def refresh_missevan_watch_counts(*, target_ids: set[str] | None = None) -> dict
         info = (payload or {}).get("info") or {}
         drama = info.get("drama") or {}
         pricing_fields, pricing_complete = missevan_pricing_observation(drama)
-        if pricing_fields:
-            pricing_observations[drama_id] = pricing_fields
+        info_fields = dict(pricing_fields)
+        sound_ids = all_sound_ids(info)
+        if sound_ids:
+            info_fields["soundIds"] = sound_ids
+        if info_fields:
+            info_observations[drama_id] = info_fields
             for _series_title, _season_key, context_node in drama_contexts.get(drama_id, []):
-                for field, value in pricing_fields.items():
+                for field, value in info_fields.items():
                     context_node[field] = value
         if not pricing_complete:
             pricing_skipped += 1
@@ -264,16 +328,7 @@ def refresh_missevan_watch_counts(*, target_ids: set[str] | None = None) -> dict
 
     save_cache(MISSEVAN_COUNTS_PATH, cache)
     save_missevan_store(MISSEVAN_INFO_PATH, store)
-    return {
-        "processed": processed,
-        "skipped": skipped,
-        "archived": archived,
-        "request_count": requester.request_count,
-        "last_backoff_seconds": requester.last_backoff_seconds,
-        "pricing_checked": processed - pricing_skipped,
-        "pricing_skipped": pricing_skipped,
-        "pricing_observations": pricing_observations,
-    }
+    return current_stats()
 
 
 def refresh_manbo_watch_counts(*, target_ids: set[str] | None = None) -> dict:
@@ -282,7 +337,7 @@ def refresh_manbo_watch_counts(*, target_ids: set[str] | None = None) -> dict:
     processed = 0
     skipped = 0
     pricing_skipped = 0
-    pricing_observations: dict[str, dict[str, object]] = {}
+    info_observations: dict[str, dict[str, object]] = {}
     now = datetime.now(UTC)
     records = store.get("records", [])
 
@@ -298,9 +353,13 @@ def refresh_manbo_watch_counts(*, target_ids: set[str] | None = None) -> dict:
         payload = request_manbo_json(f"https://www.kilamanbo.world/web_manbo/dramaDetail?dramaId={drama_id}")
         data = payload.get("data") or {}
         pricing_fields, pricing_complete = manbo_pricing_observation(drama_id, payload)
-        if pricing_fields:
-            pricing_observations[drama_id] = pricing_fields
-            for field, value in pricing_fields.items():
+        info_fields = dict(pricing_fields)
+        sound_ids = manbo_sound_ids(payload)
+        if sound_ids:
+            info_fields["soundIds"] = sound_ids
+        if info_fields:
+            info_observations[drama_id] = info_fields
+            for field, value in info_fields.items():
                 record[field] = value
         if not pricing_complete:
             pricing_skipped += 1
@@ -320,7 +379,7 @@ def refresh_manbo_watch_counts(*, target_ids: set[str] | None = None) -> dict:
         "skipped": skipped,
         "pricing_checked": processed - pricing_skipped,
         "pricing_skipped": pricing_skipped,
-        "pricing_observations": pricing_observations,
+        "info_observations": info_observations,
     }
 
 
@@ -341,11 +400,23 @@ def print_manbo_stats(stats: dict) -> None:
     print("漫播 pricing skipped:", stats.get("pricing_skipped", 0))
 
 
-def print_pricing_publish_stats(platform: str, stats: dict) -> None:
-    print(f"{platform} pricing changed:", stats.get("changed", 0))
+def print_info_publish_stats(platform: str, stats: dict) -> None:
+    print(f"{platform} info changed:", stats.get("changed", 0))
     print(f"{platform} pricing free->paid:", stats.get("free_to_paid", 0))
     print(f"{platform} pricing paid->free:", stats.get("paid_to_free", 0))
     print(f"{platform} membership changed:", stats.get("membership_changed", 0))
+    print(f"{platform} soundIds changed:", stats.get("sound_ids_changed", 0))
+
+
+def publish_refresh_results(platforms: list[str] | tuple[str, ...], refresh_results: dict[str, dict]) -> None:
+    for platform in platforms:
+        result = refresh_results.get(platform)
+        if result is None:
+            continue
+        info_stats = publish_info_observations(platform, result.get("info_observations") or {})
+        print_info_publish_stats(platform, info_stats)
+        path = MISSEVAN_COUNTS_PATH if platform == "missevan" else MANBO_COUNTS_PATH
+        upload_watchcount_file(platform, path)
 
 
 def run_missevan_refresh(target_ids: set[str] | None) -> dict:
@@ -395,6 +466,7 @@ def main(argv: list[str] | None = None) -> int:
         sync_remote_watchcount_if_newer("manbo", MANBO_COUNTS_PATH, force=args.force)
 
     if do_missevan and do_manbo and not explicit_target_mode and args.platform == "all":
+        missevan_interrupted = False
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = {
                 executor.submit(run_missevan_refresh, None): "missevan",
@@ -403,24 +475,26 @@ def main(argv: list[str] | None = None) -> int:
             for future in as_completed(futures):
                 try:
                     refresh_results[futures[future]] = future.result()
+                except MissevanRefreshInterrupted as exc:
+                    refresh_results["missevan"] = exc.stats
+                    missevan_interrupted = True
                 except RuntimeError as exc:
                     if futures[future] == "missevan" and "HTTP_418" in str(exc):
-                        return 2
+                        missevan_interrupted = True
+                        continue
                     raise
         if not args.no_upload:
-            for platform in ("missevan", "manbo"):
-                pricing_stats = publish_pricing_observations(
-                    platform,
-                    refresh_results.get(platform, {}).get("pricing_observations") or {},
-                )
-                print_pricing_publish_stats(platform, pricing_stats)
-                path = MISSEVAN_COUNTS_PATH if platform == "missevan" else MANBO_COUNTS_PATH
-                upload_watchcount_file(platform, path)
-        return 0
+            publish_refresh_results(("missevan", "manbo"), refresh_results)
+        return 2 if missevan_interrupted else 0
 
     if do_missevan:
         try:
             refresh_results["missevan"] = run_missevan_refresh(missevan_ids or None)
+        except MissevanRefreshInterrupted as exc:
+            refresh_results["missevan"] = exc.stats
+            if not args.no_upload:
+                publish_refresh_results(("missevan",), refresh_results)
+            return 2
         except RuntimeError as exc:
             if "HTTP_418" not in str(exc):
                 raise
@@ -432,14 +506,7 @@ def main(argv: list[str] | None = None) -> int:
         refreshed_platforms.append("manbo")
 
     if not args.no_upload:
-        for platform in refreshed_platforms:
-            pricing_stats = publish_pricing_observations(
-                platform,
-                refresh_results.get(platform, {}).get("pricing_observations") or {},
-            )
-            print_pricing_publish_stats(platform, pricing_stats)
-            path = MISSEVAN_COUNTS_PATH if platform == "missevan" else MANBO_COUNTS_PATH
-            upload_watchcount_file(platform, path)
+        publish_refresh_results(refreshed_platforms, refresh_results)
 
     return 0
 

@@ -87,7 +87,7 @@ flowchart LR
 #### `manbo-drama-info.json`
 
 - 结构为 `{"version": 1, "updatedAt": ISO, "records": []}`
-- 每条记录包含：`dramaId`、标题、分类、`genre/type`、主役 CV、角色名、`createTime`、`author`、`needpay`、`seriesTitle` 等字段
+- 每条记录包含：`dramaId`、标题、分类、`genre/type`、主役 CV、角色名、`createTime`、`author`、`needpay`、`soundIds`、`seriesTitle` 等字段
 
 ### Cache and Derived Data
 
@@ -96,6 +96,9 @@ flowchart LR
 - 统一结构：`{"_meta": {"updated_at": ISO}, "counts": {dramaId: {...}}}`
 - 每个条目至少包含：`name`、`view_count`、`fetched_at`
 - `refresh_watch_counts.py` 只维护这两份缓存，不会改 SQLite
+
+播放量刷新时，猫耳 `getdrama` 和漫播 `dramaDetail` 响应还会同步更新各自源库中的付费信息、
+会员状态和非空的 `soundIds`；这些字段与播放量共用同一次平台请求。
 
 #### `missevan-archived-drama.json`
 
@@ -221,11 +224,13 @@ flowchart LR
 
 ### Watch Counts and Archive Handling: `refresh_watch_counts.py`
 
-这个脚本只负责刷新播放量缓存：
+这个脚本负责刷新播放量缓存，并复用详情响应维护源库中的动态字段：
 
 - 支持全量刷新或按平台/按 ID 定向刷新
 - 命中 1 小时缓存窗口会跳过
-- 猫耳命中 418 时会先保存当前进度再退出
+- 猫耳和漫播分别在同一次 `getdrama` / `dramaDetail` 请求中同步付费信息、会员状态和非空的 `soundIds`
+- 源库动态字段通过 Upstash CAS 合并发布，避免覆盖并发更新的其他 metadata
+- 猫耳命中 418 时会先保存并发布已完成剧目的当前进度，再以退出码 `2` 退出
 - 猫耳命中 403 时会把剧目移出活跃源库并写入 `missevan-archived-drama.json`
 
 注意：
