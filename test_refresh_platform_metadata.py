@@ -356,7 +356,7 @@ class MissevanIntroCvCandidateTests(unittest.TestCase):
             "监制", "剧本", "后期", "策划", "企划", "编剧", "制作人", "统筹", "对轨", "画本",
             "配乐", "原创配乐", "作词", "作曲", "演唱", "编曲", "和声", "混音", "母带",
             "rap", "RAP", "Rap", "海报设计", "视觉设计", "美工", "题字", "商务", "商务宣传",
-            "字幕", "宣传", "出品", "发行", "后期监制", "剧本监修", "原创配乐/混音",
+            "字幕", "宣传", "宣发", "出品", "发行", "后期监制", "剧本监修", "原创配乐/混音",
         ]
         intro = "<p>配音组</p>" + "".join(f"<p>{role}：制作人员</p>" for role in roles) + "<p>角色甲：导演小王</p>"
 
@@ -422,6 +422,19 @@ class MissevanIntroCvCandidateTests(unittest.TestCase):
                 {"role_name": "霍无归", "display_name": "云惟一"},
             ],
         )
+
+    def test_94893_decorated_production_section_stops_before_promotion(self) -> None:
+        intro = """
+        <p>▷配音组◁</p>
+        <p>萧华雍：柯暮卿@柯暮卿</p>
+        <p>▷制作组◁</p>
+        <p>配音导演：柯暮卿@柯暮卿 阑倾@阑倾-whisper</p>
+        <p>宣发：鸡蛋饺子包邮</p>
+        """
+
+        candidates = refresh_platform_metadata.extract_missevan_intro_cv_candidates(intro, limit=100)
+
+        self.assertEqual(candidates, [{"role_name": "萧华雍", "display_name": "柯暮卿"}])
 
     def test_94802_intro_skips_director_and_recording_engineer(self) -> None:
         intro = """
@@ -492,6 +505,30 @@ class MissevanBatchIntroTests(unittest.TestCase):
         candidates = refresh_platform_metadata.collect_missevan_episode_intro_candidates(rows, method="showcase")
 
         self.assertEqual([item["display_name"] for item in candidates], ["CV甲", "CV乙"])
+
+    def test_94893_showcases_collect_one_cv_from_each_sound(self) -> None:
+        rows = [
+            {
+                "sound_id": 13080301,
+                "title": "声展 · 萧华雍",
+                "intro": "<p>▷配音组◁</p><p>萧华雍：柯暮卿@柯暮卿</p><p>▷制作组◁</p><p>宣发：鸡蛋饺子包邮</p>",
+            },
+            {
+                "sound_id": 13085282,
+                "title": "声展 · 沈羲和",
+                "intro": "<p>▷配音组◁</p><p>沈羲和：醋醋@醋醋cucu</p><p>▷制作组◁</p><p>宣发：鸡蛋饺子包邮</p>",
+            },
+        ]
+
+        candidates = refresh_platform_metadata.collect_missevan_episode_intro_candidates(rows, method="showcase")
+
+        self.assertEqual(
+            candidates,
+            [
+                {"role_name": "萧华雍", "display_name": "柯暮卿"},
+                {"role_name": "沈羲和", "display_name": "醋醋"},
+            ],
+        )
 
     def test_preview_matches_keywords_and_excludes_existing_names(self) -> None:
         rows = [

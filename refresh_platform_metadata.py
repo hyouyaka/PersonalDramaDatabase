@@ -66,7 +66,12 @@ MISSEVAN_INTRO_CV_SECTION_PATTERN = re.compile(
     r"^(?:[^A-Za-z0-9\u4e00-\u9fff]{0,20})?(?:配音组|配音|CAST|CV)(?:[^A-Za-z0-9\u4e00-\u9fff]{0,20})?$",
     re.I,
 )
-MISSEVAN_INTRO_SECTION_PATTERN = re.compile(r"^(?:[=＝\-\s]*)?(?:[^：:]{1,20}(?:组|制作|字幕|参与配音)|(?:[^：:]{0,20})staff)(?:[=＝\-\s]*|[：:]\s*)?$", re.I)
+MISSEVAN_INTRO_SECTION_PATTERN = re.compile(
+    r"^(?:[^A-Za-z0-9\u4e00-\u9fff：:]{0,20})?"
+    r"(?:[^：:]{1,20}(?:组|制作|字幕|参与配音)|(?:[^：:]{0,20})staff)"
+    r"(?:[^A-Za-z0-9\u4e00-\u9fff：:]{0,20})?(?:[：:]\s*)?$",
+    re.I,
+)
 MISSEVAN_INTRO_ROLE_CV_PATTERN = re.compile(r"^(?P<role>[^：:\n]{1,40})[：:](?P<cv>.+)$")
 MISSEVAN_CV_SUFFIX_PATTERN = re.compile(r"\s*(?:@|＠|【|\[|（|\(|<|《).*$")
 MISSEVAN_INTRO_STAFF_ROLE_NAMES = {
@@ -97,6 +102,7 @@ MISSEVAN_INTRO_STAFF_ROLE_NAMES = {
     "商务宣传",
     "字幕",
     "宣传",
+    "宣发",
     "出品",
     "发行",
     "配乐",
