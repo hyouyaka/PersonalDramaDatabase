@@ -280,7 +280,10 @@ python export_sqlite_to_workbook.py
 
 - 默认会随 detail 一起刷新弹幕 UID 统计
 - 传 `--skip-danmaku` 时，本次被更新到的 drama 会显式把 `danmaku_uid_count` 写成 `null`
-- 不在弹幕目标子集里的 drama 会继续刷新 detail，但保留已有 `danmaku_uid_count`
+- 除猫耳人气/畅销榜第 31–50 位外，不在弹幕目标子集里的 drama 会继续刷新 detail，并保留已有 `danmaku_uid_count`
+- 猫耳人气周榜、人气月榜、畅销周榜、畅销月榜保存前 50 位；仅前 30 位计算弹幕 UID
+- 仅位于上述榜单第 31–50 位、未进入任一榜前 30 且不在 ongoing 的 drama，会把 `danmaku_uid_count` 写成字符串 `"无需抓取"`
+- `danmaku_uid_count` 的公开类型为非负整数或 `"无需抓取"`；补填和 `--only-danmaku` 均跳过该字符串
 
 `--only-danmaku`：
 

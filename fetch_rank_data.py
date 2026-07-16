@@ -103,15 +103,18 @@ def env_float(name: str, default: float) -> float:
     except ValueError:
         return default
 
-# -- Missevan rank definitions (key -> (type, sub_type, display_name)) ------
+# -- Missevan rank definitions ---------------------------------------------
+# key -> (type, sub_type, display_name, fetch_limit, danmaku_limit)
 MISSEVAN_RANKS = {
-    "new_daily":          (1, 1, "新品日榜"),
-    "new_weekly":         (1, 2, "新品周榜"),
-    "popular_weekly":     (2, 2, "人气周榜"),
-    "popular_monthly":    (2, 3, "人气月榜"),
-    "bestseller_weekly":  (9, 2, "畅销周榜"),
-    "bestseller_monthly": (9, 3, "畅销月榜"),
+    "new_daily":          (1, 1, "新品日榜", 30, 30),
+    "new_weekly":         (1, 2, "新品周榜", 30, 30),
+    "popular_weekly":     (2, 2, "人气周榜", 50, 30),
+    "popular_monthly":    (2, 3, "人气月榜", 50, 30),
+    "bestseller_weekly":  (9, 2, "畅销周榜", 50, 30),
+    "bestseller_monthly": (9, 3, "畅销月榜", 50, 30),
 }
+
+MISSEVAN_DANMAKU_NOT_REQUIRED = "无需抓取"
 
 # -- Manbo rank definitions (key -> (rankId, display_name, limit, value_field))
 MANBO_RANKS = {
@@ -834,6 +837,8 @@ def select_stale_ids(drama_ids: set[str], existing_dramas: dict, *, force: bool)
 
 def should_refresh_only_danmaku_entry(entry: dict | None, *, force: bool) -> bool:
     """Return True when only-danmaku mode should refresh one existing metric entry."""
+    if isinstance(entry, dict) and is_missevan_danmaku_not_required(entry.get("danmaku_uid_count")):
+        return False
     if force:
         return True
     if not isinstance(entry, dict):
@@ -1010,19 +1015,41 @@ def merge_rank_and_ongoing_ids(rank_ids, ongoing_ids) -> set[str]:
     return merged
 
 
+def classify_missevan_danmaku_ids(
+    rank_danmaku_ids: set[str],
+    deferred_danmaku_ids: set[str],
+    ongoing_ids: set[str],
+) -> tuple[set[str], set[str]]:
+    """Give top-30 and ongoing membership priority over positions 31-50."""
+    eligible_ids = merge_rank_and_ongoing_ids(rank_danmaku_ids, ongoing_ids)
+    deferred_ids = {
+        str(value)
+        for value in deferred_danmaku_ids
+        if value not in (None, "") and str(value) not in eligible_ids
+    }
+    return eligible_ids, deferred_ids
+
+
 # ---------------------------------------------------------------------------
 # Phase 2: Fetch rank lists
 # ---------------------------------------------------------------------------
 
-def fetch_missevan_ranks(requester: MissevanRequester, store: dict) -> tuple[set[str], set[str]]:
-    """Fetch all Missevan rank lists, updating store. Return (all drama IDs, danmaku-eligible IDs)."""
+def fetch_missevan_ranks(
+    requester: MissevanRequester,
+    store: dict,
+) -> tuple[set[str], set[str], set[str]]:
+    """Return all, danmaku-eligible, and deferred Missevan rank drama IDs."""
     all_ids: set[str] = set()
     danmaku_ids: set[str] = set()
+    deferred_danmaku_ids: set[str] = set()
     ranks = store["missevan"].setdefault("ranks", {})
 
     # Standard ranks
-    for key, (type_val, sub_type, name) in MISSEVAN_RANKS.items():
-        url = f"https://www.missevan.com/rank/details?page_size=30&page=1&type={type_val}&sub_type={sub_type}"
+    for key, (type_val, sub_type, name, fetch_limit, danmaku_limit) in MISSEVAN_RANKS.items():
+        url = (
+            "https://www.missevan.com/rank/details"
+            f"?page_size={fetch_limit}&page=1&type={type_val}&sub_type={sub_type}"
+        )
         print(f"  [missevan] fetching rank: {name} ...")
         try:
             data = requester.request_json(url)
@@ -1030,11 +1057,17 @@ def fetch_missevan_ranks(requester: MissevanRequester, store: dict) -> tuple[set
             print(f"  [missevan] WARN: failed to fetch {name}: {exc}")
             continue
         info = data.get("info") or {}
-        items_raw = info.get("data") or []
-        items = [item["id"] for item in items_raw if "id" in item]
+        items_raw = (info.get("data") or [])[:fetch_limit]
+        ranked_items = [
+            (position, item["id"])
+            for position, item in enumerate(items_raw, 1)
+            if isinstance(item, dict) and "id" in item
+        ]
+        items = [item_id for _position, item_id in ranked_items]
         ranks[key] = {"name": name, "fetched_at": now_iso(), "items": items}
         all_ids.update(str(i) for i in items)
-        danmaku_ids.update(str(i) for i in items)
+        danmaku_ids.update(str(item_id) for position, item_id in ranked_items if position <= danmaku_limit)
+        deferred_danmaku_ids.update(str(item_id) for position, item_id in ranked_items if position > danmaku_limit)
         print(f"  [missevan] {name}: {len(items)} items")
 
     # Peak rank
@@ -1092,7 +1125,7 @@ def fetch_missevan_ranks(requester: MissevanRequester, store: dict) -> tuple[set
     except Exception as exc:
         print(f"  [missevan] WARN: failed to fetch 巅峰榜: {exc}")
 
-    return all_ids, danmaku_ids
+    return all_ids, danmaku_ids, deferred_danmaku_ids
 
 
 def fetch_manbo_ranks(store: dict) -> set[str]:
@@ -2052,6 +2085,37 @@ def is_empty_danmaku_value(value: object) -> bool:
     return False
 
 
+def is_missevan_danmaku_not_required(value: object) -> bool:
+    return isinstance(value, str) and value.strip() == MISSEVAN_DANMAKU_NOT_REQUIRED
+
+
+def apply_missevan_danmaku_not_required(store: dict, drama_ids: set[str]) -> None:
+    """Mark Missevan dramas that intentionally do not need danmaku collection."""
+    dramas = store.setdefault("missevan", {}).setdefault("dramas", {})
+    for drama_id in drama_ids:
+        entry = dramas.get(str(drama_id))
+        if not isinstance(entry, dict):
+            entry = {}
+            dramas[str(drama_id)] = entry
+        entry["danmaku_uid_count"] = MISSEVAN_DANMAKU_NOT_REQUIRED
+
+
+def select_missevan_detail_ids(
+    drama_ids: set[str],
+    existing_dramas: dict,
+    danmaku_ids: set[str],
+    *,
+    force: bool,
+) -> tuple[set[str], int]:
+    """Select stale details plus marked dramas that became danmaku-eligible."""
+    to_update, _skipped = select_stale_ids(drama_ids, existing_dramas, force=force)
+    for drama_id in danmaku_ids:
+        entry = existing_dramas.get(str(drama_id)) if isinstance(existing_dramas, dict) else None
+        if isinstance(entry, dict) and is_missevan_danmaku_not_required(entry.get("danmaku_uid_count")):
+            to_update.add(str(drama_id))
+    return to_update, len(drama_ids) - len(to_update)
+
+
 def resolve_repair_history_date(platform: str) -> str:
     if platform not in TREND_KEYS:
         raise ValueError(f"Unsupported platform: {platform}")
@@ -2079,9 +2143,12 @@ def _add_repair_source(targets: set[str], sources: dict[str, list[str]], drama_i
 def _entry_has_empty_danmaku(entry: object) -> bool:
     if not isinstance(entry, dict):
         return False
+    value = entry.get("danmaku_uid_count")
+    if is_missevan_danmaku_not_required(value):
+        return False
     if "danmaku_uid_count" not in entry:
         return True
-    return is_empty_danmaku_value(entry.get("danmaku_uid_count"))
+    return is_empty_danmaku_value(value)
 
 
 def _collect_rank_memberships(ranks: object) -> dict[str, set[str]]:
@@ -2623,6 +2690,7 @@ def main() -> None:
     manbo_ids: set[str] = set()
 
     missevan_danmaku_ids: set[str] = set()
+    missevan_deferred_danmaku_ids: set[str] = set()
 
     if do_missevan and do_manbo:
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -2633,12 +2701,15 @@ def main() -> None:
             for future in as_completed(futures):
                 platform = futures[future]
                 if platform == "missevan":
-                    missevan_ids, missevan_danmaku_ids = future.result()
+                    missevan_ids, missevan_danmaku_ids, missevan_deferred_danmaku_ids = future.result()
                 else:
                     manbo_ids = future.result()
     else:
         if do_missevan:
-            missevan_ids, missevan_danmaku_ids = fetch_missevan_ranks(requester, store)
+            missevan_ids, missevan_danmaku_ids, missevan_deferred_danmaku_ids = fetch_missevan_ranks(
+                requester,
+                store,
+            )
         if do_manbo:
             manbo_ids = fetch_manbo_ranks(store)
 
@@ -2649,7 +2720,12 @@ def main() -> None:
         ongoing_missevan_ids = load_ongoing_drama_ids("missevan")
         rank_count = len(missevan_ids)
         missevan_ids = merge_rank_and_ongoing_ids(missevan_ids, ongoing_missevan_ids)
-        missevan_danmaku_ids = merge_rank_and_ongoing_ids(missevan_danmaku_ids, ongoing_missevan_ids)
+        missevan_danmaku_ids, missevan_deferred_danmaku_ids = classify_missevan_danmaku_ids(
+            missevan_danmaku_ids,
+            missevan_deferred_danmaku_ids,
+            ongoing_missevan_ids,
+        )
+        apply_missevan_danmaku_not_required(store, missevan_deferred_danmaku_ids)
         print(
             f"  [missevan] drama IDs: rank={rank_count}, "
             f"ongoing={len(ongoing_missevan_ids)}, combined={len(missevan_ids)}"
@@ -2671,9 +2747,10 @@ def main() -> None:
     missevan_dramas_existing = store["missevan"].get("dramas") or {}
     manbo_dramas_existing = store["manbo"].get("dramas") or {}
 
-    missevan_to_update, missevan_skipped = select_stale_ids(
+    missevan_to_update, missevan_skipped = select_missevan_detail_ids(
         missevan_ids,
         missevan_dramas_existing,
+        missevan_danmaku_ids,
         force=args.force,
     )
 
@@ -2716,6 +2793,11 @@ def main() -> None:
     else:
         update_missevan_details()
         update_manbo_details()
+
+    if do_missevan:
+        # Detail refresh and --skip-danmaku may replace the marker; the final
+        # published state must keep rank positions 31-50 terminal and non-null.
+        apply_missevan_danmaku_not_required(store, missevan_deferred_danmaku_ids)
 
     # Phase 6: Upstash CV lookup
     print("=== Phase 6: Upstash CV lookup ===")

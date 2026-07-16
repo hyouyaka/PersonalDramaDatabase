@@ -195,6 +195,30 @@ class UpstashV2Tests(unittest.TestCase):
         metrics = fields["100"]["samples"]["2026-03-01"]["metrics"]
         self.assertEqual(metrics, {"view_count": 2, "subscription_num": 4})
 
+    def test_normal_v2_preserves_danmaku_not_required_marker(self) -> None:
+        payload = {
+            "dates": ["2026-07-16"],
+            "dramas": {
+                "100": {
+                    "id": "100",
+                    "name": "第31名",
+                    "samples": {
+                        "2026-07-16": {
+                            "metrics": {"view_count": 10, "danmaku_uid_count": "无需抓取"},
+                            "ranks": [{"key": "popular_weekly", "name": "人气周榜", "position": 31}],
+                        }
+                    },
+                }
+            },
+        }
+
+        _meta, fields = upstash_v2.build_normal_trend_v2(payload, "missevan")
+
+        self.assertEqual(
+            fields["100"]["samples"]["2026-07-16"]["metrics"]["danmaku_uid_count"],
+            "无需抓取",
+        )
+
     def test_atomic_hash_publish_replaces_stable_key_only_after_verification(self) -> None:
         fake = FakeUpstash()
         fake.hashes["ranks:trend:missevan:v2"] = {"old": "value"}

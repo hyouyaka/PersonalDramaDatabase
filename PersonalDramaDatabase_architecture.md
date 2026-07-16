@@ -346,10 +346,12 @@ flowchart LR
 - 双平台同时开启时，榜单抓取并行，后续 detail 刷新也按平台并行执行
 - detail 会对 rank + ongoing 合并后的去重 ID 集合做缓存判断
 - 弹幕不会对所有 detail ID 都刷新，而是只对各平台的弹幕目标子集刷新：
-  - 猫耳：标准榜单 + ongoing
+  - 猫耳：新品榜前 30、人气/畅销榜前 30，以及 ongoing
   - 漫播：非 `peak` 榜单 + ongoing
+- 猫耳人气/畅销周榜与月榜保存前 50 位；仅位于第 31–50 位、未进入其他榜前 30 且不在 ongoing 的剧目继续刷新 detail，但 `danmaku_uid_count` 固定为 `"无需抓取"`
+- 猫耳剧目进入任一榜前 30 或 ongoing 时优先恢复弹幕抓取；`--only-danmaku` 和 null 修复流程不会处理 `"无需抓取"`
 - 传 `--skip-danmaku` 时，本次被更新到的 drama 会显式把 `danmaku_uid_count` 写成 `null`
-- 如果只是“该 drama 不在本次弹幕目标子集里”，而不是全局 `--skip-danmaku`，则仍会刷新 detail，但保留已有 `danmaku_uid_count`
+- 如果只是“该 drama 不在本次弹幕目标子集里”，则仍会刷新 detail；猫耳人气/畅销榜第 31–50 位写入 `"无需抓取"`，其他情况保留已有 `danmaku_uid_count`
 
 `--only-danmaku` 模式下的具体语义：
 
