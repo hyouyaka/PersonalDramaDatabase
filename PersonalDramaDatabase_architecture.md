@@ -97,6 +97,15 @@ flowchart LR
 - 每个条目至少包含：`name`、`view_count`、`fetched_at`
 - `refresh_watch_counts.py` 只维护这两份缓存，不会改 SQLite
 
+远端 Upstash 还维护每个平台的播放量快照索引：
+
+- `missevan:watchcount:index`、`manbo:watchcount:index` 的结构为 `version`、`platform`、`updated_at`、`dates`
+- `dates` 只包含升序去重的 `YYYY-MM-DD` 快照日期，不包含 `latest`，最多保留 32 期
+- `missevan:watchcount:history`、`manbo:watchcount:history` 为 Redis Hash；field 为 dramaId，value 为包含 `name` 和升序 `points` 的 JSON 字符串
+- 发布顺序固定为 dated snapshot、latest、HSET 暂存 history、index、清理过期 points/field、淘汰快照；history 或 index 写失败时任务失败，重试保持幂等
+- 首次建立 index 会通过 SCAN 回填现有快照日期；消费端优先读 index，部署过渡期保留带缓存的 SCAN fallback
+- 共享读取函数为 `load_watchcount_snapshot_dates` 和 `load_watchcount_snapshots`
+
 播放量刷新时，猫耳 `getdrama` 和漫播 `dramaDetail` 响应还会同步更新各自源库中的付费信息、
 会员状态和非空的 `soundIds`；这些字段与播放量共用同一次平台请求。
 

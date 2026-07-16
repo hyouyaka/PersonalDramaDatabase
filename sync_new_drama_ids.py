@@ -3,9 +3,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
+import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,6 +38,13 @@ WATCHCOUNT_KEY_PREFIXES = {
     "missevan": "missevan:watchcount",
     "manbo": "manbo:watchcount",
 }
+WATCHCOUNT_INDEX_VERSION = 1
+WATCHCOUNT_MAX_DATES = 32
+WATCHCOUNT_HISTORY_MAX_POINTS = WATCHCOUNT_MAX_DATES
+WATCHCOUNT_SCAN_CACHE_TTL_SECONDS = 300
+WATCHCOUNT_SCAN_COUNT = 1000
+WATCHCOUNT_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_WATCHCOUNT_SCAN_CACHE: dict[str, tuple[float, list[str]]] = {}
 INFO_UPLOAD_MIN_COUNTS = {
     MISSEVAN_INFO_KEY: 100,
     MANBO_INFO_KEY: 50,
@@ -316,6 +326,403 @@ def watchcount_updated_at(payload: object) -> datetime | None:
     return parse_remote_iso_datetime(((payload.get("_meta") or {}).get("updated_at")))
 
 
+def normalize_watchcount_snapshot_date(value: object, *, key: str = "watchcount") -> str:
+    date_text = str(value).strip() if value is not None else ""
+    if not WATCHCOUNT_DATE_PATTERN.fullmatch(date_text):
+        raise RuntimeError(f"Refusing to use {key}: invalid snapshot date {value!r}.")
+    try:
+        datetime.strptime(date_text, "%Y-%m-%d")
+    except ValueError as exc:
+        raise RuntimeError(f"Refusing to use {key}: invalid snapshot date {value!r}.") from exc
+    return date_text
+
+
+def normalize_watchcount_snapshot_dates(values: object, *, key: str = "watchcount") -> list[str]:
+    if not isinstance(values, list):
+        raise RuntimeError(f"Refusing to use {key}: dates must be a JSON array.")
+    return sorted({normalize_watchcount_snapshot_date(value, key=key) for value in values})
+
+
+def assert_watchcount_index_is_safe(key: str, payload: object) -> None:
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Refusing to use {key}: expected a JSON object.")
+    if payload.get("version") != WATCHCOUNT_INDEX_VERSION:
+        raise RuntimeError(f"Refusing to use {key}: unsupported version {payload.get('version')!r}.")
+    expected_platform = key.split(":", 1)[0]
+    if payload.get("platform") != expected_platform:
+        raise RuntimeError(f"Refusing to use {key}: platform does not match index key.")
+    if parse_remote_iso_datetime(payload.get("updated_at")) is None:
+        raise RuntimeError(f"Refusing to use {key}: updated_at must be a valid ISO timestamp.")
+    dates = payload.get("dates")
+    normalized_dates = normalize_watchcount_snapshot_dates(dates, key=key)
+    if dates != normalized_dates:
+        raise RuntimeError(f"Refusing to use {key}: dates must be sorted and deduplicated.")
+    if len(normalized_dates) > WATCHCOUNT_MAX_DATES:
+        raise RuntimeError(
+            f"Refusing to use {key}: at most {WATCHCOUNT_MAX_DATES} snapshot dates are allowed."
+        )
+
+
+def decode_remote_watchcount_index(platform: str, raw: object) -> dict:
+    key = watchcount_key(platform, "index")
+    payload = decode_remote_json_payload(key, raw)
+    assert_watchcount_index_is_safe(key, payload)
+    return payload
+
+
+def read_watchcount_index(platform: str, *, upstash=upstash_request) -> dict | None:
+    key = watchcount_key(platform, "index")
+    raw = upstash(["GET", key])
+    if raw in (None, ""):
+        return None
+    return decode_remote_watchcount_index(platform, raw)
+
+
+def _watchcount_number(value: object) -> int | float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        try:
+            value = float(value) if any(marker in value.lower() for marker in (".", "e")) else int(value)
+        except ValueError:
+            return None
+    if not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
+def _watchcount_history_pairs(raw: object, *, key: str) -> list[tuple[str, object]]:
+    if raw in (None, ""):
+        return []
+    if isinstance(raw, dict):
+        return [(str(field), value) for field, value in raw.items()]
+    if not isinstance(raw, (list, tuple)) or len(raw) % 2:
+        raise RuntimeError(f"Refusing to use {key}: HGETALL returned an invalid response.")
+    return [(str(raw[index]), raw[index + 1]) for index in range(0, len(raw), 2)]
+
+
+def _watchcount_history_fields(raw: object, *, key: str) -> set[str]:
+    if isinstance(raw, dict):
+        return {str(field) for field in raw if str(field)}
+    if isinstance(raw, (list, tuple)):
+        return {str(raw[index]) for index in range(0, len(raw) - 1, 2) if str(raw[index])}
+    return set()
+
+
+def _decode_watchcount_history_entry(field: str, raw: object, *, key: str) -> dict:
+    payload = decode_remote_json_payload(f"{key}[{field}]", raw)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Refusing to use {key}[{field}]: expected a JSON object.")
+    name = payload.get("name", "")
+    if name is None:
+        name = ""
+    if not isinstance(name, str):
+        raise RuntimeError(f"Refusing to use {key}[{field}]: name must be a string.")
+    points = payload.get("points")
+    if not isinstance(points, list):
+        raise RuntimeError(f"Refusing to use {key}[{field}]: points must be a JSON array.")
+    normalized_points: dict[str, int | float] = {}
+    for point in points:
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            raise RuntimeError(f"Refusing to use {key}[{field}]: invalid point {point!r}.")
+        date_text = normalize_watchcount_snapshot_date(point[0], key=f"{key}[{field}]")
+        number = _watchcount_number(point[1])
+        if number is None:
+            raise RuntimeError(f"Refusing to use {key}[{field}]: invalid point value {point[1]!r}.")
+        normalized_points[date_text] = number
+    ordered_dates = sorted(normalized_points)
+    return {
+        "name": name,
+        "points": [[date_text, normalized_points[date_text]] for date_text in ordered_dates],
+    }
+
+
+def decode_watchcount_history(platform: str, raw: object) -> dict[str, dict]:
+    key = watchcount_key(platform, "history")
+    history: dict[str, dict] = {}
+    for field, value in _watchcount_history_pairs(raw, key=key):
+        if not is_numeric_drama_id(field):
+            raise RuntimeError(f"Refusing to use {key}: history field {field!r} is not a dramaId.")
+        history[field] = _decode_watchcount_history_entry(field, value, key=key)
+    return history
+
+
+def read_watchcount_history(platform: str, *, upstash=upstash_request) -> tuple[object, dict[str, dict]]:
+    key = watchcount_key(platform, "history")
+    raw = upstash(["HGETALL", key])
+    return raw, decode_watchcount_history(platform, raw)
+
+
+def _history_entry_from_points(
+    name: str,
+    points: dict[str, int | float],
+    *,
+    max_points: int | None = WATCHCOUNT_HISTORY_MAX_POINTS,
+) -> dict:
+    dates = sorted(points)
+    if max_points is not None:
+        dates = dates[-max_points:]
+    return {
+        "name": name,
+        "points": [[date_text, points[date_text]] for date_text in dates],
+    }
+
+
+def build_watchcount_history(
+    platform: str,
+    snapshots: dict[str, dict],
+    *,
+    max_points: int | None = WATCHCOUNT_HISTORY_MAX_POINTS,
+) -> dict[str, dict]:
+    entries: dict[str, dict[str, object]] = {}
+    for date_text in sorted(snapshots):
+        payload = snapshots[date_text]
+        assert_watchcount_payload_is_safe(watchcount_key(platform, date_text), payload)
+        for drama_id, item in payload["counts"].items():
+            if not isinstance(item, dict):
+                continue
+            number = _watchcount_number(item.get("view_count"))
+            if number is None:
+                continue
+            field = str(drama_id).strip()
+            if not is_numeric_drama_id(field):
+                continue
+            entry = entries.setdefault(field, {"name": "", "points": {}})
+            name = item.get("name")
+            if isinstance(name, str) and name.strip():
+                entry["name"] = name
+            entry["points"][date_text] = number
+    return {
+        field: _history_entry_from_points(
+            str(entry["name"]),
+            entry["points"],
+            max_points=max_points,
+        )
+        for field, entry in sorted(entries.items())
+        if entry["points"]
+    }
+
+
+def merge_watchcount_history(
+    existing: dict[str, dict],
+    payload: dict,
+    current_date: str,
+    allowed_dates: list[str],
+    *,
+    max_points: int | None = WATCHCOUNT_HISTORY_MAX_POINTS,
+) -> dict[str, dict]:
+    allowed = set(allowed_dates)
+    merged: dict[str, dict] = {}
+    existing_names = {field: entry["name"] for field, entry in existing.items()}
+    for field, entry in existing.items():
+        points = {
+            point[0]: point[1]
+            for point in entry["points"]
+            if point[0] in allowed
+        }
+        if points:
+            merged[field] = _history_entry_from_points(
+                entry["name"],
+                points,
+                max_points=max_points,
+            )
+    for drama_id, item in payload["counts"].items():
+        if not isinstance(item, dict):
+            continue
+        number = _watchcount_number(item.get("view_count"))
+        if number is None:
+            continue
+        field = str(drama_id).strip()
+        if not is_numeric_drama_id(field):
+            continue
+        entry = merged.get(field, {"name": existing_names.get(field, ""), "points": []})
+        points = {point[0]: point[1] for point in entry["points"]}
+        points[current_date] = number
+        name = item.get("name")
+        if isinstance(name, str) and name.strip():
+            entry["name"] = name
+        merged[field] = _history_entry_from_points(
+            entry["name"],
+            points,
+            max_points=max_points,
+        )
+    return dict(sorted(merged.items()))
+
+
+def filter_watchcount_history(
+    history: dict[str, dict],
+    retained_dates: list[str],
+) -> dict[str, dict]:
+    retained = set(retained_dates)
+    filtered: dict[str, dict] = {}
+    for field, entry in history.items():
+        points = {
+            point[0]: point[1]
+            for point in entry["points"]
+            if point[0] in retained
+        }
+        if points:
+            filtered[field] = _history_entry_from_points(entry["name"], points)
+    return dict(sorted(filtered.items()))
+
+
+def encode_watchcount_history(history: dict[str, dict]) -> list[object]:
+    fields: list[object] = []
+    for field in sorted(history):
+        fields.extend(
+            [
+                field,
+                json.dumps(history[field], ensure_ascii=False, separators=(",", ":")),
+            ]
+        )
+    return fields
+
+
+def _assert_hash_write_succeeded(operation: str, key: str, result: object) -> None:
+    if result == "OK":
+        return
+    if isinstance(result, int) and not isinstance(result, bool) and result >= 0:
+        return
+    if isinstance(result, str) and result.isdigit():
+        return
+    raise RuntimeError(f"Failed to {operation} {key}: {result!r}")
+
+
+def _assert_delete_succeeded(operation: str, keys: list[str], result: object) -> None:
+    if isinstance(result, int) and not isinstance(result, bool) and result >= 0:
+        return
+    if isinstance(result, str) and result.isdigit():
+        return
+    raise RuntimeError(f"Failed to {operation}: {keys!r}; result={result!r}")
+
+
+def _load_watchcount_snapshots_by_dates(
+    platform: str,
+    dates: list[str],
+    *,
+    upstash=upstash_request,
+) -> dict[str, dict]:
+    if not dates:
+        return {}
+    keys = [watchcount_key(platform, date_text) for date_text in dates]
+    raw = upstash(["MGET", *keys])
+    if not isinstance(raw, (list, tuple)) or len(raw) != len(keys):
+        raise RuntimeError(f"Unsupported MGET response for {platform} watchcount snapshots: {raw!r}")
+    snapshots: dict[str, dict] = {}
+    for date_text, key, value in zip(dates, keys, raw):
+        if value in (None, ""):
+            raise RuntimeError(f"Refusing to rebuild {platform} history: {key} is missing.")
+        snapshots[date_text] = decode_remote_watchcount_payload(key, value)
+    return snapshots
+
+
+def _watchcount_snapshot_date_from_key(platform: str, key: object) -> str | None:
+    if not isinstance(key, str):
+        return None
+    prefix = watchcount_key(platform, "")
+    if not key.startswith(prefix):
+        return None
+    suffix = key[len(prefix) :]
+    if suffix == "latest" or not WATCHCOUNT_DATE_PATTERN.fullmatch(suffix):
+        return None
+    try:
+        return normalize_watchcount_snapshot_date(suffix, key=key)
+    except RuntimeError:
+        return None
+
+
+def _scan_watchcount_snapshot_dates(platform: str, *, upstash=upstash_request) -> list[str]:
+    pattern = f"{watchcount_key(platform, '')}????-??-??"
+    cursor = "0"
+    seen_cursors: set[str] = set()
+    dates: set[str] = set()
+    while True:
+        if cursor in seen_cursors:
+            raise RuntimeError(f"SCAN for {pattern} returned a repeated cursor {cursor!r}.")
+        seen_cursors.add(cursor)
+        raw = upstash(["SCAN", cursor, "MATCH", pattern, "COUNT", str(WATCHCOUNT_SCAN_COUNT)])
+        if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+            raise RuntimeError(f"Unsupported SCAN response for {pattern}: {raw!r}")
+        next_cursor, keys = raw
+        if not isinstance(keys, list):
+            raise RuntimeError(f"Unsupported SCAN keys response for {pattern}: {keys!r}")
+        for remote_key in keys:
+            date_text = _watchcount_snapshot_date_from_key(platform, remote_key)
+            if date_text is not None:
+                dates.add(date_text)
+        cursor = str(next_cursor)
+        if cursor == "0":
+            return sorted(dates)
+
+
+def clear_watchcount_scan_cache() -> None:
+    _WATCHCOUNT_SCAN_CACHE.clear()
+
+
+def scan_watchcount_snapshot_dates(
+    platform: str,
+    *,
+    upstash=upstash_request,
+    cache_ttl_seconds: float = WATCHCOUNT_SCAN_CACHE_TTL_SECONDS,
+    use_cache: bool = True,
+) -> list[str]:
+    now = time.monotonic()
+    cached = _WATCHCOUNT_SCAN_CACHE.get(platform)
+    if use_cache and cached is not None and now - cached[0] < cache_ttl_seconds:
+        return list(cached[1])
+    dates = _scan_watchcount_snapshot_dates(platform, upstash=upstash)
+    _WATCHCOUNT_SCAN_CACHE[platform] = (now, dates)
+    return list(dates)
+
+
+def load_watchcount_snapshot_dates(
+    platform: str,
+    *,
+    upstash=upstash_request,
+    cache_ttl_seconds: float = WATCHCOUNT_SCAN_CACHE_TTL_SECONDS,
+) -> list[str]:
+    """Read the snapshot date list, preferring the index during rollout."""
+    index_key = watchcount_key(platform, "index")
+    try:
+        index = read_watchcount_index(platform, upstash=upstash)
+        if index is not None:
+            return list(index["dates"])
+    except Exception as exc:
+        print(f"[warn] {index_key}: index unavailable, using cached SCAN fallback: {exc}")
+    return scan_watchcount_snapshot_dates(
+        platform,
+        upstash=upstash,
+        cache_ttl_seconds=cache_ttl_seconds,
+        use_cache=True,
+    )
+
+
+def load_watchcount_snapshots(
+    platform: str,
+    *,
+    upstash=upstash_request,
+    cache_ttl_seconds: float = WATCHCOUNT_SCAN_CACHE_TTL_SECONDS,
+) -> dict[str, dict]:
+    """Load dated snapshots using the index-first date discovery path."""
+    snapshots: dict[str, dict] = {}
+    for date_text in load_watchcount_snapshot_dates(
+        platform,
+        upstash=upstash,
+        cache_ttl_seconds=cache_ttl_seconds,
+    ):
+        key = watchcount_key(platform, date_text)
+        try:
+            snapshots[date_text] = decode_remote_watchcount_payload(key, upstash(["GET", key]))
+        except RemoteJsonMissing:
+            print(f"[warn] {key}: indexed snapshot is missing")
+    return snapshots
+
+
 def load_watchcount_payload(path: Path) -> dict:
     payload = load_json(path, {"_meta": {"updated_at": None}, "counts": {}})
     if not isinstance(payload, dict):
@@ -368,13 +775,103 @@ def upload_watchcount_file(platform: str, path: Path, *, upstash=upstash_request
     latest_key = watchcount_key(platform, "latest")
     assert_watchcount_payload_is_safe(latest_key, payload)
     updated_at = watchcount_updated_at(payload) or datetime.now(timezone.utc)
-    date_key = watchcount_key(platform, updated_at.astimezone(timezone.utc).date().isoformat())
+    current_date = updated_at.astimezone(timezone.utc).date().isoformat()
+    date_key = watchcount_key(platform, current_date)
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     for key in (date_key, latest_key):
         result = upstash(["SET", key, encoded])
         if result != "OK":
             raise RuntimeError(f"Failed to upload {path.name} to {key}: {result!r}")
         print(f"[ok] uploaded {path.name} -> {key} ({len(encoded)} bytes)")
+
+    history_key = watchcount_key(platform, "history")
+    raw_history = upstash(["HGETALL", history_key])
+    history_fields = _watchcount_history_fields(raw_history, key=history_key)
+    history_invalid = False
+    try:
+        existing_history = decode_watchcount_history(platform, raw_history)
+    except RuntimeError as exc:
+        print(f"[warn] {history_key}: history unavailable, rebuilding from dated snapshots: {exc}")
+        existing_history = {}
+        history_invalid = True
+
+    existing_index = read_watchcount_index(platform, upstash=upstash)
+    if existing_index is None:
+        existing_dates = scan_watchcount_snapshot_dates(platform, upstash=upstash, use_cache=False)
+    else:
+        existing_dates = list(existing_index["dates"])
+    retained_dates = sorted(set(existing_dates) | {current_date})[-WATCHCOUNT_MAX_DATES:]
+    staging_dates = (
+        sorted(set(existing_dates) | {current_date})
+        if existing_index is not None
+        else retained_dates
+    )
+
+    needs_rebuild = existing_index is None or history_invalid or not existing_history
+    if needs_rebuild:
+        snapshots = _load_watchcount_snapshots_by_dates(platform, staging_dates, upstash=upstash)
+        staged_history = build_watchcount_history(platform, snapshots, max_points=None)
+    else:
+        staged_history = merge_watchcount_history(
+            existing_history,
+            payload,
+            current_date,
+            staging_dates,
+            max_points=None,
+        )
+    desired_history = filter_watchcount_history(staged_history, retained_dates)
+
+    staged_history_args = encode_watchcount_history(staged_history)
+    if staged_history_args:
+        result = upstash(["HSET", history_key, *staged_history_args])
+        _assert_hash_write_succeeded("write history hash", history_key, result)
+        print(f"[ok] staged watchcount history -> {history_key} ({len(staged_history)} dramas)")
+
+    index_payload = {
+        "version": WATCHCOUNT_INDEX_VERSION,
+        "platform": platform,
+        "updated_at": (
+            updated_at.astimezone(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        ),
+        "dates": retained_dates,
+    }
+    index_key = watchcount_key(platform, "index")
+    index_encoded = json.dumps(index_payload, ensure_ascii=False, separators=(",", ":"))
+    result = upstash(["SET", index_key, index_encoded])
+    if result != "OK":
+        raise RuntimeError(f"Failed to upload {path.name} index to {index_key}: {result!r}")
+    print(f"[ok] uploaded watchcount index -> {index_key} ({len(index_encoded)} bytes)")
+
+    if staged_history != desired_history:
+        desired_history_args = encode_watchcount_history(desired_history)
+        if desired_history_args:
+            result = upstash(["HSET", history_key, *desired_history_args])
+            _assert_hash_write_succeeded("trim history hash", history_key, result)
+            print(f"[ok] trimmed watchcount history -> {history_key} ({len(desired_history)} dramas)")
+
+    stale_history_fields = sorted((history_fields | set(staged_history)) - set(desired_history))
+    if stale_history_fields:
+        result = upstash(["HDEL", history_key, *stale_history_fields])
+        _assert_hash_write_succeeded("clean history hash", history_key, result)
+        print(f"[ok] deleted stale history fields from {history_key}: {len(stale_history_fields)}")
+
+    evicted_dates = set(existing_dates) - set(retained_dates)
+    if len(retained_dates) == WATCHCOUNT_MAX_DATES and existing_index is not None:
+        # The previous run may have committed the new index but failed during DEL.
+        # Re-scan only the mature 32-period set so a later retry can discover those orphans.
+        evicted_dates.update(
+            set(scan_watchcount_snapshot_dates(platform, upstash=upstash, use_cache=False))
+            - set(retained_dates)
+        )
+    evicted_dates = sorted(evicted_dates)
+    if evicted_dates:
+        evicted_keys = [watchcount_key(platform, date_text) for date_text in evicted_dates]
+        result = upstash(["DEL", *evicted_keys])
+        _assert_delete_succeeded("delete evicted watchcount snapshots", evicted_keys, result)
+        print(f"[ok] deleted evicted watchcount snapshots: {', '.join(evicted_keys)}")
 
 
 def write_json_work_copy(path: Path, payload: object) -> Path | None:

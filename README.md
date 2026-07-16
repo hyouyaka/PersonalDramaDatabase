@@ -136,6 +136,22 @@ python append_manbo_ids.py 2067945724439429338 2118896513449984153
 - 如果某条 `fetched_at` 距当前不足 1 小时，则跳过
 - 适合猫耳触发 `418` 后断点继续
 
+远端 Upstash 播放量存储：
+
+- `missevan:watchcount:YYYY-MM-DD` / `manbo:watchcount:YYYY-MM-DD`：按日期保存的快照
+- `missevan:watchcount:latest` / `manbo:watchcount:latest`：当前最新快照
+- `missevan:watchcount:index` / `manbo:watchcount:index`：快照日期索引，最多保留 32 期
+- `missevan:watchcount:history` / `manbo:watchcount:history`：Redis Hash，field 为 dramaId，value 为包含 `name` 和 `points` 的 JSON 字符串
+- 发布顺序为“dated snapshot → latest → HSET 暂存 history → index → 清理过期 points/field → 删除淘汰快照”；index 或 history 写入失败会使任务失败，重试可安全重复执行
+- 首次发布 index 时会通过 SCAN 回填已有日期；读取端优先使用 index，过渡期 index 缺失或不可用时使用带缓存的 SCAN fallback
+
+首发回填只读取已有 Upstash 快照，不请求平台 API：
+
+```powershell
+python backfill_watchcount_indexes.py --platform all --dry-run
+python backfill_watchcount_indexes.py --platform all --apply
+```
+
 用法：
 
 ```powershell

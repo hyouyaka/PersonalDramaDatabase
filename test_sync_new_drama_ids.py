@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import sync_new_drama_ids
 
@@ -201,13 +201,248 @@ class WatchcountSyncTests(unittest.TestCase):
                 tmp,
                 {"_meta": {"updated_at": "2026-06-12T04:17:39+00:00"}, "counts": {"100": {"view_count": 9}}},
             )
-            upstash = Mock(return_value="OK")
+            snapshot = path.read_text(encoding="utf-8")
+            upstash = Mock(side_effect=[
+                "OK", "OK", [], None,
+                ["0", ["missevan:watchcount:2026-06-12"]], [snapshot], 1, "OK",
+            ])
 
             sync_new_drama_ids.upload_watchcount_file("missevan", path, upstash=upstash)
 
         self.assertEqual(upstash.call_args_list[0].args[0][0:2], ["SET", "missevan:watchcount:2026-06-12"])
         self.assertEqual(upstash.call_args_list[1].args[0][0:2], ["SET", "missevan:watchcount:latest"])
         self.assertEqual(json.loads(upstash.call_args_list[0].args[0][2])["counts"]["100"]["view_count"], 9)
+        history = upstash.call_args_list[6].args[0]
+        self.assertEqual(history[:2], ["HSET", "missevan:watchcount:history"])
+        self.assertEqual(json.loads(history[3]), {"name": "", "points": [["2026-06-12", 9]]})
+        index = json.loads(upstash.call_args_list[7].args[0][2])
+        self.assertEqual(index["dates"], ["2026-06-12"])
+
+    def test_upload_watchcount_file_backfills_existing_dates_on_first_index_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_cache(
+                tmp,
+                {"_meta": {"updated_at": "2026-07-10T04:06:41+00:00"}, "counts": {}},
+            )
+            snapshots = [
+                json.dumps({"_meta": {"updated_at": f"{date}T04:06:41+00:00"}, "counts": {"100": {"name": "剧", "view_count": count}}})
+                for date, count in (("2026-06-19", 10), ("2026-06-26", 20), ("2026-07-03", 30), ("2026-07-10", 40))
+            ]
+            upstash = Mock(
+                side_effect=[
+                    "OK",
+                    "OK",
+                    [],
+                    None,
+                    [
+                        "0",
+                        [
+                            "missevan:watchcount:2026-07-03",
+                            "missevan:watchcount:2026-06-19",
+                            "missevan:watchcount:2026-07-10",
+                            "missevan:watchcount:2026-06-26",
+                            "missevan:watchcount:latest",
+                        ],
+                    ],
+                    snapshots,
+                    1,
+                    "OK",
+                ]
+            )
+
+            sync_new_drama_ids.upload_watchcount_file("missevan", path, upstash=upstash)
+
+        self.assertEqual(
+            [call.args[0][:2] for call in upstash.call_args_list],
+            [
+                ["SET", "missevan:watchcount:2026-07-10"],
+                ["SET", "missevan:watchcount:latest"],
+                ["HGETALL", "missevan:watchcount:history"],
+                ["GET", "missevan:watchcount:index"],
+                ["SCAN", "0"],
+                ["MGET", "missevan:watchcount:2026-06-19"],
+                ["HSET", "missevan:watchcount:history"],
+                ["SET", "missevan:watchcount:index"],
+            ],
+        )
+        history = json.loads(upstash.call_args_list[-2].args[0][3])
+        self.assertEqual(history["points"], [["2026-06-19", 10], ["2026-06-26", 20], ["2026-07-03", 30], ["2026-07-10", 40]])
+        index = json.loads(upstash.call_args_list[-1].args[0][2])
+        self.assertEqual(index, {
+            "version": 1,
+            "platform": "missevan",
+            "updated_at": "2026-07-10T04:06:41Z",
+            "dates": ["2026-06-19", "2026-06-26", "2026-07-03", "2026-07-10"],
+        })
+
+    def test_upload_watchcount_file_prunes_old_dates_only_after_index_write(self) -> None:
+        dates = [f"2026-05-{day:02d}" for day in range(1, 32)] + ["2026-06-01"]
+        current_index = json.dumps({
+            "version": 1,
+            "platform": "manbo",
+            "updated_at": "2026-07-03T04:06:41Z",
+            "dates": dates,
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_cache(
+                tmp,
+                {"_meta": {"updated_at": "2026-07-10T04:06:41+00:00"}, "counts": {"100": {"name": "剧", "view_count": 99}}},
+            )
+            history = json.dumps({
+                "name": "剧",
+                "points": [[date_text, index] for index, date_text in enumerate(dates)],
+            })
+            all_keys = [f"manbo:watchcount:{date}" for date in dates] + ["manbo:watchcount:2026-07-10"]
+            upstash = Mock(side_effect=["OK", "OK", ["100", history], current_index, 1, "OK", 0, ["0", all_keys], 1])
+
+            sync_new_drama_ids.upload_watchcount_file("manbo", path, upstash=upstash)
+
+        self.assertEqual(upstash.call_args_list[5].args[0][0:2], ["SET", "manbo:watchcount:index"])
+        staged_history = json.loads(upstash.call_args_list[4].args[0][3])
+        trimmed_history = json.loads(upstash.call_args_list[6].args[0][3])
+        self.assertEqual(len(staged_history["points"]), 33)
+        self.assertEqual(len(trimmed_history["points"]), 32)
+        self.assertEqual(staged_history["points"][0][0], "2026-05-01")
+        self.assertEqual(trimmed_history["points"][0][0], "2026-05-02")
+        self.assertEqual(
+            upstash.call_args_list[8].args[0],
+            ["DEL", "manbo:watchcount:2026-05-01"],
+        )
+        index = json.loads(upstash.call_args_list[5].args[0][2])
+        self.assertEqual(index["dates"], dates[1:] + ["2026-07-10"])
+
+    def test_index_write_failure_stops_before_snapshot_deletion(self) -> None:
+        dates = [f"2026-05-{day:02d}" for day in range(1, 32)] + ["2026-06-01"]
+        current_index = json.dumps({
+            "version": 1,
+            "platform": "missevan",
+            "updated_at": "2026-07-03T04:06:41Z",
+            "dates": dates,
+        })
+        existing_history = json.dumps({
+            "name": "剧",
+            "points": [[date_text, index] for index, date_text in enumerate(dates)],
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_cache(
+                tmp,
+                {"_meta": {"updated_at": "2026-07-10T04:06:41+00:00"}, "counts": {"100": {"name": "剧", "view_count": 99}}},
+            )
+            upstash = Mock(side_effect=["OK", "OK", ["100", existing_history], current_index, 1, "NO"])
+
+            with self.assertRaisesRegex(RuntimeError, "index"):
+                sync_new_drama_ids.upload_watchcount_file("missevan", path, upstash=upstash)
+
+        staged_history = json.loads(upstash.call_args_list[4].args[0][3])
+        self.assertEqual(len(staged_history["points"]), 33)
+        self.assertEqual(staged_history["points"][0][0], "2026-05-01")
+        self.assertEqual(staged_history["points"][-1], ["2026-07-10", 99])
+        self.assertNotIn("DEL", [call.args[0][0] for call in upstash.call_args_list])
+
+    def test_history_trim_failure_happens_after_index_commit_and_before_delete(self) -> None:
+        dates = [f"2026-05-{day:02d}" for day in range(1, 32)] + ["2026-06-01"]
+        current_index = json.dumps({
+            "version": 1,
+            "platform": "missevan",
+            "updated_at": "2026-06-01T04:06:41Z",
+            "dates": dates,
+        })
+        existing_history = json.dumps({
+            "name": "剧",
+            "points": [[date_text, index] for index, date_text in enumerate(dates)],
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_cache(
+                tmp,
+                {"_meta": {"updated_at": "2026-07-10T04:06:41+00:00"}, "counts": {"100": {"name": "剧", "view_count": 99}}},
+            )
+            upstash = Mock(side_effect=["OK", "OK", ["100", existing_history], current_index, 1, "OK", "NO"])
+
+            with self.assertRaisesRegex(RuntimeError, "trim history"):
+                sync_new_drama_ids.upload_watchcount_file("missevan", path, upstash=upstash)
+
+        self.assertEqual(upstash.call_args_list[5].args[0][:2], ["SET", "missevan:watchcount:index"])
+        self.assertEqual(upstash.call_args_list[6].args[0][:2], ["HSET", "missevan:watchcount:history"])
+        self.assertNotIn("DEL", [call.args[0][0] for call in upstash.call_args_list])
+
+    def test_history_update_is_idempotent_and_keeps_zero(self) -> None:
+        current_index = json.dumps({
+            "version": 1,
+            "platform": "missevan",
+            "updated_at": "2026-07-03T04:06:41Z",
+            "dates": ["2026-07-03", "2026-07-10"],
+        })
+        existing_history = [
+            "100",
+            json.dumps({
+                "name": "旧名称",
+                "points": [["2026-07-03", 12], ["2026-07-10", 8]],
+            }),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_cache(
+                tmp,
+                {"_meta": {"updated_at": "2026-07-10T04:06:41+00:00"}, "counts": {"100": {"name": "", "view_count": 0}, "bad": {"view_count": "NaN"}}},
+            )
+            upstash = Mock(side_effect=["OK", "OK", existing_history, current_index, 0, "OK"])
+
+            sync_new_drama_ids.upload_watchcount_file("missevan", path, upstash=upstash)
+
+        history_command = upstash.call_args_list[4].args[0]
+        history = json.loads(history_command[3])
+        self.assertEqual(history, {"name": "旧名称", "points": [["2026-07-03", 12], ["2026-07-10", 0]]})
+
+    def test_history_write_failure_stops_before_index_and_snapshot_deletion(self) -> None:
+        current_index = json.dumps({
+            "version": 1,
+            "platform": "manbo",
+            "updated_at": "2026-07-03T04:06:41Z",
+            "dates": ["2026-07-03"],
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_cache(
+                tmp,
+                {"_meta": {"updated_at": "2026-07-10T04:06:41+00:00"}, "counts": {"100": {"view_count": 1}}},
+            )
+            upstash = Mock(side_effect=["OK", "OK", ["100", json.dumps({"name": "剧", "points": [["2026-07-03", 1]]})], current_index, "NO"])
+
+            with self.assertRaisesRegex(RuntimeError, "history"):
+                sync_new_drama_ids.upload_watchcount_file("manbo", path, upstash=upstash)
+
+        self.assertNotIn("SET", [call.args[0][0] for call in upstash.call_args_list[4:]])
+        self.assertNotIn("DEL", [call.args[0][0] for call in upstash.call_args_list])
+
+    def test_load_watchcount_snapshot_dates_prefers_index_without_scan(self) -> None:
+        index = json.dumps({
+            "version": 1,
+            "platform": "missevan",
+            "updated_at": "2026-07-10T04:06:41Z",
+            "dates": ["2026-06-19", "2026-06-26"],
+        })
+        sync_new_drama_ids.clear_watchcount_scan_cache()
+        upstash = Mock(return_value=index)
+
+        dates = sync_new_drama_ids.load_watchcount_snapshot_dates("missevan", upstash=upstash)
+
+        self.assertEqual(dates, ["2026-06-19", "2026-06-26"])
+        upstash.assert_called_once_with(["GET", "missevan:watchcount:index"])
+
+    def test_load_watchcount_snapshot_dates_uses_cached_scan_when_index_missing(self) -> None:
+        sync_new_drama_ids.clear_watchcount_scan_cache()
+        upstash = Mock(side_effect=[None, ["0", [
+            "manbo:watchcount:2026-07-03",
+            "manbo:watchcount:latest",
+        ]], None])
+
+        first = sync_new_drama_ids.load_watchcount_snapshot_dates("manbo", upstash=upstash)
+        second = sync_new_drama_ids.load_watchcount_snapshot_dates("manbo", upstash=upstash)
+
+        self.assertEqual(first, ["2026-07-03"])
+        self.assertEqual(second, first)
+        self.assertEqual(
+            [call.args[0][0] for call in upstash.call_args_list],
+            ["GET", "SCAN", "GET"],
+        )
 
     def test_remote_watchcount_missing_counts_is_rejected_before_overwriting_local_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
