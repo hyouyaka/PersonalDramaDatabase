@@ -50,7 +50,10 @@ class BackfillMissevanCoversTests(unittest.TestCase):
             requester.request_json.assert_called_once_with(
                 "https://www.missevan.com/dramaapi/getdrama?drama_id=100"
             )
-            self.assertEqual(upstash.call_args.args[0][:2], ["SET", "missevan:info:v1"])
+            self.assertIn(
+                ["SET", "missevan:info:v1"],
+                [call.args[0][:2] for call in upstash.call_args_list],
+            )
 
     def test_existing_cover_is_skipped_without_force(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from sync_new_drama_ids import (
     upstash_request,
     write_json_work_copy,
 )
+from upstash_v2 import publish_info_v2_best_effort
 
 
 SAVE_EVERY = 25
@@ -68,6 +70,12 @@ def upload_manbo_info(path: Path, *, upstash=upstash_request) -> None:
     if result != "OK":
         raise RuntimeError(f"Failed to upload {path.name} to {MANBO_INFO_KEY}: {result!r}")
     print(f"[ok] uploaded {path.name} -> {MANBO_INFO_KEY}")
+    publish_info_v2_best_effort(
+        MANBO_INFO_KEY,
+        json.loads(value),
+        upstash=upstash,
+        source_encoded=value,
+    )
 
 
 def backfill_manbo_covers(

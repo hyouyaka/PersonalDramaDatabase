@@ -565,7 +565,11 @@ class InfoRefreshTests(unittest.TestCase):
         self.assertEqual(saved["100"]["title"], "并发新标题")
         self.assertTrue(saved["100"]["needpay"])
         self.assertEqual(saved["100"]["soundIds"], ["2002", "2001"])
-        self.assertEqual([command[0] for command in commands], ["GET", "EVAL", "GET", "EVAL"])
+        self.assertEqual([command[0] for command in commands[:4]], ["GET", "EVAL", "GET", "EVAL"])
+        self.assertEqual(
+            commands[4][3:6],
+            ["missevan:info:v1", "missevan:info:v2", "missevan:info:meta:v2"],
+        )
 
     def test_remote_info_patch_updates_manbo_sound_ids(self) -> None:
         remote = json.dumps(
@@ -593,7 +597,11 @@ class InfoRefreshTests(unittest.TestCase):
         self.assertEqual(stats["sound_ids_changed"], 1)
         self.assertEqual(saved["records"][0]["name"], "并发标题")
         self.assertEqual(saved["records"][0]["soundIds"], ["3002", "3001"])
-        self.assertEqual([command[0] for command in commands], ["GET", "EVAL"])
+        self.assertEqual([command[0] for command in commands[:2]], ["GET", "EVAL"])
+        self.assertEqual(
+            commands[2][3:6],
+            ["manbo:info:v1", "manbo:info:v2", "manbo:info:meta:v2"],
+        )
 
 
 if __name__ == "__main__":

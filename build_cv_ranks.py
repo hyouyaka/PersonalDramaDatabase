@@ -25,6 +25,7 @@ from sync_new_drama_ids import ROOT, configure_stdio, load_env_file, sync_remote
 from sync_new_drama_ids import MANBO_INFO_KEY, MISSEVAN_INFO_KEY
 from sync_remote_libraries import fetch_cvid_map_payload, fetch_info_payload, write_payloads
 from rank_key_cleanup import cleanup_legacy_cv_rank_keys, run_cleanup_best_effort
+from upstash_v2 import publish_cv_trend_v2, publish_trend_v2_best_effort
 
 
 HERE = Path(__file__).resolve().parent
@@ -557,7 +558,21 @@ def upload_cv_trends(
             raise RuntimeError(f"Failed to upload {key}: {result!r}")
         print(f"[ok] uploaded {key} ({len(encoded)} bytes, date={history_date})")
         payloads[platform] = payload
+    publish_trend_v2_best_effort(
+        "ranks:trend:cv:v2",
+        lambda: publish_cv_trend_v2(payloads, upstash=upstash),
+    )
     return payloads
+
+
+def backfill_cv_trend_v2(*, upstash=upstash_request) -> None:
+    payloads = {
+        platform: load_cv_trend_payload(platform, upstash=upstash)
+        for platform in PLATFORMS
+    }
+    if not all(isinstance(payload, dict) for payload in payloads.values()):
+        raise RuntimeError("Unable to backfill CV trend v2: one or more v1 payloads are missing")
+    publish_cv_trend_v2(payloads, upstash=upstash, force=True)
 
 
 def remove_cv_trend_samples_by_generated_at(payload: dict, generated_at: str) -> tuple[dict, dict[str, int]]:
@@ -760,6 +775,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--cleanup-trend-generated-at",
         help="Only remove CV trend samples whose generated_at exactly matches this value",
     )
+    parser.add_argument(
+        "--backfill-cv-trend-v2",
+        action="store_true",
+        help="Build the combined CV trend v2 hash from current Upstash v1 aggregates",
+    )
     return parser.parse_args(argv)
 
 
@@ -767,6 +787,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     configure_stdio()
     load_env_file(ROOT / ".env")
+    if args.backfill_cv_trend_v2:
+        backfill_cv_trend_v2()
+        print("[ok] backfilled ranks:trend:cv:v2")
+        return 0
     if args.cleanup_trend_generated_at:
         results = cleanup_remote_cv_trends_by_generated_at(args.cleanup_trend_generated_at)
         print("[ok] cleaned CV trends:", json.dumps(results, ensure_ascii=False))

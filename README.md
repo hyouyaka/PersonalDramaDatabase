@@ -152,6 +152,16 @@ python backfill_watchcount_indexes.py --platform all --dry-run
 python backfill_watchcount_indexes.py --platform all --apply
 ```
 
+v2 首发回填同样只读取现有 Upstash 数据，不请求平台 API：
+
+```powershell
+python sync_new_drama_ids.py --backfill-info-v2
+python fetch_rank_data.py --backfill-rank-trend-v2
+python build_cv_ranks.py --backfill-cv-trend-v2
+```
+
+`UPSTASH_V2_PUBLISH_MODE` 默认为 `best-effort`：所有 legacy key 先正常发布，再发布 v2；v2 失败只告警，不改变原任务退出码。紧急回滚可设为 `off`，v1 发布不受影响。
+
 用法：
 
 ```powershell

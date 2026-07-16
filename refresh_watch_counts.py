@@ -36,6 +36,7 @@ from sync_new_drama_ids import (
     upload_watchcount_file,
     upstash_request,
 )
+from upstash_v2 import publish_info_v2_best_effort
 
 
 CACHE_WINDOW = timedelta(hours=1)
@@ -187,6 +188,12 @@ def publish_info_observations(
         )
         if int(result or 0) == 1:
             save_json(path, store)
+            publish_info_v2_best_effort(
+                key,
+                store,
+                upstash=upstash,
+                source_encoded=encoded,
+            )
             return stats
     raise RuntimeError(f"Refusing to update info: {key} changed concurrently {max_attempts} times")
 

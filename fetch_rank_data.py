@@ -30,6 +30,11 @@ from platform_sync import (
     save_json as _save_json,
 )
 from rank_key_cleanup import cleanup_legacy_normal_rank_keys, run_cleanup_best_effort
+from upstash_v2 import (
+    publish_normal_trend_v2,
+    publish_peak_trend_v2,
+    publish_trend_v2_best_effort,
+)
 
 # ---------------------------------------------------------------------------
 # .env loading
@@ -630,6 +635,10 @@ def upload_rank_trend_snapshot(
     if result != "OK":
         raise RuntimeError(f"Failed to upload {key}: {result!r}")
     print(f"[ok] uploaded {key} ({len(encoded)} bytes, date={history_date})")
+    publish_trend_v2_best_effort(
+        f"{key}:v2",
+        lambda: publish_normal_trend_v2(platform, payload, upstash=upstash_request),
+    )
     return payload
 
 
@@ -727,7 +736,24 @@ def upload_missevan_peak_trend(
     if result != "OK":
         raise RuntimeError(f"Failed to upload {PEAK_TREND_KEY}: {result!r}")
     print(f"[ok] uploaded {PEAK_TREND_KEY} ({len(encoded)} bytes, date={history_date})")
+    publish_trend_v2_best_effort(
+        f"{PEAK_TREND_KEY}:v2",
+        lambda: publish_peak_trend_v2(payload, upstash=upstash_request),
+    )
     return payload
+
+
+def backfill_rank_trend_v2() -> None:
+    for platform in PLATFORMS:
+        key = TREND_KEYS[platform]
+        payload = _load_upstash_json_strict(key)
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Unable to backfill {key}: invalid payload")
+        publish_normal_trend_v2(platform, payload, upstash=upstash_request, force=True)
+    peak_payload = _load_upstash_json(PEAK_TREND_KEY)
+    if not isinstance(peak_payload, dict):
+        raise RuntimeError(f"Unable to backfill {PEAK_TREND_KEY}: invalid payload")
+    publish_peak_trend_v2(peak_payload, upstash=upstash_request, force=True)
 
 
 def _history_date_from_store_meta(store: dict) -> tuple[str, str]:
@@ -2303,6 +2329,10 @@ def write_repaired_danmaku_layers(
         if result != "OK":
             raise RuntimeError(f"Failed to upload {key}: {result!r}")
         print(f"[ok] repaired {key} ({len(encoded)} bytes)")
+    publish_trend_v2_best_effort(
+        f"{TREND_KEYS[platform]}:v2",
+        lambda: publish_normal_trend_v2(platform, trend_payload, upstash=upstash_request),
+    )
 
 
 def fetch_one_missevan_danmaku_count(drama_id: str, requester: MissevanRequester | None = None) -> tuple[str, int]:
@@ -2502,6 +2532,7 @@ def main() -> None:
     parser.add_argument("--benchmark-page-concurrency", type=int, default=MANBO_DANMAKU_PAGE_CONCURRENCY, help="Global page concurrency for Manbo benchmark")
     parser.add_argument("--benchmark-page-size", type=int, default=MANBO_DANMAKU_PAGE_SIZE, help="Page size for Manbo benchmark")
     parser.add_argument("--backfill-missevan-peak-trend-from-latest", action="store_true", help="Backfill Missevan peak view-count trend from ranks:latest")
+    parser.add_argument("--backfill-rank-trend-v2", action="store_true", help="Build v2 normal and peak trend hashes from current Upstash v1 aggregates")
     parser.add_argument("--repair-null-danmaku", action="store_true", help="Repair empty danmaku UID counts across Upstash rank layers")
     parser.add_argument("--repair-attempts", type=int, default=DANMAKU_DRAMA_RETRY_ATTEMPTS, help="Retry rounds for failed danmaku repairs")
     parser.add_argument("--dry-run", action="store_true", help="List repair targets without fetching or writing")
@@ -2517,6 +2548,12 @@ def main() -> None:
         for platform, enabled in (("missevan", do_missevan), ("manbo", do_manbo))
         if enabled
     )
+
+    if args.backfill_rank_trend_v2:
+        print("=== Backfilling rank trend v2 hashes ===")
+        backfill_rank_trend_v2()
+        print("=== Done (backfill-rank-trend-v2) ===")
+        return
 
     if args.repair_null_danmaku:
         print("=== Repairing null danmaku UID counts ===")

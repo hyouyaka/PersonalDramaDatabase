@@ -314,6 +314,10 @@ flowchart LR
 - `new:dramaIDs`
 - `missevan:info:v1`
 - `manbo:info:v1`
+- `missevan:info:v2` / `manbo:info:v2`
+- `missevan:info:meta:v2` / `manbo:info:meta:v2`
+
+`upstash_v2.py` 集中处理资料库双写。v1 成功后，helper 以 SHA-1 条件校验当前 v1 正文，并在同一 Lua 操作内写入无缩进 v2 JSON 与对应 meta；并发不匹配时按最新 v1 正文重建后重试。v2 失败只告警。`sync_new_drama_ids.py`、`refresh_watch_counts.py` 和两个封面回填入口均调用同一 helper。
 
 #### `fetch_ongoing.py`
 
@@ -362,6 +366,21 @@ flowchart LR
 - `ranks:cv:latest`：最新 CV 榜单
 - `ranks:trend:cv:{platform}`：CV 趋势聚合，内部保留最近 50 个日期样本
 - `ranks:meta`：普通榜单与 CV 榜单的发布完成时间
+
+v2 趋势层由 `upstash_v2.py` 生成并以 staging Hash + `RENAME` 原子替换：
+
+- `ranks:trend:missevan:v2` / `ranks:trend:manbo:v2`：field 为 dramaId，保留 45 天完整样本和更早一次 `lastRank`
+- `ranks:trend:peak:missevan:v2`：field 为系列名，保留 45 天完整样本和更早一次 `lastRank`
+- `ranks:trend:cv:v2`：field 为 `missevan:{规范化CV名}` 或 `manbo:{规范化CV名}`，保留 50 个周采样日期
+- 每个 Hash 均含 `__meta__`；staging 设置 24 小时 TTL，按最多 100 个 field 分批 `HSET`，通过 `HLEN` 和抽样 JSON 校验后，以同一 Lua 操作执行 `RENAME` 与 `PERSIST`，避免稳定 key 继承 staging TTL
+
+三个只读 Upstash 的 v2 回填入口：
+
+```powershell
+python sync_new_drama_ids.py --backfill-info-v2
+python fetch_rank_data.py --backfill-rank-trend-v2
+python build_cv_ranks.py --backfill-cv-trend-v2
+```
 
 不再创建 `ranks:partial:*`、`ranks:index`、`ranks:list:{date}:*`、
 `ranks:metrics:{date}:*` 和 `ranks:cv:{date}`。普通与 CV 发布成功后分别扫描并删除
@@ -472,6 +491,7 @@ GUI 现在不是一个简单 launcher，而是一个桌面工作台：
 
 - `UPSTASH_REDIS_REST_URL`
 - `UPSTASH_REDIS_REST_TOKEN`
+- `UPSTASH_V2_PUBLISH_MODE`：`best-effort`（默认）或 `off`；只控制新增 v2 发布，不改变 v1
 
 #### 猫耳 timeline 抓取
 

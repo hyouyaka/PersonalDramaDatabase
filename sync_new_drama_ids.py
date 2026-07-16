@@ -14,6 +14,8 @@ from pathlib import Path
 
 import requests
 
+from upstash_v2 import backfill_info_v2, publish_info_v2_best_effort
+
 from platform_sync import (
     COMBINED_CVID_MAP_PATH,
     MANBO_COUNTS_PATH,
@@ -164,6 +166,13 @@ def upload_json_file(key: str, path: Path, *, upstash=upstash_request) -> None:
     if result != "OK":
         raise RuntimeError(f"Failed to upload {path.name} to {key}: {result!r}")
     print(f"[ok] uploaded {path.name} -> {key}")
+    if key in (MISSEVAN_INFO_KEY, MANBO_INFO_KEY):
+        publish_info_v2_best_effort(
+            key,
+            json.loads(value),
+            upstash=upstash,
+            source_encoded=value,
+        )
 
 
 def upload_json_payload(key: str, payload: object, *, upstash=upstash_request) -> None:
@@ -175,6 +184,13 @@ def upload_json_payload(key: str, payload: object, *, upstash=upstash_request) -
     if result != "OK":
         raise RuntimeError(f"Failed to upload payload to {key}: {result!r}")
     print(f"[ok] uploaded payload -> {key}")
+    if key in (MISSEVAN_INFO_KEY, MANBO_INFO_KEY):
+        publish_info_v2_best_effort(
+            key,
+            payload,
+            upstash=upstash,
+            source_encoded=value,
+        )
 
 
 def write_info_payload(path: Path, payload: object) -> str:
@@ -1020,6 +1036,12 @@ def merge_and_upload_info_file(key: str, path: Path, drama_ids: list[str]) -> No
     if result != "OK":
         raise RuntimeError(f"Failed to upload merged {path.name} to {key}: {result!r}")
     print(f"[ok] merged and uploaded {path.name} -> {key}")
+    publish_info_v2_best_effort(
+        key,
+        merged,
+        upstash=upstash_request,
+        source_encoded=value,
+    )
 
 
 def is_missevan_ready(record: dict | None) -> bool:
@@ -1240,6 +1262,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Remove non-numeric 漫播 dramaIds from the active queue, info store, and latest watchcount",
     )
+    parser.add_argument(
+        "--backfill-info-v2",
+        action="store_true",
+        help="Build info v2 and meta keys from the current remote v1 libraries without platform API calls",
+    )
     return parser.parse_args(argv)
 
 
@@ -1247,6 +1274,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args([] if argv is None else argv)
     configure_stdio()
     load_env_file(ROOT / ".env")
+    if args.backfill_info_v2:
+        for key in (MANBO_INFO_KEY, MISSEVAN_INFO_KEY):
+            backfill_info_v2(key, upstash=upstash_request)
+        return 0
     if args.cleanup_invalid_manbo_ids:
         stats = cleanup_invalid_manbo_ids()
         print("[ok] cleaned invalid 漫播 dramaIds:", json.dumps(stats, ensure_ascii=False))
