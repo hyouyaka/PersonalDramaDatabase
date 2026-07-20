@@ -352,7 +352,7 @@ class MissevanCvMapEntryTests(unittest.TestCase):
 class MissevanIntroCvCandidateTests(unittest.TestCase):
     def test_filters_all_production_role_keywords_and_compounds(self) -> None:
         roles = [
-            "配音导演", "声音导演", "导演", "录音", "录音棚", "录音师", "录制",
+            "配音团队", "配音导演", "声音导演", "导演", "录音", "录音棚", "录音师", "录制",
             "监制", "剧本", "后期", "策划", "企划", "编剧", "制作人", "统筹", "对轨", "画本",
             "配乐", "原创配乐", "作词", "作曲", "演唱", "编曲", "和声", "混音", "母带",
             "rap", "RAP", "Rap", "海报设计", "视觉设计", "美工", "题字", "商务", "商务宣传",
@@ -363,6 +363,26 @@ class MissevanIntroCvCandidateTests(unittest.TestCase):
         candidates = refresh_platform_metadata.extract_missevan_intro_cv_candidates(intro, limit=100)
 
         self.assertEqual(candidates, [{"role_name": "角色甲", "display_name": "导演小王"}])
+
+    def test_94916_skips_voice_team_before_selecting_main_cvs(self) -> None:
+        intro = """
+        <p>🌳配音组：</p>
+        <p>配音团队：729声工场@729声工场</p>
+        <p>配音导演：刘校妤@牛怒牛笑魚</p>
+        <p>旁白：家明@家明_HF</p>
+        <p>温然/李述：孙路路@孙路路729</p>
+        <p>顾昀迟：张福正@歪歪福正了</p>
+        """
+
+        candidates = refresh_platform_metadata.extract_missevan_intro_cv_candidates(intro)
+
+        self.assertEqual(
+            candidates,
+            [
+                {"role_name": "温然/李述", "display_name": "孙路路"},
+                {"role_name": "顾昀迟", "display_name": "张福正"},
+            ],
+        )
 
     def test_extracts_candidates_from_plain_cv_section_titles(self) -> None:
         for title in ("配音组", "配音：", "CAST", "CV"):

@@ -75,6 +75,7 @@ MISSEVAN_INTRO_SECTION_PATTERN = re.compile(
 MISSEVAN_INTRO_ROLE_CV_PATTERN = re.compile(r"^(?P<role>[^：:\n]{1,40})[：:](?P<cv>.+)$")
 MISSEVAN_CV_SUFFIX_PATTERN = re.compile(r"\s*(?:@|＠|【|\[|（|\(|<|《).*$")
 MISSEVAN_INTRO_STAFF_ROLE_NAMES = {
+    "配音团队",
     "配音导演",
     "声音导演",
     "导演",
