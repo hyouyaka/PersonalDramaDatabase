@@ -145,14 +145,7 @@ python append_manbo_ids.py 2067945724439429338 2118896513449984153
 - 发布顺序为“dated snapshot → latest → HSET 暂存 history → index → 清理过期 points/field → 删除淘汰快照”；index 或 history 写入失败会使任务失败，重试可安全重复执行
 - 首次发布 index 时会通过 SCAN 回填已有日期；读取端优先使用 index，过渡期 index 缺失或不可用时使用带缓存的 SCAN fallback
 
-首发回填只读取已有 Upstash 快照，不请求平台 API：
-
-```powershell
-python backfill_watchcount_indexes.py --platform all --dry-run
-python backfill_watchcount_indexes.py --platform all --apply
-```
-
-v2 首发回填同样只读取现有 Upstash 数据，不请求平台 API：
+watchcount index/history 会在常规发布时自动初始化和维护。v2 首发回填只读取现有 Upstash 数据，不请求平台 API：
 
 ```powershell
 python sync_new_drama_ids.py --backfill-info-v2
@@ -160,7 +153,23 @@ python fetch_rank_data.py --backfill-rank-trend-v2
 python build_cv_ranks.py --backfill-cv-trend-v2
 ```
 
-`UPSTASH_V2_PUBLISH_MODE` 默认为 `best-effort`：所有 legacy key 先正常发布，再发布 v2；v2 失败只告警，不改变原任务退出码。紧急回滚可设为 `off`，v1 发布不受影响。
+清理已确认的非目标剧集时先预检，再显式应用；命令不会修改当前 CV 排名或 CV trend：
+
+```powershell
+python sync_new_drama_ids.py --purge-non-target-records
+python sync_new_drama_ids.py --purge-non-target-records --apply
+```
+
+清理会为所有待改写远端键生成 `recovery_backups` 备份，并在目标集合、远端版本或 CV 资源摘要不符合预期时停止。
+
+Info、普通榜、CV 榜及 trend v2 现为权威数据：正文与 Meta 使用 CAS 原子发布，冲突会重试，发布或校验失败会使任务失败。已存在的 legacy key 仅作为兼容副本同步，不会重新创建已退役的 legacy key。`UPSTASH_V2_PUBLISH_MODE=off` 只保留给非强制的旧版 v1→v2 兼容调用，不会关闭当前权威 v2 发布流程，不能作为紧急回滚开关。
+
+兼容期若需把已有 Info v1 校准为权威 v2，先预检再应用；命令会备份原始 v1/v2，并使用双端 CAS 防止覆盖并发更新：
+
+```powershell
+python sync_new_drama_ids.py --sync-info-v1-from-v2
+python sync_new_drama_ids.py --sync-info-v1-from-v2 --apply
+```
 
 用法：
 

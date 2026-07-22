@@ -4,7 +4,7 @@ import argparse
 import json
 import sys
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sync_new_drama_ids import ROOT, configure_stdio, load_env_file, upstash_request
 
@@ -20,13 +20,16 @@ end
 
 local function ensure_section(name)
   if type(meta[name]) ~= "table" then
-    meta[name] = {updatedAt = cjson.null, publishedAt = cjson.null}
+    meta[name] = {updatedAt = cjson.null, publishedAt = cjson.null, resources = {}}
+  elseif type(meta[name]["resources"]) ~= "table" then
+    meta[name]["resources"] = {}
   end
 end
 
 ensure_section("normal")
 ensure_section("cv")
-meta[ARGV[1]] = {updatedAt = ARGV[2], publishedAt = ARGV[2]}
+local resources = meta[ARGV[1]]["resources"]
+meta[ARGV[1]] = {updatedAt = ARGV[2], publishedAt = ARGV[2], resources = resources}
 
 local encoded = cjson.encode(meta)
 redis.call("SET", KEYS[1], encoded)
@@ -35,7 +38,7 @@ return encoded
 
 
 def current_local_iso() -> str:
-    return datetime.now().astimezone().replace(microsecond=0).isoformat()
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def _decode_meta(raw: object) -> dict:

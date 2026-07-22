@@ -9,21 +9,30 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
 
-from upstash_v2 import backfill_info_v2, publish_info_v2_best_effort
+from upstash_editor import RANK_META_KEY, build_rank_meta_update
+from upstash_v2 import (
+    NORMAL_TREND_V2_KEYS,
+    backfill_info_v2,
+    publish_hash_snapshot_atomic,
+    publish_info_v2,
+)
 
 from platform_sync import (
     COMBINED_CVID_MAP_PATH,
     MANBO_COUNTS_PATH,
     MANBO_INFO_PATH,
+    MISSEVAN_COUNTS_PATH,
     MISSEVAN_INFO_PATH,
     SERIES_INFO_PATH,
     iter_missevan_nodes,
     is_numeric_drama_id,
+    is_target_catalog,
     load_json,
     missevan_main_cv_entries,
     normalize,
@@ -32,8 +41,10 @@ from platform_sync import (
 
 ROOT = Path(__file__).resolve().parent
 QUEUE_KEY = "new:dramaIDs"
-MANBO_INFO_KEY = "manbo:info:v1"
-MISSEVAN_INFO_KEY = "missevan:info:v1"
+MANBO_INFO_KEY = "manbo:info:v2"
+MISSEVAN_INFO_KEY = "missevan:info:v2"
+MANBO_INFO_V1_KEY = "manbo:info:v1"
+MISSEVAN_INFO_V1_KEY = "missevan:info:v1"
 CVID_MAP_KEY = "cvid-map:v1"
 SERIES_INFO_KEY = "drama:series-info:v1"
 WATCHCOUNT_KEY_PREFIXES = {
@@ -60,6 +71,71 @@ end
 redis.call('SET', KEYS[1], ARGV[2])
 return 1
 """
+RANK_STRING_CAS_SCRIPT = """
+local current = redis.call('GET', KEYS[1])
+if not current or redis.sha1hex(current) ~= ARGV[1] then
+  return -1
+end
+local current_meta = redis.call('GET', KEYS[2])
+if ARGV[4] == '__missing__' then
+  if current_meta and current_meta ~= false then
+    return -2
+  end
+elseif not current_meta or redis.sha1hex(current_meta) ~= ARGV[4] then
+  return -2
+end
+redis.call('SET', KEYS[1], ARGV[2])
+redis.call('SET', KEYS[2], ARGV[3])
+return 1
+"""
+INFO_V1_FROM_V2_SYNC_SCRIPT = """
+local current_v2 = redis.call('GET', KEYS[1])
+if not current_v2 or redis.sha1hex(current_v2) ~= ARGV[1] then
+  return -1
+end
+local current_v1 = redis.call('GET', KEYS[2])
+if ARGV[2] == '__missing__' then
+  if current_v1 and current_v1 ~= false then
+    return -2
+  end
+elseif not current_v1 or redis.sha1hex(current_v1) ~= ARGV[2] then
+  return -2
+end
+redis.call('SET', KEYS[2], ARGV[3])
+return 1
+"""
+PURGE_TARGETS = {
+    "missevan": {"94774"},
+    "manbo": {
+        "1980419054065680620",
+        "2180409172502249674",
+        "2176429391381266656",
+        "2094741746226298944",
+        "1773267846462177300",
+        "2069704053985640400",
+        "1861156586873946000",
+        "2106915161011912700",
+        "1627842740605681700",
+        "1620749541986795500",
+        "2225949217547878400",
+        "2096533825625522200",
+        "2235647356781461500",
+        "2235627191910006800",
+        "201",
+    },
+}
+PURGE_MANBO_PODCAST_IDS = {
+    "1980419054065680620",
+    "2180409172502249674",
+    "2176429391381266656",
+    "2094741746226298944",
+}
+CV_REMOTE_KEYS = (
+    "ranks:cv:latest",
+    "ranks:trend:cv:missevan",
+    "ranks:trend:cv:manbo",
+    "ranks:trend:cv:v2",
+)
 
 
 class RemoteJsonMissing(RuntimeError):
@@ -157,22 +233,35 @@ def run_script(script_name: str, drama_ids: list[str]) -> None:
         raise RuntimeError(f"{script_name} failed with exit code {return_code}")
 
 
-def upload_json_file(key: str, path: Path, *, upstash=upstash_request) -> None:
+def upload_json_file(
+    key: str,
+    path: Path,
+    *,
+    upstash=upstash_request,
+    source_encoded: str | None = None,
+) -> None:
     value = path.read_text(encoding="utf-8")
     assert_info_upload_is_safe(key, value, path)
     if key == CVID_MAP_KEY:
         assert_cvid_map_upload_meets_remote_floor(json.loads(value), upstash=upstash)
+    if key in (MISSEVAN_INFO_KEY, MANBO_INFO_KEY):
+        if source_encoded is None:
+            raise RuntimeError(
+                f"Refusing to upload {key} without the original downloaded body for CAS"
+            )
+        publish_info_v2(
+            key,
+            json.loads(value),
+            upstash=upstash,
+            force=True,
+            source_encoded=source_encoded,
+        )
+        print(f"[ok] uploaded authoritative {path.name} -> {key}")
+        return
     result = upstash(["SET", key, value])
     if result != "OK":
         raise RuntimeError(f"Failed to upload {path.name} to {key}: {result!r}")
     print(f"[ok] uploaded {path.name} -> {key}")
-    if key in (MISSEVAN_INFO_KEY, MANBO_INFO_KEY):
-        publish_info_v2_best_effort(
-            key,
-            json.loads(value),
-            upstash=upstash,
-            source_encoded=value,
-        )
 
 
 def upload_json_payload(key: str, payload: object, *, upstash=upstash_request) -> None:
@@ -180,17 +269,21 @@ def upload_json_payload(key: str, payload: object, *, upstash=upstash_request) -
     assert_info_upload_is_safe(key, value, Path(key))
     if key == CVID_MAP_KEY:
         assert_cvid_map_upload_meets_remote_floor(payload, upstash=upstash)
+    if key in (MISSEVAN_INFO_KEY, MANBO_INFO_KEY):
+        current = upstash(["GET", key])
+        publish_info_v2(
+            key,
+            payload,
+            upstash=upstash,
+            force=True,
+            source_encoded=current if isinstance(current, str) else None,
+        )
+        print(f"[ok] uploaded authoritative payload -> {key}")
+        return
     result = upstash(["SET", key, value])
     if result != "OK":
         raise RuntimeError(f"Failed to upload payload to {key}: {result!r}")
     print(f"[ok] uploaded payload -> {key}")
-    if key in (MISSEVAN_INFO_KEY, MANBO_INFO_KEY):
-        publish_info_v2_best_effort(
-            key,
-            payload,
-            upstash=upstash,
-            source_encoded=value,
-        )
 
 
 def write_info_payload(path: Path, payload: object) -> str:
@@ -282,18 +375,30 @@ def assert_info_download_is_safe(key: str, payload: object) -> None:
         )
 
 
-def backup_local_info_file(path: Path) -> Path | None:
-    return backup_local_json_file(path)
-
-
 def backup_local_json_file(path: Path) -> Path | None:
     if not path.exists():
         return None
     backup_dir = ROOT / "recovery_backups"
     backup_dir.mkdir(exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    content = path.read_bytes()
+    content_digest = hashlib.sha256(content).digest()
+    suffix = f"_{path.name}"
+    candidates = sorted(
+        (
+            candidate
+            for candidate in backup_dir.iterdir()
+            if candidate.is_file() and candidate.name.endswith(suffix)
+        ),
+        key=lambda candidate: candidate.stat().st_mtime_ns,
+        reverse=True,
+    )
+    for candidate in candidates:
+        if hashlib.sha256(candidate.read_bytes()).digest() == content_digest:
+            return candidate
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     backup_path = backup_dir / f"{stamp}_{path.name}"
-    backup_path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    backup_path.write_bytes(content)
     return backup_path
 
 
@@ -466,12 +571,6 @@ def decode_watchcount_history(platform: str, raw: object) -> dict[str, dict]:
             raise RuntimeError(f"Refusing to use {key}: history field {field!r} is not a dramaId.")
         history[field] = _decode_watchcount_history_entry(field, value, key=key)
     return history
-
-
-def read_watchcount_history(platform: str, *, upstash=upstash_request) -> tuple[object, dict[str, dict]]:
-    key = watchcount_key(platform, "history")
-    raw = upstash(["HGETALL", key])
-    return raw, decode_watchcount_history(platform, raw)
 
 
 def _history_entry_from_points(
@@ -716,27 +815,6 @@ def load_watchcount_snapshot_dates(
         cache_ttl_seconds=cache_ttl_seconds,
         use_cache=True,
     )
-
-
-def load_watchcount_snapshots(
-    platform: str,
-    *,
-    upstash=upstash_request,
-    cache_ttl_seconds: float = WATCHCOUNT_SCAN_CACHE_TTL_SECONDS,
-) -> dict[str, dict]:
-    """Load dated snapshots using the index-first date discovery path."""
-    snapshots: dict[str, dict] = {}
-    for date_text in load_watchcount_snapshot_dates(
-        platform,
-        upstash=upstash,
-        cache_ttl_seconds=cache_ttl_seconds,
-    ):
-        key = watchcount_key(platform, date_text)
-        try:
-            snapshots[date_text] = decode_remote_watchcount_payload(key, upstash(["GET", key]))
-        except RemoteJsonMissing:
-            print(f"[warn] {key}: indexed snapshot is missing")
-    return snapshots
 
 
 def load_watchcount_payload(path: Path) -> dict:
@@ -1026,22 +1104,21 @@ def merge_info_payload_for_ids(key: str, remote_store: object, local_store: obje
 
 
 def merge_and_upload_info_file(key: str, path: Path, drama_ids: list[str]) -> None:
-    latest_remote = decode_remote_info_payload(key, upstash_request(["GET", key]))
+    latest_raw = upstash_request(["GET", key])
+    latest_remote = decode_remote_info_payload(key, latest_raw)
     assert_info_download_is_safe(key, latest_remote)
     local_payload = load_json(path, {})
     merged = merge_info_payload_for_ids(key, latest_remote, local_payload, drama_ids)
     value = write_info_payload(path, merged)
     assert_info_upload_is_safe(key, value, path)
-    result = upstash_request(["SET", key, value])
-    if result != "OK":
-        raise RuntimeError(f"Failed to upload merged {path.name} to {key}: {result!r}")
-    print(f"[ok] merged and uploaded {path.name} -> {key}")
-    publish_info_v2_best_effort(
+    publish_info_v2(
         key,
         merged,
         upstash=upstash_request,
-        source_encoded=value,
+        force=True,
+        source_encoded=latest_raw if isinstance(latest_raw, str) else None,
     )
+    print(f"[ok] merged and uploaded authoritative {path.name} -> {key}")
 
 
 def is_missevan_ready(record: dict | None) -> bool:
@@ -1083,6 +1160,13 @@ def is_manbo_ready(record: dict | None) -> bool:
 
 
 def prune_queue(queue: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Keep only records that were fetched but are still incomplete.
+
+    The append scripts remove newly-created placeholders when the platform
+    detail response explicitly rejects an ID.  A successful append subprocess
+    followed by a missing local record therefore means the queue item was
+    consumed, not that it should be retried forever.
+    """
     missevan_store = load_json(MISSEVAN_INFO_PATH, {})
     manbo_store = load_json(MANBO_INFO_PATH, {"records": []})
     missevan_index = build_missevan_index(missevan_store)
@@ -1090,12 +1174,16 @@ def prune_queue(queue: dict[str, list[str]]) -> dict[str, list[str]]:
     remaining_missevan = [
         drama_id
         for drama_id in queue.get("missevan", [])
-        if is_numeric_drama_id(drama_id) and not is_missevan_ready(missevan_index.get(drama_id))
+        if is_numeric_drama_id(drama_id)
+        and drama_id in missevan_index
+        and not is_missevan_ready(missevan_index[drama_id])
     ]
     remaining_manbo = [
         drama_id
         for drama_id in queue.get("manbo", [])
-        if is_numeric_drama_id(drama_id) and not is_manbo_ready(manbo_index.get(drama_id))
+        if is_numeric_drama_id(drama_id)
+        and drama_id in manbo_index
+        and not is_manbo_ready(manbo_index[drama_id])
     ]
     return {"manbo": remaining_manbo, "missevan": remaining_missevan}
 
@@ -1209,16 +1297,26 @@ def cleanup_invalid_manbo_ids(
             removed[kind] = len(counts) - len(cleaned["counts"])
 
         encoded = json.dumps(cleaned, ensure_ascii=False, separators=(",", ":"))
-        result = upstash(
-            [
-                "EVAL",
-                INVALID_MANBO_ID_CLEANUP_SCRIPT,
-                1,
+        if kind == "info":
+            publish_info_v2(
                 key,
-                hashlib.sha1(raw.encode("utf-8")).hexdigest(),
-                encoded,
-            ]
-        )
+                cleaned,
+                upstash=upstash,
+                force=True,
+                source_encoded=raw,
+            )
+            result = 1
+        else:
+            result = upstash(
+                [
+                    "EVAL",
+                    INVALID_MANBO_ID_CLEANUP_SCRIPT,
+                    1,
+                    key,
+                    hashlib.sha1(raw.encode("utf-8")).hexdigest(),
+                    encoded,
+                ]
+            )
         if int(result or 0) != 1:
             raise RuntimeError(f"Refusing to clean {key}: remote payload changed concurrently")
         verified_raw = upstash(["GET", key])
@@ -1244,6 +1342,540 @@ def cleanup_invalid_manbo_ids(
     return removed
 
 
+def _purge_rank_items(rank: dict, target_ids: set[str]) -> int:
+    removed = 0
+    kept: list[object] = []
+    for item in rank.get("items") or []:
+        if not isinstance(item, dict):
+            kept.append(item)
+            continue
+        list_key = "dramaIds" if "dramaIds" in item else "drama_ids" if "drama_ids" in item else None
+        if list_key is not None:
+            original = [str(value) for value in (item.get(list_key) or [])]
+            filtered = [value for value in original if value not in target_ids]
+            removed += len(original) - len(filtered)
+            if not filtered:
+                continue
+            updated = dict(item)
+            updated[list_key] = filtered
+            kept.append(updated)
+            continue
+        drama_id = normalize(item.get("dramaId") or item.get("drama_id") or item.get("id"))
+        if drama_id in target_ids:
+            removed += 1
+            continue
+        kept.append(item)
+    rank["items"] = kept
+    return removed
+
+
+def purge_rank_store(payload: dict, targets: dict[str, set[str]]) -> dict[str, int]:
+    removed = {"missevan_dramas": 0, "manbo_dramas": 0, "rank_items": 0}
+    for platform, target_ids in targets.items():
+        section = payload.get(platform) if isinstance(payload, dict) else None
+        if not isinstance(section, dict):
+            continue
+        dramas = section.get("dramas")
+        if isinstance(dramas, dict):
+            for drama_id in target_ids:
+                if dramas.pop(drama_id, None) is not None:
+                    removed[f"{platform}_dramas"] += 1
+        ranks = section.get("ranks")
+        if isinstance(ranks, dict):
+            for rank in ranks.values():
+                if isinstance(rank, dict):
+                    removed["rank_items"] += _purge_rank_items(rank, target_ids)
+    return removed
+
+
+def rank_store_target_hits(payload: dict, targets: dict[str, set[str]]) -> dict[str, list[str]]:
+    hits: dict[str, list[str]] = {}
+    for platform, target_ids in targets.items():
+        section = payload.get(platform) if isinstance(payload, dict) else None
+        if not isinstance(section, dict):
+            continue
+        found = set((section.get("dramas") or {})) & target_ids if isinstance(section.get("dramas"), dict) else set()
+        ranks = section.get("ranks")
+        if isinstance(ranks, dict):
+            for rank in ranks.values():
+                if not isinstance(rank, dict):
+                    continue
+                for item in rank.get("items") or []:
+                    if isinstance(item, dict):
+                        values = item.get("dramaIds") or item.get("drama_ids")
+                        if values:
+                            found.update(str(value) for value in values if str(value) in target_ids)
+                            continue
+                        value = item.get("dramaId") or item.get("drama_id") or item.get("id")
+                    else:
+                        value = item
+                    if value not in (None, "") and str(value) in target_ids:
+                        found.add(str(value))
+        if found:
+            hits[platform] = sorted(found)
+    return hits
+
+
+def _add_verification_hits(output: dict[str, list[str]], key: str, values: set[str]) -> None:
+    if values:
+        output[key] = sorted(values)
+
+
+def verify_purged_non_cv_remote_references(
+    dates: dict[str, list[str]],
+    *,
+    upstash=upstash_request,
+) -> dict[str, list[str]]:
+    """Return target drama-ID references that remain in any non-CV remote layer."""
+    hits: dict[str, list[str]] = {}
+
+    for platform, info_key, legacy_key in (
+        ("missevan", MISSEVAN_INFO_KEY, MISSEVAN_INFO_V1_KEY),
+        ("manbo", MANBO_INFO_KEY, MANBO_INFO_V1_KEY),
+    ):
+        target_ids = PURGE_TARGETS[platform]
+        for key in (info_key, legacy_key):
+            raw = upstash(["GET", key])
+            if not isinstance(raw, str):
+                continue
+            payload = decode_remote_info_payload(key, raw)
+            indexed = build_missevan_index(payload) if platform == "missevan" else build_manbo_index(payload)
+            _add_verification_hits(hits, key, set(indexed) & target_ids)
+
+    raw_queue = upstash(["GET", QUEUE_KEY])
+    if isinstance(raw_queue, str):
+        queue = decode_remote_json_payload(QUEUE_KEY, raw_queue)
+        for platform, target_ids in PURGE_TARGETS.items():
+            _add_verification_hits(
+                hits,
+                f"{QUEUE_KEY}.{platform}",
+                {str(value) for value in (queue.get(platform) or [])} & target_ids,
+            )
+
+    for platform, target_ids in PURGE_TARGETS.items():
+        for suffix in [*dates[platform], "latest"]:
+            key = watchcount_key(platform, suffix)
+            raw = upstash(["GET", key])
+            if not isinstance(raw, str):
+                continue
+            payload = decode_remote_watchcount_payload(key, raw)
+            _add_verification_hits(hits, key, set(payload.get("counts") or {}) & target_ids)
+
+        history_key = watchcount_key(platform, "history")
+        history_fields = _watchcount_history_fields(upstash(["HGETALL", history_key]), key=history_key)
+        _add_verification_hits(hits, history_key, history_fields & target_ids)
+
+        legacy_trend_key = f"ranks:trend:{platform}"
+        legacy_raw = upstash(["GET", legacy_trend_key])
+        if isinstance(legacy_raw, str):
+            legacy = decode_remote_json_payload(legacy_trend_key, legacy_raw)
+            dramas = legacy.get("dramas") if isinstance(legacy, dict) else None
+            if isinstance(dramas, dict):
+                _add_verification_hits(hits, legacy_trend_key, set(dramas) & target_ids)
+
+        v2_key = NORMAL_TREND_V2_KEYS[platform]
+        _meta, fields, _meta_raw = _decode_hash_snapshot(v2_key, upstash(["HGETALL", v2_key]))
+        _add_verification_hits(hits, v2_key, set(fields) & target_ids)
+
+    raw_ranks = upstash(["GET", "ranks:latest"])
+    if isinstance(raw_ranks, str):
+        rank_hits = rank_store_target_hits(decode_remote_json_payload("ranks:latest", raw_ranks), PURGE_TARGETS)
+        for platform, values in rank_hits.items():
+            hits[f"ranks:latest.{platform}"] = values
+    return hits
+
+
+def _decode_hash_snapshot(key: str, raw: object) -> tuple[dict, dict[str, dict], str | None]:
+    if not isinstance(raw, list) or len(raw) % 2:
+        raise RuntimeError(f"Refusing to clean {key}: expected an HGETALL array")
+    meta: dict = {}
+    fields: dict[str, dict] = {}
+    meta_raw: str | None = None
+    for index in range(0, len(raw), 2):
+        field = str(raw[index])
+        value = raw[index + 1]
+        if not isinstance(value, str):
+            raise RuntimeError(f"Refusing to clean {key}: field {field!r} is not encoded JSON")
+        parsed = json.loads(value)
+        if field == "__meta__":
+            if not isinstance(parsed, dict):
+                raise RuntimeError(f"Refusing to clean {key}: invalid __meta__")
+            meta = parsed
+            meta_raw = value
+        elif isinstance(parsed, dict):
+            fields[field] = parsed
+        else:
+            raise RuntimeError(f"Refusing to clean {key}: invalid field {field!r}")
+    return meta, fields, meta_raw
+
+
+def _remote_digest(key: str, *, upstash=upstash_request) -> str:
+    key_type = str(upstash(["TYPE", key]) or "none")
+    if key_type == "hash":
+        raw = upstash(["HGETALL", key]) or []
+        pairs = sorted((str(raw[index]), str(raw[index + 1])) for index in range(0, len(raw), 2))
+        encoded = json.dumps(pairs, ensure_ascii=False, separators=(",", ":"))
+    else:
+        raw = upstash(["GET", key])
+        encoded = "" if raw is None else str(raw)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _backup_remote_value(backup_dir: Path, key: str, raw: object) -> None:
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    path = backup_dir / f"{key.replace(':', '-')}.json"
+    if isinstance(raw, str):
+        path.write_text(raw, encoding="utf-8")
+    else:
+        path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def create_purge_backup_dir(*, root: Path | None = None) -> Path:
+    backup_root = (root or ROOT) / "recovery_backups"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    path = backup_root / f"{stamp}_{uuid.uuid4().hex}_purge_non_target_records"
+    path.mkdir(parents=True, exist_ok=False)
+    return path
+
+
+def create_info_v1_sync_backup_dir(*, root: Path | None = None) -> Path:
+    backup_root = (root or ROOT) / "recovery_backups"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    path = backup_root / f"{stamp}_{uuid.uuid4().hex}_sync_info_v1_from_v2"
+    path.mkdir(parents=True, exist_ok=False)
+    return path
+
+
+def sync_info_v1_from_v2(
+    *,
+    apply: bool,
+    upstash=upstash_request,
+    backup_root: Path | None = None,
+) -> dict[str, object]:
+    resources: list[dict[str, object]] = []
+    snapshots: list[tuple[str, str, str, str | None]] = []
+    for platform, v2_key, v1_key in (
+        ("missevan", MISSEVAN_INFO_KEY, MISSEVAN_INFO_V1_KEY),
+        ("manbo", MANBO_INFO_KEY, MANBO_INFO_V1_KEY),
+    ):
+        raw_v2 = upstash(["GET", v2_key])
+        raw_v1 = upstash(["GET", v1_key])
+        if not isinstance(raw_v2, str) or not raw_v2:
+            raise RuntimeError(f"Refusing v1 sync: authoritative {v2_key} is missing")
+        v2_payload = decode_remote_info_payload(v2_key, raw_v2)
+        assert_info_download_is_safe(v2_key, v2_payload)
+        v1_valid: bool | None
+        if raw_v1 not in (None, ""):
+            if not isinstance(raw_v1, str):
+                raise RuntimeError(f"Refusing v1 sync: unsupported {v1_key} value")
+            try:
+                decode_remote_info_payload(v1_key, raw_v1)
+                v1_valid = True
+            except RuntimeError:
+                # v1 is only a compatibility mirror. Keep its exact raw body
+                # for backup/CAS so an authoritative v2 can repair corruption.
+                v1_valid = False
+        else:
+            raw_v1 = None
+            v1_valid = None
+        different = raw_v1 != raw_v2
+        resources.append(
+            {
+                "platform": platform,
+                "v2Key": v2_key,
+                "v1Key": v1_key,
+                "v1Exists": raw_v1 is not None,
+                "v1Valid": v1_valid,
+                "different": different,
+                "v2Sha1": hashlib.sha1(raw_v2.encode("utf-8")).hexdigest(),
+                "v1Sha1": (
+                    hashlib.sha1(raw_v1.encode("utf-8")).hexdigest()
+                    if isinstance(raw_v1, str)
+                    else None
+                ),
+            }
+        )
+        snapshots.append((v2_key, v1_key, raw_v2, raw_v1))
+
+    summary: dict[str, object] = {
+        "mode": "apply" if apply else "dry-run",
+        "resources": resources,
+        "changed": sum(1 for item in resources if item["different"]),
+    }
+    if not apply or not summary["changed"]:
+        return summary
+
+    backup_dir = create_info_v1_sync_backup_dir(root=backup_root)
+    for v2_key, v1_key, raw_v2, raw_v1 in snapshots:
+        _backup_remote_value(backup_dir, v2_key, raw_v2)
+        if raw_v1 is not None:
+            _backup_remote_value(backup_dir, v1_key, raw_v1)
+
+    for v2_key, v1_key, raw_v2, raw_v1 in snapshots:
+        if raw_v1 == raw_v2:
+            continue
+        result = upstash(
+            [
+                "EVAL",
+                INFO_V1_FROM_V2_SYNC_SCRIPT,
+                2,
+                v2_key,
+                v1_key,
+                hashlib.sha1(raw_v2.encode("utf-8")).hexdigest(),
+                (
+                    hashlib.sha1(raw_v1.encode("utf-8")).hexdigest()
+                    if isinstance(raw_v1, str)
+                    else "__missing__"
+                ),
+                raw_v2,
+            ]
+        )
+        if int(result or 0) == -1:
+            raise RuntimeError(f"Refusing v1 sync: {v2_key} changed concurrently")
+        if int(result or 0) != 1:
+            raise RuntimeError(f"Refusing v1 sync: {v1_key} changed concurrently")
+
+    for v2_key, v1_key, _raw_v2, _raw_v1 in snapshots:
+        verified_v2 = upstash(["GET", v2_key])
+        verified_v1 = upstash(["GET", v1_key])
+        if not isinstance(verified_v2, str) or verified_v1 != verified_v2:
+            raise RuntimeError(f"Failed to verify synchronized compatibility key {v1_key}")
+    summary["backupDir"] = str(backup_dir)
+    return summary
+
+
+def _cas_set_json(key: str, raw: str, payload: object, *, upstash=upstash_request) -> None:
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    result = upstash(
+        [
+            "EVAL",
+            INVALID_MANBO_ID_CLEANUP_SCRIPT,
+            1,
+            key,
+            hashlib.sha1(raw.encode("utf-8")).hexdigest(),
+            encoded,
+        ]
+    )
+    if int(result or 0) != 1:
+        raise RuntimeError(f"Refusing to clean {key}: remote payload changed concurrently")
+    if upstash(["GET", key]) != encoded:
+        raise RuntimeError(f"Failed to verify cleaned {key}")
+
+
+def _publish_rank_latest_cas(raw: str, payload: dict, *, upstash=upstash_request) -> None:
+    encoded = json.dumps(payload, ensure_ascii=False)
+    digest = hashlib.sha1(encoded.encode("utf-8")).hexdigest()
+    byte_count = len(encoded.encode("utf-8"))
+    updated_at = str((payload.get("_meta") or {}).get("updated_at") or datetime.now(timezone.utc).isoformat())
+    rank_meta: dict | None = None
+    for _attempt in range(3):
+        current_meta = upstash(["GET", RANK_META_KEY])
+        rank_meta = build_rank_meta_update(
+            current_meta,
+            scope="normal",
+            key="ranks:latest",
+            data_type="string",
+            content_sha1=digest,
+            byte_count=byte_count,
+            updated_at=updated_at,
+        )
+        result = upstash(
+            [
+                "EVAL",
+                RANK_STRING_CAS_SCRIPT,
+                2,
+                "ranks:latest",
+                RANK_META_KEY,
+                hashlib.sha1(raw.encode("utf-8")).hexdigest(),
+                encoded,
+                json.dumps(rank_meta, ensure_ascii=False, separators=(",", ":")),
+                (
+                    hashlib.sha1(current_meta.encode("utf-8")).hexdigest()
+                    if isinstance(current_meta, str)
+                    else "__missing__"
+                ),
+            ]
+        )
+        if int(result or 0) == 1:
+            break
+        if int(result or 0) == -1:
+            raise RuntimeError("Refusing to clean ranks:latest: remote payload changed concurrently")
+    else:
+        raise RuntimeError("Refusing to clean ranks:latest: ranks:meta changed concurrently")
+    if upstash(["GET", "ranks:latest"]) != encoded:
+        raise RuntimeError("Failed to verify cleaned ranks:latest")
+
+
+def _validate_purge_targets(missevan: dict, manbo: dict) -> tuple[list[dict[str, object]], list[dict[str, str]]]:
+    missevan_index = build_missevan_index(missevan)
+    manbo_index = build_manbo_index(manbo)
+    found: list[dict[str, object]] = []
+    missing: list[dict[str, str]] = []
+    for drama_id in sorted(PURGE_TARGETS["missevan"]):
+        record = missevan_index.get(drama_id)
+        if record is None:
+            missing.append({"platform": "missevan", "dramaId": drama_id})
+            continue
+        if is_target_catalog("missevan", record.get("catalog")):
+            raise RuntimeError(f"Refusing purge: unexpected 猫耳 target state for {drama_id}")
+        found.append({"platform": "missevan", "dramaId": drama_id, "title": normalize(record.get("title")), "catalog": record.get("catalog")})
+    for drama_id in sorted(PURGE_TARGETS["manbo"]):
+        record = manbo_index.get(drama_id)
+        if record is None:
+            missing.append({"platform": "manbo", "dramaId": drama_id})
+            continue
+        title = normalize(record.get("name"))
+        catalog = record.get("catalog")
+        expected_podcast = drama_id in PURGE_MANBO_PODCAST_IDS
+        if expected_podcast and (catalog != 4 or not title):
+            raise RuntimeError(f"Refusing purge: unexpected 漫播播客 state for {drama_id}")
+        if not expected_podcast and (title or catalog not in (None, "")):
+            raise RuntimeError(f"Refusing purge: unexpected 漫播 placeholder state for {drama_id}")
+        found.append({"platform": "manbo", "dramaId": drama_id, "title": title, "catalog": catalog})
+    if len(found) + len(missing) != 16:
+        raise RuntimeError(f"Refusing purge: expected 16 exact targets, classified {len(found) + len(missing)}")
+    return found, missing
+
+
+def purge_non_target_records(*, apply: bool, upstash=upstash_request) -> dict[str, object]:
+    raw_missevan = upstash(["GET", MISSEVAN_INFO_KEY])
+    raw_manbo = upstash(["GET", MANBO_INFO_KEY])
+    if not isinstance(raw_missevan, str) or not isinstance(raw_manbo, str):
+        raise RuntimeError("Refusing purge: authoritative info stores are missing")
+    missevan = decode_remote_info_payload(MISSEVAN_INFO_KEY, raw_missevan)
+    manbo = decode_remote_info_payload(MANBO_INFO_KEY, raw_manbo)
+    targets, missing_targets = _validate_purge_targets(missevan, manbo)
+    dates = {platform: load_watchcount_snapshot_dates(platform, upstash=upstash) for platform in PURGE_TARGETS}
+    summary: dict[str, object] = {
+        "mode": "apply" if apply else "dry-run",
+        "targets": targets,
+        "missingTargets": missing_targets,
+        "alreadyPurged": not targets,
+        "snapshotDates": dates,
+    }
+    if not apply:
+        return summary
+
+    cv_before = {key: _remote_digest(key, upstash=upstash) for key in CV_REMOTE_KEYS}
+    backup_dir = create_purge_backup_dir()
+    string_keys = {
+        QUEUE_KEY,
+        MISSEVAN_INFO_KEY,
+        MANBO_INFO_KEY,
+        MISSEVAN_INFO_V1_KEY,
+        MANBO_INFO_V1_KEY,
+        "missevan:info:meta:v2",
+        "manbo:info:meta:v2",
+        RANK_META_KEY,
+        "ranks:latest",
+        "ranks:trend:missevan",
+        "ranks:trend:manbo",
+    }
+    for platform, platform_dates in dates.items():
+        string_keys.add(watchcount_key(platform, "latest"))
+        string_keys.update(watchcount_key(platform, date) for date in platform_dates)
+    for key in sorted(string_keys):
+        raw = upstash(["GET", key])
+        if raw is not None:
+            _backup_remote_value(backup_dir, key, raw)
+    for key in ("missevan:watchcount:history", "manbo:watchcount:history", *NORMAL_TREND_V2_KEYS.values()):
+        _backup_remote_value(backup_dir, key, upstash(["HGETALL", key]) or [])
+
+    cleaned_missevan = dict(missevan)
+    for drama_id in PURGE_TARGETS["missevan"]:
+        cleaned_missevan.pop(drama_id, None)
+    cleaned_manbo = dict(manbo)
+    cleaned_manbo["records"] = [
+        record
+        for record in (manbo.get("records") or [])
+        if normalize(record.get("dramaId")) not in PURGE_TARGETS["manbo"]
+    ]
+    publish_info_v2(MISSEVAN_INFO_KEY, cleaned_missevan, upstash=upstash, force=True, source_encoded=raw_missevan)
+    publish_info_v2(MANBO_INFO_KEY, cleaned_manbo, upstash=upstash, force=True, source_encoded=raw_manbo)
+
+    raw_queue = upstash(["GET", QUEUE_KEY])
+    if isinstance(raw_queue, str):
+        queue = decode_remote_json_payload(QUEUE_KEY, raw_queue)
+        queue_changed = False
+        for platform, target_ids in PURGE_TARGETS.items():
+            original = [str(value) for value in (queue.get(platform) or [])]
+            filtered = [value for value in original if value not in target_ids]
+            queue[platform] = filtered
+            queue_changed = queue_changed or filtered != original
+        if queue_changed:
+            _cas_set_json(QUEUE_KEY, raw_queue, queue, upstash=upstash)
+
+    cleaned_latest: dict[str, dict] = {}
+    for platform, target_ids in PURGE_TARGETS.items():
+        for suffix in [*dates[platform], "latest"]:
+            key = watchcount_key(platform, suffix)
+            raw = upstash(["GET", key])
+            if not isinstance(raw, str):
+                raise RuntimeError(f"Refusing purge: missing {key}")
+            payload = decode_remote_watchcount_payload(key, raw)
+            original_count = len(payload["counts"])
+            payload["counts"] = {drama_id: entry for drama_id, entry in payload["counts"].items() if drama_id not in target_ids}
+            if len(payload["counts"]) != original_count:
+                _cas_set_json(key, raw, payload, upstash=upstash)
+            if suffix == "latest":
+                cleaned_latest[platform] = payload
+        history_key = watchcount_key(platform, "history")
+        result = upstash(["HDEL", history_key, *sorted(target_ids)])
+        if not isinstance(result, int):
+            raise RuntimeError(f"Failed to clean {history_key}")
+
+    raw_ranks = upstash(["GET", "ranks:latest"])
+    if not isinstance(raw_ranks, str):
+        raise RuntimeError("Refusing purge: missing ranks:latest")
+    ranks_payload = decode_remote_json_payload("ranks:latest", raw_ranks)
+    purge_rank_store(ranks_payload, PURGE_TARGETS)
+    _publish_rank_latest_cas(raw_ranks, ranks_payload, upstash=upstash)
+
+    for platform, target_ids in PURGE_TARGETS.items():
+        legacy_key = f"ranks:trend:{platform}"
+        raw = upstash(["GET", legacy_key])
+        if isinstance(raw, str):
+            payload = decode_remote_json_payload(legacy_key, raw)
+            dramas = payload.get("dramas") if isinstance(payload, dict) else None
+            if isinstance(dramas, dict):
+                for drama_id in target_ids:
+                    dramas.pop(drama_id, None)
+            _cas_set_json(legacy_key, raw, payload, upstash=upstash)
+
+        v2_key = NORMAL_TREND_V2_KEYS[platform]
+        meta, fields, meta_raw = _decode_hash_snapshot(v2_key, upstash(["HGETALL", v2_key]))
+        for drama_id in target_ids:
+            fields.pop(drama_id, None)
+        publish_hash_snapshot_atomic(v2_key, meta, fields, upstash=upstash, expected_meta_raw=meta_raw)
+
+    write_json_work_copy(MISSEVAN_INFO_PATH, cleaned_missevan)
+    write_json_work_copy(MANBO_INFO_PATH, cleaned_manbo)
+    write_json_work_copy(MISSEVAN_COUNTS_PATH, cleaned_latest["missevan"])
+    write_json_work_copy(MANBO_COUNTS_PATH, cleaned_latest["manbo"])
+    ranks_path = ROOT / "ranks.json"
+    if ranks_path.exists():
+        local_ranks = load_json(ranks_path, {})
+        purge_rank_store(local_ranks, PURGE_TARGETS)
+        write_json_work_copy(ranks_path, local_ranks)
+
+    verification_hits = verify_purged_non_cv_remote_references(dates, upstash=upstash)
+    if verification_hits:
+        raise RuntimeError(f"Purge verification failed; non-CV references remain: {verification_hits}")
+    verified_missevan = decode_remote_info_payload(MISSEVAN_INFO_KEY, upstash(["GET", MISSEVAN_INFO_KEY]))
+    verified_manbo = decode_remote_info_payload(MANBO_INFO_KEY, upstash(["GET", MANBO_INFO_KEY]))
+    cv_after = {key: _remote_digest(key, upstash=upstash) for key in CV_REMOTE_KEYS}
+    if cv_after != cv_before:
+        raise RuntimeError("CV remote resources changed during purge")
+    summary.update(
+        {
+            "backupDir": str(backup_dir),
+            "finalCounts": {"missevan": len(verified_missevan), "manbo": len(verified_manbo.get("records") or [])},
+            "cvDigestsUnchanged": True,
+        }
+    )
+    return summary
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sync queued new drama IDs into platform info stores")
     parser.add_argument(
@@ -1263,6 +1895,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Remove non-numeric 漫播 dramaIds from the active queue, info store, and latest watchcount",
     )
     parser.add_argument(
+        "--purge-non-target-records",
+        action="store_true",
+        help="Preview or purge the exact approved non-target drama records from non-CV stores",
+    )
+    parser.add_argument(
+        "--sync-info-v1-from-v2",
+        action="store_true",
+        help="Preview or synchronize compatibility info v1 keys from authoritative v2",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply a purge or v2-to-v1 compatibility synchronization; otherwise dry-run",
+    )
+    parser.add_argument(
         "--backfill-info-v2",
         action="store_true",
         help="Build info v2 and meta keys from the current remote v1 libraries without platform API calls",
@@ -1271,16 +1918,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args([] if argv is None else argv)
+    args = parse_args(argv)
     configure_stdio()
     load_env_file(ROOT / ".env")
+    if args.purge_non_target_records and args.sync_info_v1_from_v2:
+        raise RuntimeError("Choose only one of --purge-non-target-records or --sync-info-v1-from-v2")
+    if args.apply and not (args.purge_non_target_records or args.sync_info_v1_from_v2):
+        raise RuntimeError(
+            "--apply is only valid with --purge-non-target-records or --sync-info-v1-from-v2"
+        )
+    if args.sync_info_v1_from_v2:
+        result = sync_info_v1_from_v2(apply=args.apply)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
     if args.backfill_info_v2:
-        for key in (MANBO_INFO_KEY, MISSEVAN_INFO_KEY):
+        for key in (MANBO_INFO_V1_KEY, MISSEVAN_INFO_V1_KEY):
             backfill_info_v2(key, upstash=upstash_request)
         return 0
     if args.cleanup_invalid_manbo_ids:
         stats = cleanup_invalid_manbo_ids()
         print("[ok] cleaned invalid 漫播 dramaIds:", json.dumps(stats, ensure_ascii=False))
+        return 0
+    if args.purge_non_target_records:
+        result = purge_non_target_records(apply=args.apply)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     if args.upload_cv_map:
         upload_json_file(CVID_MAP_KEY, COMBINED_CVID_MAP_PATH)

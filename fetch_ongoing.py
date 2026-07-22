@@ -12,7 +12,14 @@ from typing import Callable
 
 import requests
 
-from platform_sync import MANBO_CATALOG_OVERRIDES, MISSEVAN_HEADERS, MissevanRequester, normalize, request_manbo_json
+from platform_sync import (
+    MANBO_CATALOG_OVERRIDES,
+    MISSEVAN_HEADERS,
+    MissevanRequester,
+    is_numeric_drama_id,
+    normalize,
+    request_manbo_json,
+)
 
 HERE = Path(__file__).resolve().parent
 BEIJING_TZ = timezone(timedelta(hours=8))
@@ -815,8 +822,10 @@ def collect_manbo_records_from_items(items: list[dict]) -> dict[str, dict[str, o
         if not isinstance(item, dict) or not manbo_item_allowed(item):
             continue
         drama = item.get("radioDramaResp") or {}
-        drama_id = drama.get("radioDramaIdStr") or item.get("id")
-        if drama_id in (None, ""):
+        # item.id identifies the timeline entry, not the radio drama.  Falling
+        # back to it previously admitted values such as "201" as drama IDs.
+        drama_id = drama.get("radioDramaIdStr") or drama.get("radioDramaId")
+        if not is_numeric_drama_id(drama_id):
             continue
         drama_id = str(drama_id)
         category = manbo_ongoing_category(item)

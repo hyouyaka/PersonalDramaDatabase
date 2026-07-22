@@ -8,6 +8,37 @@ import sync_new_drama_ids
 
 
 class RemoteJsonBackupTests(unittest.TestCase):
+    def test_local_backup_reuses_identical_content_and_keeps_changed_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source" / "store.json"
+            source.parent.mkdir()
+            source.write_text('{"version": 1}', encoding="utf-8")
+            with unittest.mock.patch.object(sync_new_drama_ids, "ROOT", root):
+                first = sync_new_drama_ids.backup_local_json_file(source)
+                second = sync_new_drama_ids.backup_local_json_file(source)
+                source.write_text('{"version": 2}', encoding="utf-8")
+                changed = sync_new_drama_ids.backup_local_json_file(source)
+
+            backups = list((root / "recovery_backups").glob("*.json"))
+            self.assertEqual(second, first)
+            self.assertNotEqual(changed, first)
+            self.assertEqual(len(backups), 2)
+
+    def test_local_backup_does_not_deduplicate_different_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_source = root / "first.json"
+            second_source = root / "second.json"
+            first_source.write_text("{}", encoding="utf-8")
+            second_source.write_text("{}", encoding="utf-8")
+            with unittest.mock.patch.object(sync_new_drama_ids, "ROOT", root):
+                first = sync_new_drama_ids.backup_local_json_file(first_source)
+                second = sync_new_drama_ids.backup_local_json_file(second_source)
+
+            self.assertNotEqual(first, second)
+            self.assertEqual(len(list((root / "recovery_backups").glob("*.json"))), 2)
+
     def test_load_queue_filters_non_numeric_ids(self) -> None:
         payload = {"manbo": ["200", "drama-1"], "missevan": ["100", "bad"]}
         with unittest.mock.patch.object(
@@ -77,6 +108,25 @@ class RemoteJsonBackupTests(unittest.TestCase):
 
 
 class UploadJsonValidationTests(unittest.TestCase):
+    def test_info_upload_requires_the_original_downloaded_body(self) -> None:
+        payload = {
+            str(index): {"dramaId": index, "title": f"剧目 {index}"}
+            for index in range(1, 101)
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "missevan-info.json"
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            upstash = Mock()
+
+            with self.assertRaisesRegex(RuntimeError, "original downloaded body"):
+                sync_new_drama_ids.upload_json_file(
+                    sync_new_drama_ids.MISSEVAN_INFO_KEY,
+                    path,
+                    upstash=upstash,
+                )
+
+        upstash.assert_not_called()
+
     def test_upload_cv_map_rejects_invalid_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "cvid-map.json"
@@ -458,6 +508,42 @@ class WatchcountSyncTests(unittest.TestCase):
 
 
 class QueueReadyTests(unittest.TestCase):
+    def test_prune_queue_consumes_ids_rejected_by_detail_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missevan_path = root / "missevan.json"
+            manbo_path = root / "manbo.json"
+            missevan_path.write_text("{}", encoding="utf-8")
+            manbo_path.write_text('{"records": []}', encoding="utf-8")
+            queue = {"manbo": ["201"], "missevan": ["99999"]}
+
+            with (
+                unittest.mock.patch.object(sync_new_drama_ids, "MISSEVAN_INFO_PATH", missevan_path),
+                unittest.mock.patch.object(sync_new_drama_ids, "MANBO_INFO_PATH", manbo_path),
+            ):
+                remaining = sync_new_drama_ids.prune_queue(queue)
+
+        self.assertEqual(remaining, {"manbo": [], "missevan": []})
+
+    def test_prune_queue_keeps_existing_incomplete_record_for_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missevan_path = root / "missevan.json"
+            manbo_path = root / "manbo.json"
+            missevan_path.write_text("{}", encoding="utf-8")
+            manbo_path.write_text(
+                json.dumps({"records": [{"dramaId": "123", "name": "待完善剧集"}]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with (
+                unittest.mock.patch.object(sync_new_drama_ids, "MISSEVAN_INFO_PATH", missevan_path),
+                unittest.mock.patch.object(sync_new_drama_ids, "MANBO_INFO_PATH", manbo_path),
+            ):
+                remaining = sync_new_drama_ids.prune_queue({"manbo": ["123"], "missevan": []})
+
+        self.assertEqual(remaining, {"manbo": ["123"], "missevan": []})
+
     def test_missevan_ready_requires_cover(self) -> None:
         base = {
             "title": "猫耳剧",
@@ -541,6 +627,10 @@ class InvalidManboIdCleanupTests(unittest.TestCase):
             if command[0] == "GET":
                 return remote[command[1]]
             if command[0] == "EVAL":
+                if command[2] == 3:
+                    remote[command[3]] = command[7]
+                    remote[command[4]] = command[8]
+                    return 1
                 key = command[3]
                 remote[key] = command[5]
                 return 1
@@ -571,6 +661,339 @@ class InvalidManboIdCleanupTests(unittest.TestCase):
             sync_new_drama_ids.cleanup_invalid_manbo_ids(upstash=upstash, backup_dir=Path(tmp))
 
         self.assertEqual(upstash.call_args_list[1].args[0][0], "EVAL")
+
+
+class InfoV1CompatibilitySyncTests(unittest.TestCase):
+    def test_sync_copies_v2_to_v1_with_backups_and_cas(self) -> None:
+        strings = {
+            sync_new_drama_ids.MISSEVAN_INFO_KEY: json.dumps(
+                {"100": {"dramaId": 100, "title": "权威猫耳"}},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            sync_new_drama_ids.MISSEVAN_INFO_V1_KEY: json.dumps(
+                {"100": {"dramaId": 100, "title": "旧猫耳"}},
+                ensure_ascii=False,
+            ),
+            sync_new_drama_ids.MANBO_INFO_KEY: json.dumps(
+                {"records": [{"dramaId": "200", "name": "权威漫播"}]},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            sync_new_drama_ids.MANBO_INFO_V1_KEY: json.dumps(
+                {"records": [{"dramaId": "200", "name": "权威漫播"}]},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        }
+        eval_commands: list[list[object]] = []
+
+        def fake_upstash(command):
+            if command[0] == "GET":
+                return strings.get(command[1])
+            if command[0] == "EVAL":
+                eval_commands.append(command)
+                v2_key, v1_key = str(command[3]), str(command[4])
+                current_v2 = strings.get(v2_key)
+                current_v1 = strings.get(v1_key)
+                self.assertEqual(
+                    sync_new_drama_ids.hashlib.sha1(current_v2.encode("utf-8")).hexdigest(),
+                    command[5],
+                )
+                self.assertEqual(
+                    sync_new_drama_ids.hashlib.sha1(current_v1.encode("utf-8")).hexdigest(),
+                    command[6],
+                )
+                strings[v1_key] = str(command[7])
+                return 1
+            raise AssertionError(command)
+
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.dict(
+            sync_new_drama_ids.INFO_UPLOAD_MIN_COUNTS,
+            {
+                sync_new_drama_ids.MISSEVAN_INFO_KEY: 1,
+                sync_new_drama_ids.MANBO_INFO_KEY: 1,
+            },
+        ):
+            summary = sync_new_drama_ids.sync_info_v1_from_v2(
+                apply=True,
+                upstash=fake_upstash,
+                backup_root=Path(tmp),
+            )
+            backup_dir = Path(str(summary["backupDir"]))
+            self.assertTrue((backup_dir / "missevan-info-v1.json").exists())
+            self.assertTrue((backup_dir / "missevan-info-v2.json").exists())
+
+        self.assertEqual(summary["changed"], 1)
+        self.assertEqual(len(eval_commands), 1)
+        self.assertEqual(
+            strings[sync_new_drama_ids.MISSEVAN_INFO_V1_KEY],
+            strings[sync_new_drama_ids.MISSEVAN_INFO_KEY],
+        )
+        self.assertEqual(
+            strings[sync_new_drama_ids.MANBO_INFO_V1_KEY],
+            strings[sync_new_drama_ids.MANBO_INFO_KEY],
+        )
+
+    def test_sync_dry_run_reports_differences_without_writing(self) -> None:
+        values = {
+            sync_new_drama_ids.MISSEVAN_INFO_KEY: json.dumps({"1": {"dramaId": 1}}),
+            sync_new_drama_ids.MISSEVAN_INFO_V1_KEY: json.dumps({}),
+            sync_new_drama_ids.MANBO_INFO_KEY: json.dumps({"records": []}),
+            sync_new_drama_ids.MANBO_INFO_V1_KEY: json.dumps({"records": []}),
+        }
+        upstash = Mock(side_effect=lambda command: values.get(command[1]))
+
+        with unittest.mock.patch.dict(
+            sync_new_drama_ids.INFO_UPLOAD_MIN_COUNTS,
+            {
+                sync_new_drama_ids.MISSEVAN_INFO_KEY: 0,
+                sync_new_drama_ids.MANBO_INFO_KEY: 0,
+            },
+        ):
+            summary = sync_new_drama_ids.sync_info_v1_from_v2(apply=False, upstash=upstash)
+
+        self.assertEqual(summary["mode"], "dry-run")
+        self.assertEqual(summary["changed"], 1)
+        self.assertTrue(all(call.args[0][0] == "GET" for call in upstash.call_args_list))
+
+    def test_sync_rejects_truncated_authoritative_v2_before_writing(self) -> None:
+        values = {
+            sync_new_drama_ids.MISSEVAN_INFO_KEY: json.dumps({}),
+            sync_new_drama_ids.MISSEVAN_INFO_V1_KEY: json.dumps(
+                {str(index): {"dramaId": index} for index in range(1, 101)}
+            ),
+        }
+        upstash = Mock(side_effect=lambda command: values.get(command[1]))
+
+        with self.assertRaisesRegex(RuntimeError, "only 0 records found"):
+            sync_new_drama_ids.sync_info_v1_from_v2(apply=True, upstash=upstash)
+
+        self.assertTrue(all(call.args[0][0] == "GET" for call in upstash.call_args_list))
+
+    def test_sync_repairs_invalid_v1_using_raw_backup_and_cas(self) -> None:
+        invalid_v1 = "{truncated"
+        strings = {
+            sync_new_drama_ids.MISSEVAN_INFO_KEY: json.dumps(
+                {"1": {"dramaId": 1, "title": "权威猫耳"}},
+                ensure_ascii=False,
+            ),
+            sync_new_drama_ids.MISSEVAN_INFO_V1_KEY: invalid_v1,
+            sync_new_drama_ids.MANBO_INFO_KEY: json.dumps(
+                {"records": [{"dramaId": "2", "name": "权威漫播"}]},
+                ensure_ascii=False,
+            ),
+            sync_new_drama_ids.MANBO_INFO_V1_KEY: json.dumps(
+                {"records": [{"dramaId": "2", "name": "权威漫播"}]},
+                ensure_ascii=False,
+            ),
+        }
+
+        def fake_upstash(command):
+            if command[0] == "GET":
+                return strings.get(command[1])
+            if command[0] == "EVAL":
+                v2_key, v1_key = str(command[3]), str(command[4])
+                self.assertEqual(
+                    sync_new_drama_ids.hashlib.sha1(strings[v1_key].encode("utf-8")).hexdigest(),
+                    command[6],
+                )
+                strings[v1_key] = strings[v2_key]
+                return 1
+            raise AssertionError(command)
+
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.dict(
+            sync_new_drama_ids.INFO_UPLOAD_MIN_COUNTS,
+            {
+                sync_new_drama_ids.MISSEVAN_INFO_KEY: 1,
+                sync_new_drama_ids.MANBO_INFO_KEY: 1,
+            },
+        ):
+            summary = sync_new_drama_ids.sync_info_v1_from_v2(
+                apply=True,
+                upstash=fake_upstash,
+                backup_root=Path(tmp),
+            )
+            backup = Path(str(summary["backupDir"])) / "missevan-info-v1.json"
+            self.assertEqual(backup.read_text(encoding="utf-8"), invalid_v1)
+
+        missevan_status = next(
+            item for item in summary["resources"] if item["platform"] == "missevan"
+        )
+        self.assertFalse(missevan_status["v1Valid"])
+        self.assertEqual(
+            strings[sync_new_drama_ids.MISSEVAN_INFO_V1_KEY],
+            strings[sync_new_drama_ids.MISSEVAN_INFO_KEY],
+        )
+
+    def test_sync_cli_defaults_to_dry_run(self) -> None:
+        args = sync_new_drama_ids.parse_args(["--sync-info-v1-from-v2"])
+
+        self.assertTrue(args.sync_info_v1_from_v2)
+        self.assertFalse(args.apply)
+
+
+class NonTargetPurgeTests(unittest.TestCase):
+    def test_rank_publish_retries_meta_race_and_preserves_cv_resources(self) -> None:
+        original = json.dumps(
+            {
+                "_meta": {"updated_at": "2026-07-22T00:00:00+00:00"},
+                "missevan": {"dramas": {}, "ranks": {}},
+                "manbo": {"dramas": {}, "ranks": {}},
+            },
+            ensure_ascii=False,
+        )
+        strings = {
+            "ranks:latest": original,
+            sync_new_drama_ids.RANK_META_KEY: json.dumps(
+                {
+                    "normal": {"resources": {}},
+                    "cv": {"resources": {"ranks:cv:latest": {"contentSha1": "old"}}},
+                },
+                separators=(",", ":"),
+            ),
+        }
+        eval_count = 0
+
+        def fake_upstash(command):
+            nonlocal eval_count
+            if command[0] == "GET":
+                return strings.get(command[1])
+            if command[0] == "EVAL":
+                eval_count += 1
+                if eval_count == 1:
+                    current = json.loads(strings[sync_new_drama_ids.RANK_META_KEY])
+                    current["cv"]["resources"]["ranks:cv:latest"] = {"contentSha1": "raced"}
+                    strings[sync_new_drama_ids.RANK_META_KEY] = json.dumps(
+                        current,
+                        separators=(",", ":"),
+                    )
+                    return -2
+                strings[command[3]] = command[6]
+                strings[command[4]] = command[7]
+                return 1
+            raise AssertionError(command)
+
+        payload = json.loads(original)
+        payload["missevan"]["dramas"] = {"100": {"name": "保留"}}
+        sync_new_drama_ids._publish_rank_latest_cas(original, payload, upstash=fake_upstash)
+
+        self.assertEqual(eval_count, 2)
+        final_meta = json.loads(strings[sync_new_drama_ids.RANK_META_KEY])
+        self.assertEqual(
+            final_meta["cv"]["resources"]["ranks:cv:latest"]["contentSha1"],
+            "raced",
+        )
+        self.assertIn("ranks:latest", final_meta["normal"]["resources"])
+
+    def test_purge_backup_directories_are_unique_and_exclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = sync_new_drama_ids.create_purge_backup_dir(root=root)
+            second = sync_new_drama_ids.create_purge_backup_dir(root=root)
+
+        self.assertNotEqual(first, second)
+        self.assertIn("purge_non_target_records", first.name)
+
+    def test_remote_purge_verifier_checks_every_non_cv_layer_without_matching_metrics(self) -> None:
+        target = "94774"
+        dates = {"missevan": ["2026-07-01"], "manbo": []}
+        strings = {
+            sync_new_drama_ids.MISSEVAN_INFO_KEY: json.dumps({}),
+            sync_new_drama_ids.MISSEVAN_INFO_V1_KEY: json.dumps(
+                {target: {"dramaId": int(target), "title": "残留"}}
+            ),
+            sync_new_drama_ids.MANBO_INFO_KEY: json.dumps({"records": []}),
+            sync_new_drama_ids.MANBO_INFO_V1_KEY: json.dumps({"records": []}),
+            sync_new_drama_ids.QUEUE_KEY: json.dumps({"missevan": [], "manbo": []}),
+            "missevan:watchcount:2026-07-01": json.dumps(
+                {"_meta": {}, "counts": {target: {"view_count": 201}}}
+            ),
+            "missevan:watchcount:latest": json.dumps({"_meta": {}, "counts": {}}),
+            "manbo:watchcount:latest": json.dumps({"_meta": {}, "counts": {}}),
+            "ranks:trend:missevan": json.dumps({"dramas": {target: {"samples": {}}}}),
+            "ranks:trend:manbo": json.dumps({"dramas": {}}),
+            "ranks:latest": json.dumps(
+                {
+                    "missevan": {
+                        "dramas": {"100": {"view_count": 201}},
+                        "ranks": {"hot": {"items": [{"dramaId": target}]}},
+                    },
+                    "manbo": {"dramas": {}, "ranks": {}},
+                }
+            ),
+        }
+        hashes = {
+            "missevan:watchcount:history": {target: json.dumps({"name": "残留", "points": []})},
+            "manbo:watchcount:history": {},
+            sync_new_drama_ids.NORMAL_TREND_V2_KEYS["missevan"]: {
+                "__meta__": json.dumps({}),
+                target: json.dumps({"id": target, "samples": {}}),
+            },
+            sync_new_drama_ids.NORMAL_TREND_V2_KEYS["manbo"]: {},
+        }
+
+        def fake_upstash(command):
+            if command[0] == "GET":
+                return strings.get(command[1])
+            if command[0] == "HGETALL":
+                result = []
+                for field, value in hashes.get(command[1], {}).items():
+                    result.extend([field, value])
+                return result
+            raise AssertionError(command)
+
+        hits = sync_new_drama_ids.verify_purged_non_cv_remote_references(dates, upstash=fake_upstash)
+
+        self.assertIn(sync_new_drama_ids.MISSEVAN_INFO_V1_KEY, hits)
+        self.assertIn("missevan:watchcount:2026-07-01", hits)
+        self.assertIn("missevan:watchcount:history", hits)
+        self.assertIn("ranks:trend:missevan", hits)
+        self.assertIn(sync_new_drama_ids.NORMAL_TREND_V2_KEYS["missevan"], hits)
+        self.assertIn("ranks:latest.missevan", hits)
+        self.assertNotIn("100", set().union(*(set(values) for values in hits.values())))
+
+    def test_rank_cleanup_removes_only_id_references_not_numeric_metrics(self) -> None:
+        payload = {
+            "missevan": {
+                "dramas": {"94774": {"name": "自传"}, "100": {"view_count": 201}},
+                "ranks": {
+                    "hot": {
+                        "items": [
+                            {"dramaId": "94774", "position": 1},
+                            {"dramaId": "100", "view_count": 201},
+                        ]
+                    }
+                },
+            },
+            "manbo": {"dramas": {}, "ranks": {}},
+        }
+
+        removed = sync_new_drama_ids.purge_rank_store(payload, sync_new_drama_ids.PURGE_TARGETS)
+
+        self.assertEqual(removed["missevan_dramas"], 1)
+        self.assertEqual(payload["missevan"]["ranks"]["hot"]["items"], [{"dramaId": "100", "view_count": 201}])
+
+    def test_rank_cleanup_filters_multi_drama_items(self) -> None:
+        rank = {"items": [{"name": "系列", "dramaIds": ["94774", "100"]}]}
+
+        removed = sync_new_drama_ids._purge_rank_items(rank, {"94774"})
+
+        self.assertEqual(removed, 1)
+        self.assertEqual(rank["items"][0]["dramaIds"], ["100"])
+
+    def test_purge_cli_is_dry_run_without_apply(self) -> None:
+        args = sync_new_drama_ids.parse_args(["--purge-non-target-records"])
+
+        self.assertTrue(args.purge_non_target_records)
+        self.assertFalse(args.apply)
+
+    def test_purge_validation_treats_absent_targets_as_already_removed(self) -> None:
+        found, missing = sync_new_drama_ids._validate_purge_targets({}, {"records": []})
+
+        self.assertEqual(found, [])
+        self.assertEqual(len(missing), 16)
+        self.assertEqual({item["dramaId"] for item in missing}, set().union(*sync_new_drama_ids.PURGE_TARGETS.values()))
 
 
 if __name__ == "__main__":

@@ -8,7 +8,6 @@ import os
 import re
 import threading
 import time
-import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,7 +15,6 @@ from pathlib import Path
 import requests
 
 from platform_sync import (
-    MANBO_HEADERS,
     MANBO_CATALOG_NAME_ALIASES,
     MANBO_CATALOG_NAME_BY_ID,
     MISSEVAN_HEADERS,
@@ -24,6 +22,7 @@ from platform_sync import (
     MissevanRequester,
     load_json,
     is_numeric_drama_id,
+    is_target_catalog,
     missevan_main_cv_entries,
     normalize,
     request_manbo_json,
@@ -31,8 +30,11 @@ from platform_sync import (
 )
 from rank_key_cleanup import cleanup_legacy_normal_rank_keys, run_cleanup_best_effort
 from upstash_v2 import (
+    NORMAL_TREND_V2_KEYS,
+    PEAK_TREND_V2_KEY,
     publish_normal_trend_v2,
     publish_peak_trend_v2,
+    publish_rank_string,
     publish_trend_v2_best_effort,
 )
 
@@ -138,6 +140,10 @@ MANBO_DANMAKU_LOW_VALUE_RATIO = 0.02
 
 class DanmakuRefreshError(RuntimeError):
     """Raised when a drama-level danmaku refresh should be retried."""
+
+
+class RejectedDramaRecord(RuntimeError):
+    """Raised when platform detail proves an ID is outside the supported libraries."""
 
 # ---------------------------------------------------------------------------
 # Upstash helpers (adapted from sync_new_drama_ids.py)
@@ -252,9 +258,7 @@ return payload
 def upload_full_ranks(store: dict) -> None:
     """Upload complete merged ranks under the latest full-rank key."""
     payload = json.dumps(store, ensure_ascii=False)
-    result = upstash_request(["SET", "ranks:latest", payload])
-    if result != "OK":
-        raise RuntimeError(f"Failed to upload ranks:latest: {result!r}")
+    publish_rank_string("ranks:latest", store, scope="normal", upstash=upstash_request)
     print(f"[ok] uploaded merged ranks to Upstash ({len(payload)} bytes)")
 
 
@@ -264,14 +268,6 @@ def decode_upstash_json(raw: object, default: object = None) -> object:
     if isinstance(raw, str):
         return json.loads(raw)
     return raw
-
-
-def platform_store(value: object) -> dict:
-    if isinstance(value, dict):
-        value.setdefault("ranks", {})
-        value.setdefault("dramas", {})
-        return value
-    return {"ranks": {}, "dramas": {}}
 
 
 def load_remote_full_ranks() -> dict | None:
@@ -488,6 +484,27 @@ def _rank_item_drama_ids(item: object) -> list[str]:
     return [str(single)] if single not in (None, "") else []
 
 
+def remove_drama_ids_from_rank_items(store: dict, platform: str, drama_ids: set[str]) -> None:
+    if not drama_ids:
+        return
+    ranks = (store.get(platform) or {}).get("ranks") or {}
+    for rank in ranks.values():
+        if not isinstance(rank, dict):
+            continue
+        kept: list[object] = []
+        for item in rank.get("items") or []:
+            if isinstance(item, dict):
+                list_key = "dramaIds" if "dramaIds" in item else "drama_ids" if "drama_ids" in item else None
+                if list_key is not None:
+                    filtered = [value for value in (item.get(list_key) or []) if str(value) not in drama_ids]
+                    if filtered:
+                        kept.append({**item, list_key: filtered})
+                    continue
+            if not (set(_rank_item_drama_ids(item)) & drama_ids):
+                kept.append(item)
+        rank["items"] = kept
+
+
 def _rank_badges_by_drama(platform: str, list_payload: dict | None) -> dict[str, list[dict]]:
     if not isinstance(list_payload, dict):
         return {}
@@ -623,7 +640,21 @@ def upload_rank_trend_snapshot(
     pruned_dates: list[str] | tuple[str, ...] | set[str] = (),
 ) -> dict:
     key = TREND_KEYS[platform]
-    current = _load_upstash_json_strict(key)
+    v2_payload = build_rank_trend_payload(
+        None,
+        platform,
+        history_date,
+        metrics_payload if isinstance(metrics_payload, dict) else None,
+        list_payload if isinstance(list_payload, dict) else None,
+        generated_at=generated_at,
+        pruned_dates=pruned_dates,
+    )
+    publish_trend_v2_best_effort(
+        f"{key}:v2",
+        lambda: publish_normal_trend_v2(platform, v2_payload, upstash=upstash_request),
+    )
+    legacy_exists = int(upstash_request(["EXISTS", key]) or 0) == 1
+    current = _load_upstash_json_strict(key) if legacy_exists else None
     payload = build_rank_trend_payload(
         current if isinstance(current, dict) else None,
         platform,
@@ -633,15 +664,14 @@ def upload_rank_trend_snapshot(
         generated_at=generated_at,
         pruned_dates=pruned_dates,
     )
-    encoded = json.dumps(payload, ensure_ascii=False)
-    result = upstash_request(["SET", key, encoded])
-    if result != "OK":
-        raise RuntimeError(f"Failed to upload {key}: {result!r}")
-    print(f"[ok] uploaded {key} ({len(encoded)} bytes, date={history_date})")
-    publish_trend_v2_best_effort(
-        f"{key}:v2",
-        lambda: publish_normal_trend_v2(platform, payload, upstash=upstash_request),
-    )
+    if legacy_exists:
+        encoded = json.dumps(payload, ensure_ascii=False)
+        result = upstash_request(["SET", key, encoded])
+        if result != "OK":
+            raise RuntimeError(f"Failed to upload {key}: {result!r}")
+        print(f"[ok] uploaded legacy {key} ({len(encoded)} bytes, date={history_date})")
+    else:
+        print(f"[skip] legacy key is retired: {key}")
     return payload
 
 
@@ -726,7 +756,19 @@ def upload_missevan_peak_trend(
     generated_at: str,
     pruned_dates: list[str] | tuple[str, ...] | set[str] = (),
 ) -> dict:
-    current = _load_upstash_json(PEAK_TREND_KEY)
+    v2_payload = build_missevan_peak_trend_payload(
+        None,
+        store,
+        history_date,
+        generated_at,
+        pruned_dates=pruned_dates,
+    )
+    publish_trend_v2_best_effort(
+        f"{PEAK_TREND_KEY}:v2",
+        lambda: publish_peak_trend_v2(v2_payload, upstash=upstash_request),
+    )
+    legacy_exists = int(upstash_request(["EXISTS", PEAK_TREND_KEY]) or 0) == 1
+    current = _load_upstash_json(PEAK_TREND_KEY) if legacy_exists else None
     payload = build_missevan_peak_trend_payload(
         current if isinstance(current, dict) else None,
         store,
@@ -734,19 +776,25 @@ def upload_missevan_peak_trend(
         generated_at,
         pruned_dates=pruned_dates,
     )
-    encoded = json.dumps(payload, ensure_ascii=False)
-    result = upstash_request(["SET", PEAK_TREND_KEY, encoded])
-    if result != "OK":
-        raise RuntimeError(f"Failed to upload {PEAK_TREND_KEY}: {result!r}")
-    print(f"[ok] uploaded {PEAK_TREND_KEY} ({len(encoded)} bytes, date={history_date})")
-    publish_trend_v2_best_effort(
-        f"{PEAK_TREND_KEY}:v2",
-        lambda: publish_peak_trend_v2(payload, upstash=upstash_request),
-    )
+    if legacy_exists:
+        encoded = json.dumps(payload, ensure_ascii=False)
+        result = upstash_request(["SET", PEAK_TREND_KEY, encoded])
+        if result != "OK":
+            raise RuntimeError(f"Failed to upload {PEAK_TREND_KEY}: {result!r}")
+        print(f"[ok] uploaded legacy {PEAK_TREND_KEY} ({len(encoded)} bytes, date={history_date})")
+    else:
+        print(f"[skip] legacy key is retired: {PEAK_TREND_KEY}")
     return payload
 
 
 def backfill_rank_trend_v2() -> None:
+    target_keys = [*NORMAL_TREND_V2_KEYS.values(), PEAK_TREND_V2_KEY]
+    existing = [key for key in target_keys if int(upstash_request(["EXISTS", key]) or 0) == 1]
+    if existing:
+        raise RuntimeError(
+            "Refusing legacy backfill because authoritative v2 already exists: "
+            + ", ".join(existing)
+        )
     for platform in PLATFORMS:
         key = TREND_KEYS[platform]
         payload = _load_upstash_json_strict(key)
@@ -953,20 +1001,6 @@ def _rank_item_drama_id(item: object) -> str | None:
     return str(value)
 
 
-def collect_missevan_danmaku_target_ids(store: dict) -> set[str]:
-    """Collect Missevan rank drama IDs whose paid danmaku UID counts should refresh."""
-    targets: set[str] = set()
-    ranks = store.get("missevan", {}).get("ranks") or {}
-    for rank_key, rank in ranks.items():
-        if rank_key == "peak":
-            continue
-        for item in rank.get("items") or []:
-            drama_id = _rank_item_drama_id(item)
-            if drama_id:
-                targets.add(drama_id)
-    return targets
-
-
 def collect_manbo_danmaku_target_ids(store: dict) -> set[str]:
     """Collect Manbo rank drama IDs whose paid danmaku UID counts should refresh."""
     targets: set[str] = set()
@@ -1099,11 +1133,11 @@ def fetch_missevan_ranks(
             name = el.get("name", "")
             if name and name not in missevan_series:
                 unmatched_names.add(name)
-        # Fallback: search upstash missevan:info:v1 for unmatched names
+        # Fallback: search authoritative Upstash v2 info for unmatched names.
         upstash_series: dict[str, list[str]] = {}
         if unmatched_names:
             print(f"  [missevan] 巅峰榜: {len(unmatched_names)} names not in drama-series-info, searching upstash ...")
-            missevan_info = _load_upstash_json("missevan:info:v1") or {}
+            missevan_info = _load_upstash_json("missevan:info:v2") or {}
             for drama_id, node in missevan_info.items():
                 title = node.get("title", "")
                 if title in unmatched_names:
@@ -1175,6 +1209,7 @@ def fetch_missevan_drama_details(
     dramas = store["missevan"].setdefault("dramas", {})
     total = len(drama_ids)
     failed_danmaku_ids: set[str] = set()
+    rejected_ids: set[str] = set()
     for idx, drama_id in enumerate(sorted(drama_ids), 1):
         print(f"  [missevan] ({idx}/{total}) drama {drama_id} ...")
         entry: dict = dramas.get(str(drama_id), {})
@@ -1187,6 +1222,12 @@ def fetch_missevan_drama_details(
                 skip_danmaku=should_skip_dm,
                 clear_danmaku_on_skip=skip_danmaku,
             )
+        except RejectedDramaRecord as exc:
+            rejected_ids.add(str(drama_id))
+            dramas.pop(str(drama_id), None)
+            print(f"  [missevan] rejected {drama_id}: {exc}")
+            save_json(RANKS_PATH, store)
+            continue
         except RuntimeError as exc:
             if "HTTP_418" in str(exc):
                 print(f"  [missevan] FATAL: rate limited (418). Saving progress and stopping.")
@@ -1227,6 +1268,7 @@ def fetch_missevan_drama_details(
         retry_one_danmaku,
         mark_failed=mark_danmaku_failed,
     )
+    remove_drama_ids_from_rank_items(store, "missevan", rejected_ids)
 
 
 def _fetch_one_missevan(
@@ -1242,10 +1284,16 @@ def _fetch_one_missevan(
     data = requester.request_json(url)
     info = data.get("info") or {}
     drama = info.get("drama") or {}
+    title = normalize(drama.get("name"))
+    catalog = drama.get("catalog")
+    if not title:
+        raise RejectedDramaRecord("empty title")
+    if not is_target_catalog("missevan", catalog):
+        raise RejectedDramaRecord(f"non-target catalog={catalog}")
     episodes_section = info.get("episodes") or {}
     episodes = episodes_section.get("episode") or []
 
-    entry["name"] = drama.get("name", entry.get("name", ""))
+    entry["name"] = title
     entry["cover"] = drama.get("cover", entry.get("cover", ""))
     entry["view_count"] = drama.get("view_count", 0)
 
@@ -1373,11 +1421,18 @@ def fetch_manbo_drama_details(
     total = len(drama_ids)
     save_counter = 0
     failed_danmaku_ids: set[str] = set()
+    rejected_ids: set[str] = set()
     for idx, drama_id in enumerate(sorted(drama_ids), 1):
         print(f"  [manbo] ({idx}/{total}) drama {drama_id} ...")
         entry: dict = dramas.get(drama_id, {})
         try:
             _fetch_one_manbo(drama_id, entry)
+        except RejectedDramaRecord as exc:
+            rejected_ids.add(str(drama_id))
+            dramas.pop(str(drama_id), None)
+            print(f"  [manbo] rejected {drama_id}: {exc}")
+            save_counter += 1
+            continue
         except Exception as exc:
             print(f"  [manbo] ERROR on {drama_id}: {exc}")
             entry.pop("danmaku_paid_episode_count", None)
@@ -1428,6 +1483,7 @@ def fetch_manbo_drama_details(
         retry_one_danmaku,
         mark_failed=mark_danmaku_failed,
     )
+    remove_drama_ids_from_rank_items(store, "manbo", rejected_ids)
 
 
 def _fetch_one_manbo(drama_id: str, entry: dict) -> None:
@@ -1435,7 +1491,16 @@ def _fetch_one_manbo(drama_id: str, entry: dict) -> None:
     data = request_manbo_json(url)
     body = data.get("b") or data.get("data") or {}
 
-    entry["name"] = body.get("title", entry.get("name", ""))
+    title = normalize(body.get("title"))
+    catalog = body.get("catelog")
+    if catalog is None:
+        catalog = body.get("category")
+    if not title:
+        raise RejectedDramaRecord("empty title")
+    if not is_target_catalog("manbo", catalog):
+        raise RejectedDramaRecord(f"non-target catalog={catalog}")
+
+    entry["name"] = title
     entry["cover"] = body.get("coverPic") or body.get("largePic") or body.get("cover", entry.get("cover", ""))
     entry["view_count"] = body.get("watchCount", 0)
     entry["favorite_count"] = body.get("favoriteCount", 0)
@@ -1525,56 +1590,6 @@ def fetch_manbo_paid_set_ids(
         if paid_ids or episodes:
             return list(dict.fromkeys(paid_ids))
     return []
-
-
-def fetch_manbo_danmaku_users(
-    set_id: str,
-    *,
-    request_json=request_manbo_json,
-    page_size: int = MANBO_DANMAKU_PAGE_SIZE,
-    page_concurrency: int = MANBO_DANMAKU_PAGE_CONCURRENCY,
-    retry_delay: float = 0.5,
-) -> set[str]:
-    """Fetch Manbo danmaku pages for one episode/set and return unique user eids."""
-    def fetch_page(page_no: int) -> tuple[int, set[str]]:
-        url = (
-            "https://www.kilamanbo.com/web_manbo/getDanmaKuPgList"
-            f"?pageSize={page_size}&dramaSetId={set_id}&pageNo={page_no}"
-        )
-        last_error: Exception | None = None
-        for attempt in range(1, MANBO_DANMAKU_REQUEST_RETRIES + 1):
-            try:
-                data = request_json(url)
-                break
-            except Exception as exc:
-                last_error = exc
-                if attempt >= MANBO_DANMAKU_REQUEST_RETRIES:
-                    raise
-                time.sleep(retry_delay * attempt)
-        else:
-            raise last_error or RuntimeError("failed to fetch Manbo danmaku page")
-        payload = data.get("data") or {}
-        entries = payload.get("list") if isinstance(payload, dict) else []
-        users = {
-            str(item.get("eid"))
-            for item in (entries or [])
-            if isinstance(item, dict) and item.get("eid") not in (None, "")
-        }
-        total = safe_int(payload.get("count") if isinstance(payload, dict) else 0, len(users))
-        return total, users
-
-    total_count, users = fetch_page(1)
-    total_pages = max(1, (total_count + page_size - 1) // page_size)
-    if total_pages <= 1:
-        return users
-
-    workers = max(1, min(page_concurrency, total_pages - 1))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(fetch_page, page_no) for page_no in range(2, total_pages + 1)]
-        for future in as_completed(futures):
-            _, page_users = future.result()
-            users.update(page_users)
-    return users
 
 
 def _request_manbo_danmaku_page(
@@ -1907,14 +1922,6 @@ def catalog_name_from_manbo(record: dict) -> str | None:
         return None
 
 
-def pay_status_from_needpay(value: object) -> str | None:
-    if value is True:
-        return "付费"
-    if value is False:
-        return "免费"
-    return None
-
-
 def truthy_member_value(value: object) -> bool:
     if value is True:
         return True
@@ -1982,10 +1989,10 @@ def lookup_cvs(store: dict) -> None:
         return
 
     # Load info stores from Upstash
-    print("  [upstash] loading missevan:info:v1 ...")
-    missevan_info = _load_upstash_json("missevan:info:v1") or {}
-    print("  [upstash] loading manbo:info:v1 ...")
-    manbo_info_raw = _load_upstash_json("manbo:info:v1") or {}
+    print("  [upstash] loading missevan:info:v2 ...")
+    missevan_info = _load_upstash_json("missevan:info:v2") or {}
+    print("  [upstash] loading manbo:info:v2 ...")
+    manbo_info_raw = _load_upstash_json("manbo:info:v2") or {}
     manbo_records = manbo_info_raw.get("records") or []
     manbo_by_id: dict[str, dict] = {str(r.get("dramaId", "")): r for r in manbo_records}
 
@@ -2072,6 +2079,41 @@ def _load_upstash_json_strict(key: str) -> dict | list | None:
         raise RuntimeError(f"Failed to load {key}: {exc}") from exc
 
 
+def _load_normal_trend_v2_strict(platform: str) -> dict:
+    key = NORMAL_TREND_V2_KEYS[platform]
+    try:
+        raw = upstash_request(["HGETALL", key])
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load {key}: {exc}") from exc
+    if not isinstance(raw, list) or len(raw) % 2:
+        raise RuntimeError(f"Failed to load {key}: expected an HGETALL array")
+    fields: dict[str, object] = {}
+    meta: dict = {}
+    for index in range(0, len(raw), 2):
+        field = str(raw[index])
+        value = raw[index + 1]
+        if not isinstance(value, str):
+            raise RuntimeError(f"Failed to load {key}: field {field!r} is not a string")
+        parsed = json.loads(value)
+        if field == "__meta__":
+            if isinstance(parsed, dict):
+                meta = parsed
+        else:
+            fields[field] = parsed
+    dates: set[str] = set()
+    for entry in fields.values():
+        samples = entry.get("samples") if isinstance(entry, dict) else None
+        if isinstance(samples, dict):
+            dates.update(str(sample_date) for sample_date in samples)
+    return {
+        "version": 2,
+        "platform": platform,
+        "updated_at": meta.get("updated_at"),
+        "dates": sorted(dates),
+        "dramas": fields,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Null danmaku repair mode
 # ---------------------------------------------------------------------------
@@ -2117,9 +2159,9 @@ def select_missevan_detail_ids(
 
 
 def resolve_repair_history_date(platform: str) -> str:
-    if platform not in TREND_KEYS:
+    if platform not in NORMAL_TREND_V2_KEYS:
         raise ValueError(f"Unsupported platform: {platform}")
-    trend = _load_upstash_json_strict(TREND_KEYS[platform])
+    trend = _load_normal_trend_v2_strict(platform)
     dates = [
         str(value)
         for value in ((trend or {}).get("dates") or [])
@@ -2221,7 +2263,7 @@ def collect_null_danmaku_ids_from_layers(
 
     payloads: dict[str, object] = {
         "latest": _load_upstash_json_strict("ranks:latest"),
-        "trend": _load_upstash_json_strict(TREND_KEYS[platform]),
+        "trend": _load_normal_trend_v2_strict(platform),
     }
     if platform == "manbo":
         payloads["ongoing"] = _load_upstash_json(ONGOING_KEYS[platform])
@@ -2386,20 +2428,26 @@ def write_repaired_danmaku_layers(
                     sample_metrics[field] = source_entry[field]
             sample_metrics["danmaku_uid_count"] = count
 
-    writes = (
-        ("ranks:latest", latest_payload),
-        (TREND_KEYS[platform], trend_payload),
+    publish_rank_string(
+        "ranks:latest",
+        latest_payload,
+        scope="normal",
+        upstash=upstash_request,
     )
-    for key, payload in writes:
-        encoded = json.dumps(payload, ensure_ascii=False)
-        result = upstash_request(["SET", key, encoded])
-        if result != "OK":
-            raise RuntimeError(f"Failed to upload {key}: {result!r}")
-        print(f"[ok] repaired {key} ({len(encoded)} bytes)")
+    print("[ok] repaired ranks:latest")
     publish_trend_v2_best_effort(
-        f"{TREND_KEYS[platform]}:v2",
+        NORMAL_TREND_V2_KEYS[platform],
         lambda: publish_normal_trend_v2(platform, trend_payload, upstash=upstash_request),
     )
+    legacy_key = TREND_KEYS[platform]
+    if int(upstash_request(["EXISTS", legacy_key]) or 0) == 1:
+        encoded = json.dumps(trend_payload, ensure_ascii=False)
+        result = upstash_request(["SET", legacy_key, encoded])
+        if result != "OK":
+            raise RuntimeError(f"Failed to upload compatibility key {legacy_key}: {result!r}")
+        print(f"[ok] repaired existing compatibility key {legacy_key} ({len(encoded)} bytes)")
+    else:
+        print(f"[skip] legacy key is retired: {legacy_key}")
 
 
 def fetch_one_missevan_danmaku_count(drama_id: str, requester: MissevanRequester | None = None) -> tuple[str, int]:

@@ -8,6 +8,12 @@ import uuid
 from datetime import datetime, timezone
 from typing import Callable
 
+from upstash_editor import (
+    RANK_META_KEY,
+    build_rank_meta_update,
+    decode_hgetall,
+    hash_content_stats,
+)
 
 INFO_V2_KEYS = {
     "missevan:info:v1": "missevan:info:v2",
@@ -16,7 +22,10 @@ INFO_V2_KEYS = {
 INFO_V2_META_KEYS = {
     "missevan:info:v1": "missevan:info:meta:v2",
     "manbo:info:v1": "manbo:info:meta:v2",
+    "missevan:info:v2": "missevan:info:meta:v2",
+    "manbo:info:v2": "manbo:info:meta:v2",
 }
+INFO_V1_KEYS = {v2_key: v1_key for v1_key, v2_key in INFO_V2_KEYS.items()}
 NORMAL_TREND_V2_KEYS = {
     "missevan": "ranks:trend:missevan:v2",
     "manbo": "ranks:trend:manbo:v2",
@@ -39,11 +48,18 @@ return 1
 
 INFO_SOURCE_COMPARE_AND_PUBLISH_SCRIPT = """
 local current = redis.call('GET', KEYS[1])
-if not current or redis.sha1hex(current) ~= ARGV[1] then
+if ARGV[1] == '__missing__' then
+  if current and current ~= false then
+    return 0
+  end
+elseif not current or redis.sha1hex(current) ~= ARGV[1] then
   return 0
 end
-redis.call('SET', KEYS[2], ARGV[2])
-redis.call('SET', KEYS[3], ARGV[3])
+redis.call('SET', KEYS[1], ARGV[2])
+redis.call('SET', KEYS[2], ARGV[3])
+if redis.call('EXISTS', KEYS[3]) == 1 then
+  redis.call('SET', KEYS[3], ARGV[2])
+end
 return 1
 """
 
@@ -53,146 +69,235 @@ redis.call('PERSIST', KEYS[2])
 return 1
 """
 
+HASH_ACTIVATE_WITH_META_SCRIPT = """
+local current_meta = redis.call('HGET', KEYS[2], '__meta__')
+if ARGV[1] == '__missing__' then
+  if redis.call('EXISTS', KEYS[2]) == 1 then
+    return 0
+  end
+elseif not current_meta or current_meta ~= ARGV[1] then
+  return 0
+end
+local rank_meta = redis.call('GET', KEYS[3])
+if ARGV[2] == '__missing__' then
+  if rank_meta and rank_meta ~= false then
+    return 0
+  end
+elseif not rank_meta or redis.sha1hex(rank_meta) ~= ARGV[2] then
+  return 0
+end
+redis.call('RENAME', KEYS[1], KEYS[2])
+redis.call('PERSIST', KEYS[2])
+redis.call('SET', KEYS[3], ARGV[3])
+return 1
+"""
+
+RANK_STRING_PUBLISH_SCRIPT = """
+local rank_meta = redis.call('GET', KEYS[2])
+if ARGV[3] == '__missing__' then
+  if rank_meta and rank_meta ~= false then
+    return 0
+  end
+elseif not rank_meta or redis.sha1hex(rank_meta) ~= ARGV[3] then
+  return 0
+end
+redis.call('SET', KEYS[1], ARGV[1])
+redis.call('SET', KEYS[2], ARGV[2])
+return 1
+"""
+
 
 def compact_json(payload: object) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def string_cas_token(raw: object) -> str:
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest() if isinstance(raw, str) else "__missing__"
 
 
 def v2_publish_enabled() -> bool:
     return os.environ.get("UPSTASH_V2_PUBLISH_MODE", "best-effort").strip().lower() != "off"
 
 
-def _record_count(v1_key: str, payload: object) -> int:
-    if v1_key == "missevan:info:v1" and isinstance(payload, dict):
+def _verify_rank_resource(
+    raw: object,
+    *,
+    scope: str,
+    key: str,
+    digest: str,
+    byte_count: int,
+    updated_at: str,
+) -> None:
+    if not isinstance(raw, (str, dict)):
+        raise RuntimeError(f"Unable to verify {RANK_META_KEY} for {key}")
+    meta = json.loads(raw) if isinstance(raw, str) else raw
+    section = meta.get(scope) if isinstance(meta, dict) else None
+    resources = section.get("resources") if isinstance(section, dict) else None
+    resource = resources.get(key) if isinstance(resources, dict) else None
+    if (
+        not isinstance(resource, dict)
+        or resource.get("contentSha1") != digest
+        or int(resource.get("bytes") or -1) != byte_count
+        or resource.get("updatedAt") != updated_at
+    ):
+        raise RuntimeError(f"Remote {RANK_META_KEY} verification failed for {key}")
+
+
+def publish_rank_string(
+    key: str,
+    payload: object,
+    *,
+    scope: str,
+    upstash: Callable[[list[object]], object],
+) -> dict:
+    encoded = json.dumps(payload, ensure_ascii=False)
+    digest = hashlib.sha1(encoded.encode("utf-8")).hexdigest()
+    byte_count = len(encoded.encode("utf-8"))
+    updated_at = datetime.now(timezone.utc).isoformat()
+    if isinstance(payload, dict):
+        if key == "ranks:latest":
+            updated_at = str((payload.get("_meta") or {}).get("updated_at") or updated_at)
+        elif key == "ranks:cv:latest":
+            updated_at = str(payload.get("generated_at") or updated_at)
+    rank_meta: dict | None = None
+    for _attempt in range(3):
+        current_meta = upstash(["GET", RANK_META_KEY])
+        rank_meta = build_rank_meta_update(
+            current_meta,
+            scope=scope,
+            key=key,
+            data_type="string",
+            content_sha1=digest,
+            byte_count=byte_count,
+            updated_at=updated_at,
+        )
+        result = upstash(
+            [
+                "EVAL",
+                RANK_STRING_PUBLISH_SCRIPT,
+                2,
+                key,
+                RANK_META_KEY,
+                encoded,
+                compact_json(rank_meta),
+                string_cas_token(current_meta),
+            ]
+        )
+        if int(result or 0) == 1:
+            break
+    else:
+        raise RuntimeError(f"Concurrent updates prevented publishing {key} and {RANK_META_KEY}")
+    assert rank_meta is not None
+    if upstash(["GET", key]) != encoded:
+        raise RuntimeError(f"Remote payload verification failed for {key}")
+    _verify_rank_resource(
+        upstash(["GET", RANK_META_KEY]),
+        scope=scope,
+        key=key,
+        digest=digest,
+        byte_count=byte_count,
+        updated_at=updated_at,
+    )
+    return rank_meta
+
+
+def info_v2_key(key: str) -> str:
+    if key in INFO_V1_KEYS:
+        return key
+    if key in INFO_V2_KEYS:
+        return INFO_V2_KEYS[key]
+    raise ValueError(f"Unsupported info key: {key}")
+
+
+def info_v1_key(key: str) -> str:
+    return INFO_V1_KEYS[info_v2_key(key)]
+
+
+def _record_count(key: str, payload: object) -> int:
+    v2_key = info_v2_key(key)
+    if v2_key == "missevan:info:v2" and isinstance(payload, dict):
         return len(payload)
-    if v1_key == "manbo:info:v1" and isinstance(payload, dict):
+    if v2_key == "manbo:info:v2" and isinstance(payload, dict):
         records = payload.get("records")
         return len(records) if isinstance(records, list) else 0
     return 0
 
 
-def build_info_v2_meta(v1_key: str, encoded: str, payload: object) -> dict:
+def build_info_v2_meta(key: str, encoded: str, payload: object) -> dict:
+    v2_key = info_v2_key(key)
     return {
         "schemaVersion": 2,
-        "dataKey": INFO_V2_KEYS[v1_key],
+        "dataKey": v2_key,
         "contentSha1": hashlib.sha1(encoded.encode("utf-8")).hexdigest(),
         "updatedAt": datetime.now(timezone.utc).isoformat(),
-        "recordCount": _record_count(v1_key, payload),
+        "recordCount": _record_count(v2_key, payload),
         "bytes": len(encoded.encode("utf-8")),
     }
 
 
 def publish_info_v2(
-    v1_key: str,
+    key: str,
     payload: object,
     *,
     upstash: Callable[[list[object]], object],
     force: bool = False,
     source_encoded: str | None = None,
 ) -> dict | None:
-    if v1_key not in INFO_V2_KEYS:
-        raise ValueError(f"Unsupported info key: {v1_key}")
-    if not force and not v2_publish_enabled():
+    v2_key = info_v2_key(key)
+    if key in INFO_V2_KEYS and not force and not v2_publish_enabled():
         return None
-    v2_key = INFO_V2_KEYS[v1_key]
-    meta_key = INFO_V2_META_KEYS[v1_key]
-    if source_encoded is not None:
-        return _publish_info_v2_from_source(
-            v1_key,
-            source_encoded,
-            payload,
-            upstash=upstash,
+    normalized = json.loads(json.dumps(payload, ensure_ascii=False))
+    if v2_key == "manbo:info:v2":
+        if not isinstance(normalized, dict):
+            raise ValueError("manbo:info:v2 payload must be a JSON object")
+        normalized["updatedAt"] = datetime.now(timezone.utc).isoformat()
+    encoded = compact_json(normalized)
+    meta_key = INFO_V2_META_KEYS[v2_key]
+    legacy_key = info_v1_key(v2_key)
+    if source_encoded is None:
+        current = upstash(["GET", v2_key])
+        expected = (
+            hashlib.sha1(current.encode("utf-8")).hexdigest()
+            if isinstance(current, str)
+            else "__missing__"
         )
-    encoded = compact_json(payload)
-    result = upstash(["SET", v2_key, encoded])
-    if result != "OK":
-        raise RuntimeError(f"Failed to publish {v2_key}: {result!r}")
-    meta = build_info_v2_meta(v1_key, encoded, payload)
-    result = upstash([
-        "EVAL",
-        INFO_META_COMPARE_SCRIPT,
-        2,
-        v2_key,
-        meta_key,
-        meta["contentSha1"],
-        compact_json(meta),
-    ])
-    if int(result or 0) != 1:
-        current_encoded = upstash(["GET", v2_key])
-        if not isinstance(current_encoded, str) or not current_encoded:
-            raise RuntimeError(f"Unable to rebuild current info meta: {meta_key}")
-        current_payload = json.loads(current_encoded)
-        meta = build_info_v2_meta(v1_key, current_encoded, current_payload)
-        result = upstash([
-            "EVAL",
-            INFO_META_COMPARE_SCRIPT,
-            2,
-            v2_key,
-            meta_key,
-            meta["contentSha1"],
-            compact_json(meta),
-        ])
-        if int(result or 0) != 1:
-            raise RuntimeError(f"Refusing to publish stale info meta: {meta_key}")
-    print(f"[ok] published {v2_key} and {meta_key} ({meta['bytes']} bytes)")
-    return meta
-
-
-def _publish_info_v2_from_source(
-    v1_key: str,
-    source_encoded: str,
-    payload: object,
-    *,
-    upstash: Callable[[list[object]], object],
-) -> dict:
-    v2_key = INFO_V2_KEYS[v1_key]
-    meta_key = INFO_V2_META_KEYS[v1_key]
-    current_source = source_encoded
-    current_payload = payload
-    for _attempt in range(2):
-        encoded = compact_json(current_payload)
-        meta = build_info_v2_meta(v1_key, encoded, current_payload)
-        result = upstash([
+    else:
+        expected = hashlib.sha1(source_encoded.encode("utf-8")).hexdigest()
+    meta = build_info_v2_meta(v2_key, encoded, normalized)
+    result = upstash(
+        [
             "EVAL",
             INFO_SOURCE_COMPARE_AND_PUBLISH_SCRIPT,
             3,
-            v1_key,
             v2_key,
             meta_key,
-            hashlib.sha1(current_source.encode("utf-8")).hexdigest(),
+            legacy_key,
+            expected,
             encoded,
             compact_json(meta),
-        ])
-        if int(result or 0) == 1:
-            print(f"[ok] published {v2_key} and {meta_key} ({meta['bytes']} bytes)")
-            return meta
-        current_source = upstash(["GET", v1_key])
-        if not isinstance(current_source, str) or not current_source:
-            raise RuntimeError(f"Unable to rebuild info v2 from current source: {v1_key}")
-        current_payload = json.loads(current_source)
-    raise RuntimeError(f"Refusing to publish stale info v2: {v2_key}")
-
-
-def publish_info_v2_best_effort(
-    v1_key: str,
-    payload: object,
-    *,
-    upstash: Callable[[list[object]], object],
-    source_encoded: str | None = None,
-) -> dict | None:
-    try:
-        return publish_info_v2(
-            v1_key,
-            payload,
-            upstash=upstash,
-            source_encoded=source_encoded,
-        )
-    except Exception as exc:
-        print(f"[warn] failed to publish info v2 for {v1_key}: {exc}")
-        return None
+        ]
+    )
+    if int(result or 0) != 1:
+        raise RuntimeError(f"Refusing to overwrite concurrently changed info v2: {v2_key}")
+    if upstash(["GET", v2_key]) != encoded:
+        raise RuntimeError(f"Remote payload verification failed for {v2_key}")
+    verified_meta_raw = upstash(["GET", meta_key])
+    verified_meta = json.loads(verified_meta_raw) if isinstance(verified_meta_raw, str) else verified_meta_raw
+    if (
+        not isinstance(verified_meta, dict)
+        or verified_meta.get("contentSha1") != meta["contentSha1"]
+        or int(verified_meta.get("bytes") or -1) != meta["bytes"]
+        or verified_meta.get("updatedAt") != meta["updatedAt"]
+    ):
+        raise RuntimeError(f"Remote meta verification failed for {v2_key}")
+    print(f"[ok] published authoritative {v2_key} and {meta_key} ({meta['bytes']} bytes)")
+    return meta
 
 
 def backfill_info_v2(v1_key: str, *, upstash: Callable[[list[object]], object]) -> dict:
+    v2_key = info_v2_key(v1_key)
+    if int(upstash(["EXISTS", v2_key]) or 0) == 1:
+        raise RuntimeError(f"Refusing to backfill {v2_key}: authoritative v2 already exists")
     raw = upstash(["GET", v1_key])
     if not isinstance(raw, str) or not raw:
         raise RuntimeError(f"Unable to backfill {v1_key}: remote value is empty")
@@ -202,7 +307,6 @@ def backfill_info_v2(v1_key: str, *, upstash: Callable[[list[object]], object]) 
         payload,
         upstash=upstash,
         force=True,
-        source_encoded=raw,
     )
     assert meta is not None
     return meta
@@ -369,20 +473,190 @@ def build_cv_trend_v2(payloads: dict[str, dict]) -> tuple[dict, dict[str, dict]]
     return meta, fields
 
 
+def _load_hash_snapshot(
+    key: str,
+    *,
+    upstash: Callable[[list[object]], object],
+) -> tuple[dict, dict[str, dict], str | None]:
+    raw = decode_hgetall(upstash(["HGETALL", key]))
+    if not raw:
+        return {}, {}, None
+    raw_meta = raw.get("__meta__")
+    if raw_meta is None:
+        raise RuntimeError(f"Invalid authoritative v2 Hash: {key} is missing __meta__")
+    try:
+        meta = json.loads(raw_meta)
+        fields = {
+            field: json.loads(value)
+            for field, value in raw.items()
+            if field != "__meta__"
+        }
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid authoritative v2 Hash: {key}") from exc
+    if not isinstance(meta, dict) or not all(isinstance(value, dict) for value in fields.values()):
+        raise RuntimeError(f"Invalid authoritative v2 Hash shape: {key}")
+    return meta, fields, raw_meta
+
+
+def _merge_latest_entity_samples(
+    current_fields: dict[str, dict],
+    candidate_fields: dict[str, dict],
+    *,
+    incoming_dates: set[str],
+    kept_dates: set[str],
+) -> dict[str, dict]:
+    merged = json.loads(json.dumps(current_fields, ensure_ascii=False))
+    for field, candidate in candidate_fields.items():
+        existing = merged.get(field) if isinstance(merged.get(field), dict) else {}
+        existing_samples = existing.get("samples") if isinstance(existing.get("samples"), dict) else {}
+        candidate_samples = candidate.get("samples") if isinstance(candidate.get("samples"), dict) else {}
+        samples = {
+            str(date): sample
+            for date, sample in existing_samples.items()
+            if str(date) in kept_dates
+        }
+        for date, sample in candidate_samples.items():
+            if str(date) in incoming_dates:
+                samples[str(date)] = sample
+        record = {**existing, **candidate, "samples": samples}
+        if samples:
+            merged[field] = record
+    for field, record in list(merged.items()):
+        samples = record.get("samples") if isinstance(record, dict) else None
+        if not isinstance(samples, dict):
+            merged.pop(field, None)
+            continue
+        record["samples"] = {
+            str(date): sample for date, sample in samples.items() if str(date) in kept_dates
+        }
+        if not record["samples"]:
+            merged.pop(field, None)
+    return merged
+
+
+def merge_normal_v2_authoritative(
+    current_meta: dict,
+    current_fields: dict[str, dict],
+    candidate_meta: dict,
+    candidate_fields: dict[str, dict],
+) -> tuple[dict, dict[str, dict]]:
+    retention = int(current_meta.get("retentionDates") or candidate_meta.get("retentionDates") or NORMAL_TREND_V2_RETENTION_DATES)
+    candidate_dates = [str(value) for value in candidate_meta.get("dates") or [] if value]
+    incoming_dates = {max(candidate_dates)} if candidate_dates else set()
+    all_dates = sorted(
+        {
+            *(str(value) for value in current_meta.get("dates") or [] if value),
+            *candidate_dates,
+        }
+    )
+    kept_dates = set(all_dates[-retention:])
+    fields = _merge_latest_entity_samples(
+        current_fields,
+        candidate_fields,
+        incoming_dates=incoming_dates,
+        kept_dates=kept_dates,
+    )
+    meta = {
+        **current_meta,
+        **candidate_meta,
+        "dates": sorted(kept_dates),
+        "entityCount": len(fields),
+        "retentionDates": retention,
+    }
+    return meta, fields
+
+
+def merge_cv_v2_authoritative(
+    current_meta: dict,
+    current_fields: dict[str, dict],
+    candidate_meta: dict,
+    candidate_fields: dict[str, dict],
+) -> tuple[dict, dict[str, dict]]:
+    fields = json.loads(json.dumps(current_fields, ensure_ascii=False))
+    platforms_meta: dict[str, dict] = {}
+    for platform in ("missevan", "manbo"):
+        current_platform = ((current_meta.get("platforms") or {}).get(platform) or {})
+        candidate_platform = ((candidate_meta.get("platforms") or {}).get(platform) or {})
+        retention = int(
+            current_platform.get("retentionDates")
+            or candidate_platform.get("retentionDates")
+            or CV_TREND_V2_RETENTION_DATES
+        )
+        candidate_dates = [str(value) for value in candidate_platform.get("dates") or [] if value]
+        incoming_dates = {max(candidate_dates)} if candidate_dates else set()
+        all_dates = sorted(
+            {
+                *(str(value) for value in current_platform.get("dates") or [] if value),
+                *candidate_dates,
+            }
+        )
+        kept_dates = set(all_dates[-retention:])
+        prefix = f"{platform}:"
+        platform_current = {field: item for field, item in fields.items() if field.startswith(prefix)}
+        platform_candidate = {
+            field: item for field, item in candidate_fields.items() if field.startswith(prefix)
+        }
+        platform_merged = _merge_latest_entity_samples(
+            platform_current,
+            platform_candidate,
+            incoming_dates=incoming_dates,
+            kept_dates=kept_dates,
+        )
+        for field in [field for field in fields if field.startswith(prefix)]:
+            fields.pop(field)
+        fields.update(platform_merged)
+        platforms_meta[platform] = {
+            **current_platform,
+            **candidate_platform,
+            "dates": sorted(kept_dates),
+            "entityCount": len(platform_merged),
+            "retentionDates": retention,
+        }
+    meta = {
+        **current_meta,
+        **candidate_meta,
+        "platforms": platforms_meta,
+        "entityCount": len(fields),
+    }
+    return meta, fields
+
+
+def _rank_scope_for_hash(key: str) -> str:
+    return "cv" if key == CV_TREND_V2_KEY else "normal"
+
+
+def decorate_hash_meta(meta: dict, fields: dict[str, dict]) -> tuple[dict, dict[str, str]]:
+    encoded_fields = {
+        str(field): compact_json(value)
+        for field, value in sorted(fields.items())
+    }
+    digest, byte_count = hash_content_stats(encoded_fields)
+    decorated = {
+        **meta,
+        "version": 2,
+        "updated_at": str(meta.get("updated_at") or datetime.now(timezone.utc).isoformat()),
+        "revision": uuid.uuid4().hex,
+        "contentSha1": digest,
+        "entityCount": len(fields),
+        "bytes": byte_count,
+    }
+    return decorated, encoded_fields
+
+
 def publish_hash_snapshot_atomic(
     stable_key: str,
     meta: dict,
     fields: dict[str, dict],
     *,
     upstash: Callable[[list[object]], object],
+    expected_meta_raw: str | None,
     chunk_size: int = HASH_WRITE_CHUNK_SIZE,
 ) -> None:
     if any(str(field) == "__meta__" for field in fields):
         raise ValueError(f"Reserved hash field __meta__ cannot be published to {stable_key}")
     staging_key = f"{stable_key}:staging:{uuid.uuid4().hex}"
-    encoded_fields = [("__meta__", compact_json(meta))] + [
-        (str(field), compact_json(value)) for field, value in sorted(fields.items())
-    ]
+    meta, raw_fields = decorate_hash_meta(meta, fields)
+    encoded_fields = [("__meta__", compact_json(meta)), *sorted(raw_fields.items())]
     effective_chunk_size = max(1, min(chunk_size, HASH_WRITE_CHUNK_SIZE))
     try:
         for offset in range(0, len(encoded_fields), effective_chunk_size):
@@ -408,9 +682,58 @@ def publish_hash_snapshot_atomic(
             raise RuntimeError(f"Unable to sample {staging_key}")
         for value in sample_values:
             json.loads(value)
-        result = upstash(["EVAL", HASH_ACTIVATE_SCRIPT, 2, staging_key, stable_key])
-        if int(result or 0) != 1:
-            raise RuntimeError(f"Failed to activate {stable_key}: {result!r}")
+        digest = str(meta["contentSha1"])
+        byte_count = int(meta["bytes"])
+        rank_meta: dict | None = None
+        for _attempt in range(3):
+            current_rank_meta = upstash(["GET", RANK_META_KEY])
+            rank_meta = build_rank_meta_update(
+                current_rank_meta,
+                scope=_rank_scope_for_hash(stable_key),
+                key=stable_key,
+                data_type="hash",
+                content_sha1=digest,
+                byte_count=byte_count,
+                updated_at=str(meta.get("updated_at") or datetime.now(timezone.utc).isoformat()),
+            )
+            result = upstash(
+                [
+                    "EVAL",
+                    HASH_ACTIVATE_WITH_META_SCRIPT,
+                    3,
+                    staging_key,
+                    stable_key,
+                    RANK_META_KEY,
+                    expected_meta_raw if expected_meta_raw is not None else "__missing__",
+                    string_cas_token(current_rank_meta),
+                    compact_json(rank_meta),
+                ]
+            )
+            if int(result or 0) == 1:
+                break
+        else:
+            raise RuntimeError(f"Concurrent update detected while activating {stable_key}")
+        assert rank_meta is not None
+        verified = decode_hgetall(upstash(["HGETALL", stable_key]))
+        verified_digest, verified_bytes = hash_content_stats(verified)
+        verified_meta_raw = verified.get("__meta__")
+        verified_meta = json.loads(verified_meta_raw) if isinstance(verified_meta_raw, str) else None
+        if (
+            verified_digest != digest
+            or verified_bytes != byte_count
+            or not isinstance(verified_meta, dict)
+            or verified_meta.get("contentSha1") != digest
+            or int(verified_meta.get("bytes") or -1) != byte_count
+        ):
+            raise RuntimeError(f"Remote Hash verification failed for {stable_key}")
+        _verify_rank_resource(
+            upstash(["GET", RANK_META_KEY]),
+            scope=_rank_scope_for_hash(stable_key),
+            key=stable_key,
+            digest=digest,
+            byte_count=byte_count,
+            updated_at=str(meta.get("updated_at") or ""),
+        )
     except Exception:
         try:
             upstash(["EXPIRE", staging_key, STAGING_TTL_SECONDS])
@@ -421,28 +744,78 @@ def publish_hash_snapshot_atomic(
 
 
 def publish_normal_trend_v2(platform: str, payload: dict, *, upstash: Callable[[list[object]], object], force: bool = False) -> None:
-    if not force and not v2_publish_enabled():
-        return
-    meta, fields = build_normal_trend_v2(payload, platform)
-    publish_hash_snapshot_atomic(NORMAL_TREND_V2_KEYS[platform], meta, fields, upstash=upstash)
+    key = NORMAL_TREND_V2_KEYS[platform]
+    if force and int(upstash(["EXISTS", key]) or 0) == 1:
+        raise RuntimeError(f"Refusing legacy backfill: authoritative v2 already exists: {key}")
+    candidate_meta, candidate_fields = build_normal_trend_v2(payload, platform)
+    current_meta, current_fields, current_meta_raw = _load_hash_snapshot(key, upstash=upstash)
+    if current_fields:
+        meta, fields = merge_normal_v2_authoritative(
+            current_meta,
+            current_fields,
+            candidate_meta,
+            candidate_fields,
+        )
+    else:
+        meta, fields = candidate_meta, candidate_fields
+    publish_hash_snapshot_atomic(
+        NORMAL_TREND_V2_KEYS[platform],
+        meta,
+        fields,
+        upstash=upstash,
+        expected_meta_raw=current_meta_raw,
+    )
 
 
 def publish_peak_trend_v2(payload: dict, *, upstash: Callable[[list[object]], object], force: bool = False) -> None:
-    if not force and not v2_publish_enabled():
-        return
-    meta, fields = build_peak_trend_v2(payload)
-    publish_hash_snapshot_atomic(PEAK_TREND_V2_KEY, meta, fields, upstash=upstash)
+    if force and int(upstash(["EXISTS", PEAK_TREND_V2_KEY]) or 0) == 1:
+        raise RuntimeError(f"Refusing legacy backfill: authoritative v2 already exists: {PEAK_TREND_V2_KEY}")
+    candidate_meta, candidate_fields = build_peak_trend_v2(payload)
+    current_meta, current_fields, current_meta_raw = _load_hash_snapshot(PEAK_TREND_V2_KEY, upstash=upstash)
+    if current_fields:
+        meta, fields = merge_normal_v2_authoritative(
+            current_meta,
+            current_fields,
+            candidate_meta,
+            candidate_fields,
+        )
+    else:
+        meta, fields = candidate_meta, candidate_fields
+    publish_hash_snapshot_atomic(
+        PEAK_TREND_V2_KEY,
+        meta,
+        fields,
+        upstash=upstash,
+        expected_meta_raw=current_meta_raw,
+    )
 
 
 def publish_cv_trend_v2(payloads: dict[str, dict], *, upstash: Callable[[list[object]], object], force: bool = False) -> None:
-    if not force and not v2_publish_enabled():
-        return
-    meta, fields = build_cv_trend_v2(payloads)
-    publish_hash_snapshot_atomic(CV_TREND_V2_KEY, meta, fields, upstash=upstash)
+    if force and int(upstash(["EXISTS", CV_TREND_V2_KEY]) or 0) == 1:
+        raise RuntimeError(f"Refusing legacy backfill: authoritative v2 already exists: {CV_TREND_V2_KEY}")
+    candidate_meta, candidate_fields = build_cv_trend_v2(payloads)
+    current_meta, current_fields, current_meta_raw = _load_hash_snapshot(CV_TREND_V2_KEY, upstash=upstash)
+    if current_fields:
+        meta, fields = merge_cv_v2_authoritative(
+            current_meta,
+            current_fields,
+            candidate_meta,
+            candidate_fields,
+        )
+    else:
+        meta, fields = candidate_meta, candidate_fields
+    publish_hash_snapshot_atomic(
+        CV_TREND_V2_KEY,
+        meta,
+        fields,
+        upstash=upstash,
+        expected_meta_raw=current_meta_raw,
+    )
 
 
 def publish_trend_v2_best_effort(label: str, publish: Callable[[], None]) -> None:
     try:
         publish()
     except Exception as exc:
-        print(f"[warn] failed to publish {label}: {exc}")
+        print(f"[error] failed to publish authoritative {label}: {exc}")
+        raise

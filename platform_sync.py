@@ -61,19 +61,44 @@ EPISODE_PATTERNS = [
     re.compile(rf"[（(＜<【\[]\s*(?:1|0*1|一)\s*[）)＞>】\]]", re.I | re.U),
     re.compile(r"(?:上集)(?:\D|$)", re.I | re.U),
 ]
+FIRST_EPISODE_PATTERNS = [
+    re.compile(r"第\s*(?:0*1|一|壹)\s*[集话期章节卷杯单篇回]", re.I | re.U),
+    re.compile(r"(?:^|\s)ep\.?\s*0*1(?:\D|$)", re.I | re.U),
+    re.compile(r"(?:^|\s)e\s*0*1(?:\D|$)", re.I | re.U),
+    re.compile(r"episode\s*0*1(?:\D|$)", re.I | re.U),
+    re.compile(r"s\s*[0-9]{1,2}\s*e\s*0*1(?:\D|$)", re.I | re.U),
+    re.compile(r"^0*1(?:\b|[·.、\s\-_:：])", re.I | re.U),
+    re.compile(r"0*1\s*集(?:\D|$)", re.I | re.U),
+    re.compile(r"(?:上集)(?:\D|$)", re.I | re.U),
+]
 NARRATOR_ROLES = {"旁白", "报幕"}
 NON_MAIN_EPISODE_KEYWORDS = (
     "预告",
-    "pv",
+    "先导",
+    "预热",
+    "定档",
+    "声展",
+    "角色id",
+    "倒计时",
     "番外",
     "花絮",
     "采访",
-    "ed",
-    "op",
-    "ft",
+    "小剧场",
+    "幕后",
+    "企划",
+    "福利",
+    "生日",
+    "生辰",
+    "回顾",
+    "视角",
+    "七天乐",
+    "主题曲",
+    "插曲",
+    "伴奏",
     "翻唱",
+    "报幕",
 )
-THEME_SONG_KEYWORDS = ("主题曲",)
+NON_MAIN_EPISODE_LATIN_PATTERN = re.compile(r"(?:^|[^a-z0-9])(?:pv|kv|op|ed|ft|reaction)(?:[^a-z0-9]|$)", re.I)
 
 
 def utc_now() -> str:
@@ -239,6 +264,20 @@ def is_numeric_drama_id(value: object) -> bool:
     return bool(text) and text.isascii() and text.isdigit()
 
 
+def is_target_catalog(platform: str, catalog: object) -> bool:
+    if catalog in (None, ""):
+        return False
+    try:
+        numeric_catalog = int(catalog)
+    except (TypeError, ValueError):
+        return False
+    if platform == "missevan":
+        return numeric_catalog in MISSEVAN_CATALOG_NAME_BY_ID
+    if platform == "manbo":
+        return numeric_catalog in MANBO_CATALOG_NAME_BY_ID
+    raise ValueError(f"Unsupported platform: {platform}")
+
+
 def normalize_match(value: object) -> str:
     return re.sub(r"\s+", "", normalize(value)).casefold()
 
@@ -385,18 +424,6 @@ def clean_role_name(value: object) -> str:
     if compact in NARRATOR_ROLES:
         return compact
     return normalize(text)
-
-
-def clean_role_names(value: object) -> str:
-    seen: set[str] = set()
-    out: list[str] = []
-    for part in re.split(r"/", str(value or "")):
-        item = re.sub(r"\s+", "", part or "")
-        if not item or item == "报幕" or item in seen:
-            continue
-        seen.add(item)
-        out.append(item)
-    return " / ".join(out)
 
 
 def first_sound_id(info: dict) -> str:
@@ -565,29 +592,33 @@ def select_main_cv_entries(entries: list[dict], drama_type: int) -> list[dict]:
     return selected[:limit]
 
 
-def match_main_episode(title: object) -> bool:
+def is_non_main_episode_title(title: object) -> bool:
     text = normalize_text_for_match(title)
     if not text:
-        return False
+        return True
     lowered = text.casefold()
     if any(keyword in lowered for keyword in NON_MAIN_EPISODE_KEYWORDS):
+        return True
+    return bool(NON_MAIN_EPISODE_LATIN_PATTERN.search(lowered))
+
+
+def match_main_episode(title: object) -> bool:
+    text = normalize_text_for_match(title)
+    if not text or is_non_main_episode_title(text):
         return False
     return any(pattern.search(text) for pattern in EPISODE_PATTERNS)
 
 
-def match_theme_song(title: object) -> bool:
+def match_first_episode(title: object) -> bool:
     text = normalize_text_for_match(title)
-    if not text:
+    if not text or is_non_main_episode_title(text):
         return False
-    lowered = text.casefold()
-    if any(keyword in lowered for keyword in ("预告", "番外")):
-        return False
-    return any(keyword in text for keyword in THEME_SONG_KEYWORDS)
+    return any(pattern.search(text) for pattern in FIRST_EPISODE_PATTERNS)
 
 
 def pick_first_episode_month(entries: list[dict], *, title_key: str, time_key: str, milliseconds: bool) -> str:
-    candidates: list[tuple[int, float, str]] = []
-    theme_candidates: list[tuple[int, float, str]] = []
+    explicit_candidates: list[tuple[int, float, int, str]] = []
+    inferred_candidates: list[tuple[int, float, int, str]] = []
     for idx, item in enumerate(entries):
         title = item.get(title_key)
         order_value = safe_int(item.get("order"), 0) or safe_int(item.get("setNo"), 0) or idx + 1
@@ -595,18 +626,16 @@ def pick_first_episode_month(entries: list[dict], *, title_key: str, time_key: s
         month = to_beijing_month(timestamp_value, milliseconds=milliseconds)
         if not month:
             continue
-        if match_main_episode(title):
-            candidates.append((order_value, timestamp_value, month))
+        if match_first_episode(title):
+            explicit_candidates.append((order_value, timestamp_value, idx, month))
             continue
-        if match_theme_song(title):
-            theme_candidates.append((order_value, timestamp_value, month))
+        if not is_non_main_episode_title(title):
+            inferred_candidates.append((order_value, timestamp_value, idx, month))
+    candidates = explicit_candidates or inferred_candidates
     if not candidates:
-        if not theme_candidates:
-            return ""
-        theme_candidates.sort(key=lambda item: (item[0], item[1]))
-        return theme_candidates[0][2]
-    candidates.sort(key=lambda item: (item[0], item[1]))
-    return candidates[0][2]
+        return ""
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+    return candidates[0][3]
 
 
 def strip_catalog_suffix(title: object) -> str:

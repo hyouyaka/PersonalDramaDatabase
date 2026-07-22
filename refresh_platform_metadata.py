@@ -33,10 +33,10 @@ from platform_sync import (
     build_missevan_cv_entries,
     finalize_series_titles,
     first_main_episode_sound_id,
-    finalize_missevan_store,
     infer_type_from_labels,
     is_narrator_role,
     is_numeric_drama_id,
+    is_target_catalog,
     iter_missevan_nodes,
     load_cache,
     load_json,
@@ -405,11 +405,6 @@ def missevan_cv_entry_from_combined_map(display_name: str, combined_map: dict) -
     if len(unique) == 1:
         return next(iter(unique))
     return None, None, ""
-
-
-def missevan_cv_id_from_combined_map(display_name: str, combined_map: dict) -> tuple[int | None, str]:
-    _key, cv_id, mapped_name = missevan_cv_entry_from_combined_map(display_name, combined_map)
-    return cv_id, mapped_name
 
 
 def search_missevan_cv(name: str, requester: MissevanRequester) -> dict | None:
@@ -782,12 +777,6 @@ def missevan_is_member_from_infos(drama_info: dict, sound_info: dict | None = No
     return safe_int(sound_drama.get("vip")) == 1
 
 
-def apply_missevan_preview_maincvs(node: dict, drama_id: str, base_entries: list[dict], preview_info: dict, use_preview_maincvs: bool) -> dict:
-    if not use_preview_maincvs:
-        return node
-    return apply_missevan_sound_maincvs(node, drama_id, base_entries, preview_info)
-
-
 def apply_missevan_sound_maincvs(node: dict, drama_id: str, base_entries: list[dict], sound_info: dict) -> dict:
     preview_entries = build_missevan_main_cv_entries(sound_info)
     if not preview_entries:
@@ -890,11 +879,6 @@ def resolve_missevan_type(raw_type: object) -> int:
         return 3
 
 
-def finalize_missevan_store_titles(store: dict) -> dict:
-    finalized, _conflicts = finalize_missevan_store(store)
-    return finalized
-
-
 def is_http_403(exc: Exception) -> bool:
     response = getattr(exc, "response", None)
     return getattr(response, "status_code", None) == 403
@@ -931,6 +915,7 @@ def refresh_missevan(
     processed = 0
     skipped = 0
     archived = 0
+    rejected: list[dict[str, str]] = []
 
     pending_nodes: list[tuple[str, str, dict]] = []
     pending_nodes = list(iter_missevan_nodes(store))
@@ -990,6 +975,19 @@ def refresh_missevan(
             raise
         info = (drama_payload or {}).get("info") or {}
         drama = info.get("drama") or {}
+        remote_title = normalize(drama.get("name"))
+        remote_catalog = drama.get("catalog")
+        if not remote_title or not is_target_catalog("missevan", remote_catalog):
+            reason = "empty title" if not remote_title else f"non-target catalog={remote_catalog}"
+            rejected.append({"dramaId": drama_id, "reason": reason})
+            is_placeholder = not normalize(node.get("title")) or normalize(node.get("title")).startswith("__pending__")
+            if is_placeholder:
+                remove_missevan_node(store, series_title, season_key)
+                cache.get("counts", {}).pop(drama_id, None)
+                print(f"[猫耳] rejected ID={drama_id}: {reason}")
+            else:
+                print(f"[猫耳] WARN existing record rejected by current detail ID={drama_id}: {reason}")
+            continue
         sound_id, used_preview_sound = preferred_sound_id(info)
         preview_sound_id_list = preview_sound_ids(info)
         first_episode_sound_id = first_main_episode_sound_id(info)
@@ -1134,6 +1132,7 @@ def refresh_missevan(
         "archived": archived,
         "last_backoff_seconds": requester.last_backoff_seconds,
         "request_count": requester.request_count,
+        "rejected": rejected,
         "cv_upgrade_ambiguities": list(cv_upgrade_ambiguities or []),
     }
 
@@ -1252,6 +1251,8 @@ def refresh_manbo(*, target_drama_ids: set[str] | None = None, force: bool = Tru
     missing_catalog = 0
     processed = 0
     skipped = 0
+    rejected: list[dict[str, str]] = []
+    rejected_ids: set[str] = set()
 
     for idx, record in enumerate(records, start=1):
         drama_id = str(record.get("dramaId") or "").strip()
@@ -1278,12 +1279,32 @@ def refresh_manbo(*, target_drama_ids: set[str] | None = None, force: bool = Tru
             continue
 
         payload = request_manbo_json(f"https://www.kilamanbo.world/web_manbo/dramaDetail?dramaId={drama_id}")
+        data = payload.get("data") if isinstance(payload, dict) else None
+        remote_title = normalize((data or {}).get("title")) if isinstance(data, dict) else ""
+        remote_catalog = (data or {}).get("catelog") if isinstance(data, dict) else None
+        if remote_catalog is None and isinstance(data, dict):
+            remote_catalog = data.get("category")
+        if not isinstance(data, dict) or not remote_title or not is_target_catalog("manbo", remote_catalog):
+            if not isinstance(data, dict):
+                reason = "missing data"
+            elif not remote_title:
+                reason = "empty title"
+            else:
+                reason = f"non-target catalog={remote_catalog}"
+            rejected.append({"dramaId": drama_id, "reason": reason})
+            is_placeholder = not normalize(record.get("name"))
+            if is_placeholder:
+                rejected_ids.add(drama_id)
+                cache.get("counts", {}).pop(drama_id, None)
+                print(f"[漫播] rejected ID={drama_id}: {reason}")
+            else:
+                print(f"[漫播] WARN existing record rejected by current detail ID={drama_id}: {reason}")
+            continue
         updated = build_manbo_record(record, payload, manbo_cv_name_map)
         if updated.get("catalog") is None:
             missing_catalog += 1
         elif int(updated["catalog"]) not in set(MANBO_CATALOG_NAME_BY_ID):
             unknown_catalogs.add(int(updated["catalog"]))
-        data = payload.get("data") or {}
         cache["counts"][drama_id] = {
             "name": normalize(data.get("title") or updated.get("name")),
             "view_count": None if data.get("watchCount") is None else int(data["watchCount"]),
@@ -1297,6 +1318,8 @@ def refresh_manbo(*, target_drama_ids: set[str] | None = None, force: bool = Tru
             save_json(MANBO_INFO_PATH, info)
             save_cache(MANBO_COUNTS_PATH, cache)
 
+    if rejected_ids:
+        records[:] = [record for record in records if str(record.get("dramaId") or "") not in rejected_ids]
     finalize_manbo_records(records)
     info["updatedAt"] = utc_now()
     save_json(MANBO_INFO_PATH, info)
@@ -1306,6 +1329,7 @@ def refresh_manbo(*, target_drama_ids: set[str] | None = None, force: bool = Tru
         "skipped": skipped,
         "unknown_catalogs": sorted(unknown_catalogs),
         "missing_catalog": missing_catalog,
+        "rejected": rejected,
     }
 
 

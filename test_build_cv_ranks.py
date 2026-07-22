@@ -119,9 +119,17 @@ class BuildCvRanksTests(unittest.TestCase):
                     "avatar": "https://avatar.test/canonical.jpg",
                 }
             }
+            remote: dict[str, str] = {}
+
             def upstash(command: list[object]) -> object:
                 if command[0] == "GET":
-                    return None
+                    return remote.get(str(command[1]))
+                if command[0] == "EXISTS":
+                    return 0
+                if command[0] == "EVAL":
+                    remote[str(command[3])] = str(command[5])
+                    remote[str(command[4])] = str(command[6])
+                    return 1
                 if command[0] == "SET":
                     return "OK"
                 raise AssertionError(command)
@@ -131,6 +139,7 @@ class BuildCvRanksTests(unittest.TestCase):
             with (
                 patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value=remote_map),
                 patch.object(build_cv_ranks, "sync_remote_watchcount_inputs"),
+                patch.object(build_cv_ranks, "publish_trend_v2_best_effort"),
                 patch.object(build_cv_ranks, "run_cleanup_best_effort") as cleanup,
             ):
                 payload = build_cv_ranks.build_and_publish_cv_ranks(
@@ -174,15 +183,12 @@ class BuildCvRanksTests(unittest.TestCase):
             self.assertIs(manbo_cv["works"][0]["isPaid"], True)
             self.assertEqual(payload["paidRankings"]["manbo"][0]["totalViewCount"], 60)
             self.assertEqual(json.loads(output.read_text(encoding="utf-8")), payload)
-            written_keys = [
-                call.args[0][1]
+            atomic_rank_writes = [
+                call.args[0]
                 for call in upstash.call_args_list
-                if call.args[0][0] == "SET"
+                if call.args[0][0] == "EVAL" and call.args[0][3:5] == ["ranks:cv:latest", "ranks:meta"]
             ]
-            self.assertEqual(
-                written_keys,
-                ["ranks:cv:latest", "ranks:trend:cv:missevan", "ranks:trend:cv:manbo"],
-            )
+            self.assertEqual(len(atomic_rank_writes), 1)
             cleanup.assert_called_once()
 
     def test_builds_paid_rankings_from_platform_paid_flags(self) -> None:
@@ -400,9 +406,20 @@ class BuildCvRanksTests(unittest.TestCase):
             manbo_counts = self.write_json(tmp, "manbo-counts.json", {"_meta": {}, "counts": {"200": {"view_count": 60}}})
             cvid_map = self.write_json(tmp, "map.json", {})
             commands: list[list[object]] = []
+            remote: dict[str, str] = {}
 
             def fake_upstash(command: list[object]) -> object:
                 commands.append(command)
+                if command[0] == "GET" and str(command[1]) in remote:
+                    return remote[str(command[1])]
+                if command[:2] == ["GET", "ranks:meta"]:
+                    return None
+                if command[0] == "EVAL":
+                    remote[str(command[3])] = str(command[5])
+                    remote[str(command[4])] = str(command[6])
+                    return 1
+                if command[0] == "EXISTS":
+                    return 1
                 if command[:2] in (["GET", "ranks:trend:cv:missevan"], ["GET", "ranks:trend:cv:manbo"]):
                     return None
                 if command[0] == "SET":
@@ -412,6 +429,7 @@ class BuildCvRanksTests(unittest.TestCase):
             with (
                 patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value={}),
                 patch.object(build_cv_ranks, "sync_remote_watchcount_inputs"),
+                patch.object(build_cv_ranks, "publish_trend_v2_best_effort") as publish_v2,
                 patch.object(build_cv_ranks, "run_cleanup_best_effort") as cleanup,
                 patch("builtins.print"),
             ):
@@ -427,15 +445,16 @@ class BuildCvRanksTests(unittest.TestCase):
                     upload=True,
                 )
 
-            self.assertEqual(commands[0][0:2], ["SET", "ranks:cv:latest"])
-            self.assertEqual(commands[1][0:2], ["GET", "ranks:trend:cv:missevan"])
-            self.assertEqual(commands[2][0:2], ["SET", "ranks:trend:cv:missevan"])
-            self.assertEqual(commands[3][0:2], ["GET", "ranks:trend:cv:manbo"])
-            self.assertEqual(commands[4][0:2], ["SET", "ranks:trend:cv:manbo"])
-            missevan_trend = json.loads(commands[2][2])
+            legacy_sets = [command for command in commands if command[:1] == ["SET"]]
+            self.assertEqual(
+                [command[1] for command in legacy_sets],
+                ["ranks:trend:cv:missevan", "ranks:trend:cv:manbo"],
+            )
+            missevan_trend = json.loads(legacy_sets[0][2])
             self.assertEqual(missevan_trend["cvs"]["猫耳名"]["samples"]["2026-06-10"]["metrics"]["paidViewCount"], 100)
-            manbo_trend = json.loads(commands[4][2])
+            manbo_trend = json.loads(legacy_sets[1][2])
             self.assertEqual(manbo_trend["cvs"]["漫播名"]["samples"]["2026-06-10"]["metrics"]["paidViewCount"], 0)
+            publish_v2.assert_called_once()
             cleanup.assert_called_once()
 
     def test_upload_cv_trends_does_not_overwrite_when_current_read_fails(self) -> None:
@@ -443,13 +462,18 @@ class BuildCvRanksTests(unittest.TestCase):
 
         def fake_upstash(command: list[object]) -> object:
             commands.append(command)
+            if command[:2] == ["EXISTS", "ranks:trend:cv:missevan"]:
+                return 1
             if command[:2] == ["GET", "ranks:trend:cv:missevan"]:
                 raise RuntimeError("temporary read failure")
             if command[0] == "SET":
                 raise AssertionError("trend should not be overwritten after read failure")
             raise AssertionError(command)
 
-        with self.assertRaisesRegex(RuntimeError, "Failed to load ranks:trend:cv:missevan"):
+        with (
+            patch.object(build_cv_ranks, "publish_trend_v2_best_effort"),
+            self.assertRaisesRegex(RuntimeError, "Failed to load ranks:trend:cv:missevan"),
+        ):
             build_cv_ranks.upload_cv_trends(
                 history_date="2026-06-10",
                 generated_at="2026-06-10T12:00:00+00:00",
@@ -458,7 +482,13 @@ class BuildCvRanksTests(unittest.TestCase):
                 upstash=fake_upstash,
             )
 
-        self.assertEqual(commands, [["GET", "ranks:trend:cv:missevan"]])
+        self.assertEqual(
+            commands,
+            [
+                ["EXISTS", "ranks:trend:cv:missevan"],
+                ["GET", "ranks:trend:cv:missevan"],
+            ],
+        )
 
     def test_no_upload_still_syncs_remote_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -580,8 +610,8 @@ class BuildCvRanksTests(unittest.TestCase):
 
             self.assertEqual(upstash.call_args_list[0].args[0], ["GET", "missevan:watchcount:latest"])
             self.assertEqual(upstash.call_args_list[1].args[0], ["GET", "manbo:watchcount:latest"])
-            self.assertEqual(upstash.call_args_list[2].args[0], ["GET", "manbo:info:v1"])
-            self.assertEqual(upstash.call_args_list[3].args[0], ["GET", "missevan:info:v1"])
+            self.assertEqual(upstash.call_args_list[2].args[0], ["GET", "manbo:info:v2"])
+            self.assertEqual(upstash.call_args_list[3].args[0], ["GET", "missevan:info:v2"])
             self.assertEqual(upstash.call_args_list[4].args[0], ["GET", "cvid-map:v1"])
             self.assertEqual(json.loads(manbo_info.read_text(encoding="utf-8")), remote_manbo)
             self.assertEqual(json.loads(missevan_info.read_text(encoding="utf-8")), remote_missevan)

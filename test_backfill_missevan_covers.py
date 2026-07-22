@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import requests
 
@@ -32,14 +32,16 @@ class BackfillMissevanCoversTests(unittest.TestCase):
             requester.request_count = 1
             requester.last_backoff_seconds = 0
             requester.request_json.return_value = {"info": {"drama": {"cover": "https://cover.test/a.jpg"}}}
-            upstash = Mock(return_value="OK")
+            source_encoded = path.read_text(encoding="utf-8")
+            upstash = Mock(return_value=source_encoded)
 
-            stats = backfill_missevan_covers.backfill_missevan_covers(
-                path=path,
-                requester=requester,
-                upstash=upstash,
-                upload=True,
-            )
+            with patch.object(backfill_missevan_covers, "publish_info_v2", return_value={}) as publish:
+                stats = backfill_missevan_covers.backfill_missevan_covers(
+                    path=path,
+                    requester=requester,
+                    upstash=upstash,
+                    upload=True,
+                )
 
             saved = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(saved["100"]["cover"], "https://cover.test/a.jpg")
@@ -50,9 +52,10 @@ class BackfillMissevanCoversTests(unittest.TestCase):
             requester.request_json.assert_called_once_with(
                 "https://www.missevan.com/dramaapi/getdrama?drama_id=100"
             )
-            self.assertIn(
-                ["SET", "missevan:info:v1"],
-                [call.args[0][:2] for call in upstash.call_args_list],
+            publish.assert_called_once()
+            self.assertEqual(
+                publish.call_args.kwargs["source_encoded"],
+                source_encoded,
             )
 
     def test_existing_cover_is_skipped_without_force(self) -> None:

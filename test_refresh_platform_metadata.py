@@ -2,6 +2,66 @@ import unittest
 from unittest.mock import Mock, patch
 
 import refresh_platform_metadata
+import platform_sync
+
+
+class FirstEpisodeMonthTests(unittest.TestCase):
+    def test_explicit_first_episode_beats_earlier_unnumbered_candidate(self) -> None:
+        entries = [
+            {"setTitle": "独立标题正片", "setNo": 1, "createTime": 1767225600000},
+            {"setTitle": "EP01", "setNo": 2, "createTime": 1769904000000},
+        ]
+
+        result = platform_sync.pick_first_episode_month(
+            entries,
+            title_key="setTitle",
+            time_key="createTime",
+            milliseconds=True,
+        )
+
+        self.assertEqual(result, "2026.02")
+
+    def test_unnumbered_first_content_is_inferred_after_promos(self) -> None:
+        entries = [
+            {"setTitle": "系列预热片", "setNo": 1, "createTime": 1696118400000},
+            {"setTitle": "先导预告", "setNo": 2, "createTime": 1696204800000},
+            {"setTitle": "《晓歌天下》之《空空》", "setNo": 3, "createTime": 1698796800000},
+        ]
+
+        result = platform_sync.pick_first_episode_month(
+            entries,
+            title_key="setTitle",
+            time_key="createTime",
+            milliseconds=True,
+        )
+
+        self.assertEqual(result, "2023.11")
+
+    def test_only_non_main_material_remains_empty(self) -> None:
+        entries = [
+            {"name": "PV", "order": 1, "create_time": 1767225600},
+            {"name": "主题曲", "order": 2, "create_time": 1767312000},
+            {"name": "生日福利", "order": 3, "create_time": 1767398400},
+        ]
+
+        result = platform_sync.pick_first_episode_month(
+            entries,
+            title_key="name",
+            time_key="create_time",
+            milliseconds=False,
+        )
+
+        self.assertEqual(result, "")
+
+    def test_numbered_extras_do_not_match_first_episode(self) -> None:
+        for title in ("幕后企划①", "倒计时1天", "花絮01", "小剧场1", "雪饼日记1.0", "郑郑视角01"):
+            with self.subTest(title=title):
+                self.assertFalse(platform_sync.match_first_episode(title))
+
+    def test_supported_first_episode_variants(self) -> None:
+        for title in ("第一集", "第1期", "EP01", "E01", "Episode 1", "S02E01", "01 癖好", "上集"):
+            with self.subTest(title=title):
+                self.assertTrue(platform_sync.match_first_episode(title))
 
 
 class ManboCvFallbackTests(unittest.TestCase):

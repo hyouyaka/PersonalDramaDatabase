@@ -17,7 +17,7 @@ from sync_new_drama_ids import (
     upstash_request,
     write_json_work_copy,
 )
-from upstash_v2 import publish_info_v2_best_effort
+from upstash_v2 import publish_info_v2
 
 
 SAVE_EVERY = 25
@@ -50,32 +50,41 @@ def count_missing_covers(store: dict) -> int:
     )
 
 
-def download_manbo_info(path: Path, *, upstash=upstash_request) -> dict:
-    payload = decode_remote_info_payload(MANBO_INFO_KEY, upstash(["GET", MANBO_INFO_KEY]))
+def download_manbo_info(path: Path, *, upstash=upstash_request) -> tuple[dict, str]:
+    raw = upstash(["GET", MANBO_INFO_KEY])
+    if not isinstance(raw, str) or not raw:
+        raise RuntimeError(f"{MANBO_INFO_KEY} is empty or unsupported")
+    payload = decode_remote_info_payload(MANBO_INFO_KEY, raw)
     if path.resolve() == MANBO_INFO_PATH.resolve():
         assert_info_download_is_safe(MANBO_INFO_KEY, payload)
     backup_path = write_json_work_copy(path, payload)
     if backup_path is not None:
         print(f"[backup] {path.name} -> {backup_path}")
     print(f"[ok] downloaded {MANBO_INFO_KEY} -> {path.name}")
-    return payload if isinstance(payload, dict) else {"version": 1, "records": []}
+    return (
+        payload if isinstance(payload, dict) else {"version": 1, "records": []},
+        raw,
+    )
 
 
-def upload_manbo_info(path: Path, *, upstash=upstash_request) -> None:
+def upload_manbo_info(path: Path, *, source_encoded: str, upstash=upstash_request) -> None:
     if path.resolve() == MANBO_INFO_PATH.resolve():
-        upload_json_file(MANBO_INFO_KEY, path, upstash=upstash)
+        upload_json_file(
+            MANBO_INFO_KEY,
+            path,
+            upstash=upstash,
+            source_encoded=source_encoded,
+        )
         return
     value = path.read_text(encoding="utf-8")
-    result = upstash(["SET", MANBO_INFO_KEY, value])
-    if result != "OK":
-        raise RuntimeError(f"Failed to upload {path.name} to {MANBO_INFO_KEY}: {result!r}")
-    print(f"[ok] uploaded {path.name} -> {MANBO_INFO_KEY}")
-    publish_info_v2_best_effort(
+    publish_info_v2(
         MANBO_INFO_KEY,
         json.loads(value),
         upstash=upstash,
-        source_encoded=value,
+        force=True,
+        source_encoded=source_encoded,
     )
+    print(f"[ok] uploaded authoritative {path.name} -> {MANBO_INFO_KEY}")
 
 
 def backfill_manbo_covers(
@@ -85,7 +94,7 @@ def backfill_manbo_covers(
     manbo_request=request_manbo_json,
     upload: bool = True,
 ) -> dict:
-    store = download_manbo_info(path, upstash=upstash)
+    store, source_encoded = download_manbo_info(path, upstash=upstash)
     records = [record for record in store.get("records") or [] if isinstance(record, dict)]
     targets: list[tuple[dict, str]] = []
     skipped = 0
@@ -134,7 +143,7 @@ def backfill_manbo_covers(
     missing_cover = count_missing_covers(store)
     uploaded = False
     if upload:
-        upload_manbo_info(path, upstash=upstash)
+        upload_manbo_info(path, source_encoded=source_encoded, upstash=upstash)
         uploaded = True
     return {
         "processed": processed,

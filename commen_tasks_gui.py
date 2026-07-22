@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import codecs
+import copy
 import math
 import sqlite3
 import subprocess
@@ -25,8 +26,10 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QInputDialog,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QStatusBar,
     QTabWidget,
@@ -34,6 +37,17 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QFileDialog,
+)
+
+from upstash_editor import (
+    RESOURCE_SPECS,
+    CollectionRef,
+    LoadedResource,
+    SaveResult,
+    collection_refs,
+    find_list_item_by_identity,
+    load_resource,
+    save_resource,
 )
 
 
@@ -1052,6 +1066,560 @@ class JSONBrowserPage(QWidget):
             self._current_item_source = self._items_source_info[row]
 
 
+class UpstashResourceWorker(QThread):
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        operation: str,
+        *,
+        key: str | None = None,
+        loaded: LoadedResource | None = None,
+        payload: object = None,
+    ) -> None:
+        super().__init__()
+        self.operation = operation
+        self.key = key
+        self.loaded = loaded
+        self.payload = payload
+
+    def run(self) -> None:
+        try:
+            from sync_new_drama_ids import load_env_file, upstash_request
+
+            load_env_file(ROOT / ".env")
+            if self.operation == "load":
+                if not self.key:
+                    raise RuntimeError("Missing Upstash key.")
+                result = load_resource(self.key, upstash=upstash_request)
+            elif self.operation == "save":
+                if self.loaded is None:
+                    raise RuntimeError("No Upstash resource is loaded.")
+                result = save_resource(self.loaded, self.payload, upstash=upstash_request)
+            else:
+                raise RuntimeError(f"Unsupported Upstash worker operation: {self.operation}")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.succeeded.emit(result)
+
+
+class UpstashEditorPage(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.worker: UpstashResourceWorker | None = None
+        self.loaded: LoadedResource | None = None
+        self.working_payload: object = None
+        self.original_payload: object = None
+        self.collections: list[CollectionRef] = []
+        self.visible_items: list[tuple[object, object]] = []
+        self.current_identity: object = None
+        self.current_collection_index: int | None = None
+        self.dirty = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+
+        remote_box = QGroupBox("Upstash v2 权威数据")
+        remote_layout = QGridLayout(remote_box)
+        self.key_box = QComboBox()
+        self.key_box.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.key_box.setMinimumContentsLength(28)
+        for spec in RESOURCE_SPECS.values():
+            self.key_box.addItem(f"{spec.label}  ·  {spec.key}", spec.key)
+        self.load_button = QPushButton("载入并备份")
+        self.save_remote_button = QPushButton("保存到 Upstash")
+        self.resource_status = QLabel("尚未载入远端数据")
+        self.resource_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.resource_status.setWordWrap(True)
+        self.resource_status.setMinimumWidth(0)
+        self.resource_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        remote_layout.addWidget(QLabel("资源"), 0, 0)
+        remote_layout.addWidget(self.key_box, 0, 1)
+        remote_layout.addWidget(self.load_button, 0, 2)
+        remote_layout.addWidget(self.save_remote_button, 0, 3)
+        remote_layout.addWidget(self.resource_status, 1, 0, 1, 4)
+        remote_layout.setColumnStretch(1, 1)
+        root.addWidget(remote_box)
+
+        controls_box = QGroupBox("条目检索")
+        controls = QGridLayout(controls_box)
+        self.collection_box = QComboBox()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("按 ID、标题、CV 或 JSON 内容搜索")
+        self.regex_checkbox = QCheckBox("正则")
+        self.search_button = QPushButton("筛选")
+        self.clear_search_button = QPushButton("清除")
+        controls.addWidget(QLabel("集合"), 0, 0)
+        controls.addWidget(self.collection_box, 0, 1)
+        controls.addWidget(QLabel("搜索"), 0, 2)
+        controls.addWidget(self.search_edit, 0, 3)
+        controls.addWidget(self.regex_checkbox, 0, 4)
+        controls.addWidget(self.search_button, 0, 5)
+        controls.addWidget(self.clear_search_button, 0, 6)
+        controls.setColumnStretch(3, 1)
+        root.addWidget(controls_box)
+
+        splitter = QSplitter(Qt.Horizontal)
+        root.addWidget(splitter, stretch=1)
+
+        left_panel = QWidget()
+        left_panel.setMinimumWidth(0)
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        self.table_view = ResultTableView()
+        self.model = ResultTableModel()
+        self.table_view.setModel(self.model)
+        left_layout.addWidget(self.table_view)
+
+        right_panel = QWidget()
+        right_panel.setMinimumWidth(0)
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
+        action_row = QGridLayout()
+        self.apply_button = QPushButton("应用条目修改")
+        self.new_button = QPushButton("新增")
+        self.delete_button = QPushButton("删除")
+        self.revert_button = QPushButton("还原条目")
+        action_row.addWidget(self.apply_button, 0, 0)
+        action_row.addWidget(self.new_button, 0, 1)
+        action_row.addWidget(self.delete_button, 0, 2)
+        action_row.addWidget(self.revert_button, 0, 3)
+        self.detail_view = QPlainTextEdit()
+        self.detail_view.setPlaceholderText("从左侧选择条目，或点击“新增”。")
+        right_layout.addLayout(action_row)
+        right_layout.addWidget(self.detail_view, stretch=1)
+
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+
+        self.load_button.clicked.connect(self.load_selected_resource)
+        self.save_remote_button.clicked.connect(self.save_remote)
+        self.collection_box.currentIndexChanged.connect(self.on_collection_changed)
+        self.search_button.clicked.connect(self.refresh_items)
+        self.search_edit.returnPressed.connect(self.refresh_items)
+        self.clear_search_button.clicked.connect(self.clear_search)
+        self.table_view.clicked.connect(self.on_row_clicked)
+        self.apply_button.clicked.connect(self.apply_current_edit)
+        self.new_button.clicked.connect(self.add_item)
+        self.delete_button.clicked.connect(self.delete_item)
+        self.revert_button.clicked.connect(self.revert_item)
+        self.detail_view.textChanged.connect(self.on_detail_changed)
+        self.apply_density()
+        self.set_editor_enabled(False)
+
+    def apply_density(self) -> None:
+        self.table_view.apply_density()
+        self.detail_view.setFont(make_mono_font())
+
+    def set_editor_enabled(self, enabled: bool) -> None:
+        for widget in (
+            self.collection_box,
+            self.search_edit,
+            self.regex_checkbox,
+            self.search_button,
+            self.clear_search_button,
+            self.table_view,
+            self.apply_button,
+            self.new_button,
+            self.delete_button,
+            self.revert_button,
+            self.detail_view,
+            self.save_remote_button,
+        ):
+            widget.setEnabled(enabled)
+
+    def set_busy(self, busy: bool) -> None:
+        self.key_box.setEnabled(not busy)
+        self.load_button.setEnabled(not busy)
+        if busy:
+            self.set_editor_enabled(False)
+        else:
+            self.set_editor_enabled(self.loaded is not None)
+
+    def load_selected_resource(self) -> None:
+        if self.worker is not None:
+            return
+        if self.dirty:
+            answer = QMessageBox.question(
+                self,
+                "放弃未保存修改",
+                "当前资源有尚未保存到 Upstash 的修改，确定重新载入吗？",
+            )
+            if answer != QMessageBox.Yes:
+                return
+        key = self.key_box.currentData()
+        if not key:
+            QMessageBox.warning(self, "缺少资源", "请选择要载入的 Upstash 资源。")
+            return
+        self.resource_status.setText(f"正在载入并备份 {key} ...")
+        self.set_busy(True)
+        self.worker = UpstashResourceWorker("load", key=str(key))
+        self.worker.succeeded.connect(self.on_load_success)
+        self.worker.failed.connect(self.on_worker_error)
+        self.worker.finished.connect(self.on_worker_finished)
+        self.worker.start()
+
+    def on_load_success(self, result: object) -> None:
+        if not isinstance(result, LoadedResource):
+            self.on_worker_error("载入结果类型错误。")
+            return
+        self.loaded = result
+        self.working_payload = copy.deepcopy(result.payload)
+        self.original_payload = copy.deepcopy(result.payload)
+        self.dirty = False
+        self.current_identity = None
+        self.current_collection_index = None
+        self.detail_view.blockSignals(True)
+        self.detail_view.clear()
+        self.detail_view.blockSignals(False)
+        self.collections = collection_refs(result.spec, self.working_payload)
+        self.collection_box.blockSignals(True)
+        self.collection_box.clear()
+        self.collection_box.addItems([collection.name for collection in self.collections])
+        self.collection_box.blockSignals(False)
+        if self.collections:
+            self.collection_box.setCurrentIndex(0)
+        self.refresh_items()
+        updated_at = result.updated_at or "未知"
+        self.resource_status.setText(
+            f"{result.spec.key} · {result.spec.redis_type} · {result.byte_count:,} bytes · "
+            f"SHA1 {result.content_sha1} · 更新时间 {updated_at} · "
+            f"Meta {result.meta_status} · 备份 {result.backup_path}"
+        )
+
+    def on_worker_error(self, message: str) -> None:
+        QMessageBox.critical(self, "Upstash 操作失败", message)
+        if self.worker is not None and self.worker.operation == "load" and self.loaded is not None:
+            previous_index = self.key_box.findData(self.loaded.spec.key)
+            if previous_index >= 0:
+                self.key_box.setCurrentIndex(previous_index)
+            self.resource_status.setText(
+                f"载入失败：{message}；继续显示原资源 {self.loaded.spec.key}"
+            )
+        else:
+            self.resource_status.setText(f"失败：{message}")
+
+    def on_worker_finished(self) -> None:
+        self.worker = None
+        self.set_busy(False)
+
+    def clear_search(self) -> None:
+        self.search_edit.clear()
+        self.regex_checkbox.setChecked(False)
+        self.refresh_items()
+
+    def current_collection(self) -> CollectionRef | None:
+        index = self.collection_box.currentIndex()
+        if 0 <= index < len(self.collections):
+            return self.collections[index]
+        return None
+
+    def on_collection_changed(self, _index: int) -> None:
+        self.current_identity = None
+        self.current_collection_index = None
+        self.detail_view.blockSignals(True)
+        self.detail_view.clear()
+        self.detail_view.blockSignals(False)
+        self.apply_button.setText("应用条目修改")
+        self.refresh_items()
+
+    def _collection_entries(self, collection: CollectionRef) -> list[tuple[object, object]]:
+        if isinstance(collection.container, dict):
+            return list(collection.container.items())
+        return list(enumerate(collection.container))
+
+    def _display_identity(self, collection: CollectionRef, identity: object, item: object) -> str:
+        if isinstance(collection.container, dict):
+            return str(identity)
+        if collection.identity_field and isinstance(item, dict):
+            return str(item.get(collection.identity_field) or f"#{int(identity) + 1}")
+        return f"#{int(identity) + 1}"
+
+    def refresh_items(self) -> None:
+        collection = self.current_collection()
+        if collection is None:
+            self.visible_items = []
+            self.model.clear()
+            return
+        query = self.search_edit.text().strip()
+        matcher = None
+        if query and self.regex_checkbox.isChecked():
+            try:
+                matcher = re.compile(query, re.I)
+            except re.error as exc:
+                QMessageBox.warning(self, "正则无效", str(exc))
+                return
+        visible: list[tuple[object, object]] = []
+        rows: list[tuple[object, ...]] = []
+        for identity, item in self._collection_entries(collection):
+            display_identity = self._display_identity(collection, identity, item)
+            serialized = json.dumps(item, ensure_ascii=False)
+            searchable = f"{display_identity}\n{serialized}"
+            if query:
+                matched = bool(matcher.search(searchable)) if matcher else query.casefold() in searchable.casefold()
+                if not matched:
+                    continue
+            visible.append((identity, item))
+            preview = serialized if len(serialized) <= 180 else f"{serialized[:177]}..."
+            rows.append((display_identity, preview))
+        self.visible_items = visible
+        self.model.set_result(["标识", "预览"], rows)
+        header = self.table_view.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        identity_width = max(100, min(self.table_view.sizeHintForColumn(0), 240))
+        self.table_view.setColumnWidth(0, identity_width)
+
+    def on_row_clicked(self, index: QModelIndex) -> None:
+        row = index.row()
+        if row < 0 or row >= len(self.visible_items):
+            return
+        identity, item = self.visible_items[row]
+        self.current_identity = identity
+        self.current_collection_index = self.collection_box.currentIndex()
+        self.detail_view.blockSignals(True)
+        self.detail_view.setPlainText(json.dumps(item, ensure_ascii=False, indent=2))
+        self.detail_view.blockSignals(False)
+
+    def on_detail_changed(self) -> None:
+        if self.current_identity is not None:
+            self.apply_button.setText("应用条目修改 *")
+
+    def _parse_detail(self) -> object | None:
+        try:
+            return json.loads(self.detail_view.toPlainText())
+        except json.JSONDecodeError as exc:
+            QMessageBox.critical(self, "JSON 解析失败", str(exc))
+            return None
+
+    def apply_current_edit(self) -> bool:
+        collection = self.current_collection()
+        if collection is None or self.current_identity is None:
+            QMessageBox.warning(self, "未选择条目", "请先选择或新增一个条目。")
+            return False
+        new_item = self._parse_detail()
+        if new_item is None:
+            return False
+        if isinstance(collection.container, dict) and isinstance(new_item, dict) and self.loaded:
+            expected_field = None
+            expected_value = str(self.current_identity)
+            if self.loaded.spec.kind == "info_missevan":
+                expected_field = "dramaId"
+            elif self.loaded.spec.kind == "trend_normal":
+                expected_field = "id"
+            elif self.loaded.spec.kind == "trend_peak":
+                expected_field = "name"
+            elif self.loaded.spec.kind == "trend_cv":
+                expected_field = "cvName"
+                expected_value = str(self.current_identity).partition(":")[2]
+            elif self.loaded.spec.kind == "ranks_latest" and collection.name.endswith("/ 剧目"):
+                expected_field = "dramaId" if "dramaId" in new_item else None
+            if expected_field and str(new_item.get(expected_field) or "") != expected_value:
+                QMessageBox.warning(
+                    self,
+                    "标识不可修改",
+                    f"{expected_field} 必须与集合标识 {self.current_identity} 一致；"
+                    "如需改名，请删除旧条目后新增。",
+                )
+                return False
+        if collection.identity_field:
+            if not isinstance(new_item, dict):
+                QMessageBox.warning(self, "条目结构错误", "当前条目必须是 JSON 对象。")
+                return False
+            old_item = (
+                collection.container[self.current_identity]
+                if isinstance(collection.container, (dict, list))
+                else None
+            )
+            old_identity = str((old_item or {}).get(collection.identity_field) or "")
+            new_identity = str(new_item.get(collection.identity_field) or "")
+            if old_identity and new_identity != old_identity:
+                QMessageBox.warning(
+                    self,
+                    "标识不可修改",
+                    f"{collection.identity_field} 不可直接修改；请删除旧条目后新增。",
+                )
+                return False
+        collection.container[self.current_identity] = new_item
+        self.dirty = True
+        self.apply_button.setText("应用条目修改")
+        self.refresh_items()
+        return True
+
+    def add_item(self) -> None:
+        collection = self.current_collection()
+        if collection is None:
+            return
+        label = collection.identity_field or "Hash/字典键"
+        identity, accepted = QInputDialog.getText(self, "新增条目", f"输入唯一的 {label}：")
+        identity = identity.strip()
+        if not accepted or not identity:
+            return
+        if isinstance(collection.container, dict):
+            if identity in collection.container:
+                QMessageBox.warning(self, "条目已存在", f"集合中已存在 {identity}。")
+                return
+            if self.loaded and self.loaded.spec.kind == "info_missevan":
+                if not identity.isascii() or not identity.isdigit():
+                    QMessageBox.warning(self, "ID 无效", "dramaId 必须为 ASCII 数字。")
+                    return
+                new_item: object = {"dramaId": int(identity), "title": ""}
+            elif self.loaded and self.loaded.spec.kind == "trend_normal":
+                new_item = {"version": 2, "id": identity, "name": identity, "samples": {}}
+            elif self.loaded and self.loaded.spec.kind == "trend_peak":
+                new_item = {"version": 2, "name": identity, "samples": {}}
+            elif self.loaded and self.loaded.spec.kind == "trend_cv":
+                platform, separator, cv_name = identity.partition(":")
+                if separator != ":" or platform not in ("missevan", "manbo") or not cv_name:
+                    QMessageBox.warning(self, "标识无效", "CV trend 标识必须为 missevan:CV名 或 manbo:CV名。")
+                    return
+                new_item = {"version": 2, "cvName": cv_name, "samples": {}}
+            else:
+                new_item = {}
+            collection.container[identity] = new_item
+            self.current_identity = identity
+        else:
+            if collection.identity_field:
+                if any(
+                    str((item or {}).get(collection.identity_field) or "") == identity
+                    for item in collection.container
+                    if isinstance(item, dict)
+                ):
+                    QMessageBox.warning(self, "条目已存在", f"集合中已存在 {identity}。")
+                    return
+                value = (
+                    int(identity)
+                    if collection.identity_field == "dramaId" and identity.isdigit()
+                    else identity
+                )
+                new_item = {collection.identity_field: value}
+            else:
+                new_item = {}
+            collection.container.append(new_item)
+            self.current_identity = len(collection.container) - 1
+        self.current_collection_index = self.collection_box.currentIndex()
+        self.dirty = True
+        self.refresh_items()
+        self.detail_view.blockSignals(True)
+        self.detail_view.setPlainText(json.dumps(new_item, ensure_ascii=False, indent=2))
+        self.detail_view.blockSignals(False)
+
+    def delete_item(self) -> None:
+        collection = self.current_collection()
+        if collection is None or self.current_identity is None:
+            QMessageBox.warning(self, "未选择条目", "请先选择要删除的条目。")
+            return
+        item = collection.container[self.current_identity]
+        display = self._display_identity(collection, self.current_identity, item)
+        summary = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+        if len(summary) > 500:
+            summary = f"{summary[:497]}..."
+        answer = QMessageBox.question(
+            self,
+            "确认删除",
+            f"标识：{display}\n所属集合：{collection.name}\n"
+            f"差异摘要：删除 1 条，内容 {summary}\n\n"
+            "此修改会在保存后写入 Upstash，确定继续吗？",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        if isinstance(collection.container, dict):
+            collection.container.pop(self.current_identity)
+        else:
+            collection.container.pop(int(self.current_identity))
+        self.current_identity = None
+        self.detail_view.blockSignals(True)
+        self.detail_view.clear()
+        self.detail_view.blockSignals(False)
+        self.dirty = True
+        self.refresh_items()
+
+    def revert_item(self) -> None:
+        if self.current_collection_index is None or self.current_identity is None:
+            return
+        original_collections = collection_refs(self.loaded.spec, self.original_payload) if self.loaded else []
+        if not (0 <= self.current_collection_index < len(original_collections)):
+            return
+        original_collection = original_collections[self.current_collection_index]
+        original = original_collection.container
+        current = self.collections[self.current_collection_index].container
+        try:
+            if isinstance(original, list) and original_collection.identity_field:
+                current_item = current[int(self.current_identity)]
+                stable_identity = current_item[original_collection.identity_field]
+                item = find_list_item_by_identity(
+                    original,
+                    original_collection.identity_field,
+                    stable_identity,
+                )
+            else:
+                item = original[self.current_identity]
+        except (KeyError, IndexError, TypeError):
+            QMessageBox.information(self, "无法还原", "该条目是本次新增的，可直接删除。")
+            return
+        current[self.current_identity] = copy.deepcopy(item)
+        self.detail_view.blockSignals(True)
+        self.detail_view.setPlainText(json.dumps(item, ensure_ascii=False, indent=2))
+        self.detail_view.blockSignals(False)
+        self.dirty = self.working_payload != self.original_payload
+        self.refresh_items()
+
+    def save_remote(self) -> None:
+        if self.worker is not None or self.loaded is None:
+            return
+        if self.current_identity is not None and self.apply_button.text().endswith("*"):
+            if not self.apply_current_edit():
+                return
+        if not self.dirty:
+            QMessageBox.information(self, "没有修改", "当前资源没有需要保存的修改。")
+            return
+        before = json.dumps(self.original_payload, ensure_ascii=False, sort_keys=True)
+        after = json.dumps(self.working_payload, ensure_ascii=False, sort_keys=True)
+        answer = QMessageBox.question(
+            self,
+            "确认保存到 Upstash",
+            f"资源：{self.loaded.spec.key}\n原始字符数：{len(before):,}\n修改后字符数：{len(after):,}\n"
+            "保存将使用 CAS；若远端已变化会拒绝写入。确定继续吗？",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.resource_status.setText(f"正在校验并保存 {self.loaded.spec.key} ...")
+        self.set_busy(True)
+        self.worker = UpstashResourceWorker(
+            "save",
+            loaded=self.loaded,
+            payload=copy.deepcopy(self.working_payload),
+        )
+        self.worker.succeeded.connect(self.on_save_success)
+        self.worker.failed.connect(self.on_worker_error)
+        self.worker.finished.connect(self.on_worker_finished)
+        self.worker.start()
+
+    def on_save_success(self, result: object) -> None:
+        if not isinstance(result, SaveResult):
+            self.on_worker_error("保存结果类型错误。")
+            return
+        self.dirty = False
+        self.original_payload = copy.deepcopy(self.working_payload)
+        local_state = f"本地镜像失败：{result.local_error}" if result.local_error else "本地镜像已同步"
+        self.resource_status.setText(
+            f"远端保存并回读验证成功 · {result.byte_count:,} bytes · SHA1 {result.content_sha1} · {local_state}"
+        )
+        if result.local_error:
+            QMessageBox.warning(self, "远端成功，本地失败", result.local_error)
+        else:
+            QMessageBox.information(self, "保存成功", "Upstash 已原子保存并通过回读校验。")
+        # The loaded CAS token is now stale; reload also creates the required next-session backup.
+        self.loaded = None
+        self.set_editor_enabled(False)
+
+
 class OperationsPage(QWidget):
     run_command_requested = Signal(list, str)
 
@@ -1283,9 +1851,11 @@ class MainWindow(QMainWindow):
         self.operations_page = OperationsPage()
         self.sqlite_page = SQLitePage()
         self.rank_page = RankPreviewPage()
+        self.upstash_editor_page = UpstashEditorPage()
         tabs.addTab(self.operations_page, "操作")
         tabs.addTab(self.sqlite_page, "SQLite")
         tabs.addTab(self.rank_page, "榜单预览")
+        tabs.addTab(self.upstash_editor_page, "Upstash 编辑")
         self.json_browser = JSONBrowserPage()
         tabs.addTab(self.json_browser, "JSON 浏览")
 
@@ -1294,6 +1864,7 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("就绪")
 
         self.operations_page.run_command_requested.connect(self.run_command)
+        self.setMaximumWidth(1400)
         self.apply_density()
         self.resize_for_screen()
 
@@ -1304,6 +1875,7 @@ class MainWindow(QMainWindow):
         self.operations_page.apply_density()
         self.sqlite_page.apply_density()
         self.rank_page.apply_density()
+        self.upstash_editor_page.apply_density()
         self.json_browser.apply_density()
 
     def resize_for_screen(self) -> None:
@@ -1312,7 +1884,7 @@ class MainWindow(QMainWindow):
             self.resize(1280, 760)
             return
         available = screen.availableGeometry()
-        width = max(1100, int(available.width() * 0.6))
+        width = min(1400, available.width(), max(1100, int(available.width() * 0.6)))
         height = max(720, int(available.height() * 0.6))
         left = available.x() + (available.width() - width) // 2
         top = available.y() + (available.height() - height) // 2
@@ -1322,6 +1894,7 @@ class MainWindow(QMainWindow):
         self.operations_page.set_running(running)
         self.sqlite_page.setEnabled(not running)
         self.rank_page.setEnabled(not running)
+        self.upstash_editor_page.setEnabled(not running)
         self.json_browser.setEnabled(not running)
 
     def append_log(self, text: str) -> None:
@@ -1392,6 +1965,26 @@ class MainWindow(QMainWindow):
 
         self.sqlite_page.refresh_tables()
         self.process = None
+
+    def closeEvent(self, event) -> None:
+        if self.upstash_editor_page.worker is not None:
+            QMessageBox.information(
+                self,
+                "Upstash 操作进行中",
+                "请等待当前 Upstash 载入或保存操作完成后再关闭窗口。",
+            )
+            event.ignore()
+            return
+        if self.upstash_editor_page.dirty:
+            answer = QMessageBox.question(
+                self,
+                "存在未保存修改",
+                "Upstash 编辑页还有尚未保存到远端的修改，确定关闭吗？",
+            )
+            if answer != QMessageBox.Yes:
+                event.ignore()
+                return
+        event.accept()
 
 
 def create_application(argv: list[str] | None = None) -> QApplication:

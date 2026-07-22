@@ -792,6 +792,51 @@ class MissevanWeekdayCacheTests(unittest.TestCase):
 
 
 class ManboOngoingPayTypeTests(unittest.TestCase):
+    def test_does_not_treat_timeline_item_id_as_drama_id(self):
+        item = {
+            "id": 201,
+            "updateSetTitle": "01",
+            "workUpdateTimeFormat": "18:00",
+            "radioDramaResp": {
+                "title": "缺少剧集ID的更新时间表条目",
+                "category": 1,
+                "price": 100,
+                "memberPrice": 100,
+                "vipFree": 0,
+            },
+        }
+
+        records = fetch_ongoing.collect_manbo_records_from_items([item])
+
+        self.assertEqual(records, {})
+
+    def test_uses_numeric_radio_drama_id_when_string_field_is_missing(self):
+        item = {
+            "id": 201,
+            "updateSetTitle": "01",
+            "workUpdateTimeFormat": "18:00",
+            "radioDramaResp": {
+                "radioDramaId": 2238948515889807453,
+                "title": "普通付费剧",
+                "category": 1,
+                "price": 100,
+                "memberPrice": 100,
+                "vipFree": 0,
+            },
+        }
+
+        records = fetch_ongoing.collect_manbo_records_from_items([item])
+
+        self.assertEqual(
+            records,
+            {
+                "2238948515889807453": {
+                    "dramaId": "2238948515889807453",
+                    "updateType": "weekly",
+                }
+            },
+        )
+
     def test_keeps_price_positive_item_even_when_member_price_is_zero(self):
         item = {
             "updateSetTitle": "🎂·陈挽day·04",

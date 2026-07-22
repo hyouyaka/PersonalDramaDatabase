@@ -1,4 +1,5 @@
 import json
+import hashlib
 import tempfile
 import threading
 import unittest
@@ -543,13 +544,25 @@ class InfoRefreshTests(unittest.TestCase):
             ensure_ascii=False,
         )
         commands = []
+        remote_values = {"missevan:info:v2": first}
+        compare_attempts = 0
 
         def fake_upstash(command):
+            nonlocal compare_attempts
             commands.append(command)
             if command[0] == "GET":
-                return first if sum(1 for item in commands if item[0] == "GET") == 1 else second
-            if command[0] == "EVAL":
-                return 0 if sum(1 for item in commands if item[0] == "EVAL") == 1 else 1
+                return remote_values.get(command[1])
+            if command[0] == "EVAL" and command[2] == 3:
+                compare_attempts += 1
+                if compare_attempts == 1:
+                    remote_values["missevan:info:v2"] = second
+                    return 0
+                current = remote_values.get(command[3])
+                if hashlib.sha1(current.encode("utf-8")).hexdigest() != command[6]:
+                    return 0
+                remote_values[command[3]] = command[7]
+                remote_values[command[4]] = command[8]
+                return 1
             raise AssertionError(command)
 
         with tempfile.TemporaryDirectory() as tmp, patch.object(
@@ -567,8 +580,8 @@ class InfoRefreshTests(unittest.TestCase):
         self.assertEqual(saved["100"]["soundIds"], ["2002", "2001"])
         self.assertEqual([command[0] for command in commands[:4]], ["GET", "EVAL", "GET", "EVAL"])
         self.assertEqual(
-            commands[4][3:6],
-            ["missevan:info:v1", "missevan:info:v2", "missevan:info:meta:v2"],
+            commands[3][3:6],
+            ["missevan:info:v2", "missevan:info:meta:v2", "missevan:info:v1"],
         )
 
     def test_remote_info_patch_updates_manbo_sound_ids(self) -> None:
@@ -577,10 +590,20 @@ class InfoRefreshTests(unittest.TestCase):
             ensure_ascii=False,
         )
         commands = []
+        remote_values = {"manbo:info:v2": remote}
 
         def fake_upstash(command):
             commands.append(command)
-            return remote if command[0] == "GET" else 1
+            if command[0] == "GET":
+                return remote_values.get(command[1])
+            if command[0] == "EVAL" and command[2] == 3:
+                remote_values[command[3]] = command[7]
+                remote_values[command[4]] = command[8]
+                return 1
+            if command[0] == "EVAL":
+                remote_values[command[3]] = command[5]
+                return 1
+            raise AssertionError(command)
 
         with tempfile.TemporaryDirectory() as tmp, patch.object(
             refresh_watch_counts, "MANBO_INFO_PATH", Path(tmp) / "manbo.json"
@@ -599,8 +622,8 @@ class InfoRefreshTests(unittest.TestCase):
         self.assertEqual(saved["records"][0]["soundIds"], ["3002", "3001"])
         self.assertEqual([command[0] for command in commands[:2]], ["GET", "EVAL"])
         self.assertEqual(
-            commands[2][3:6],
-            ["manbo:info:v1", "manbo:info:v2", "manbo:info:meta:v2"],
+            commands[1][3:6],
+            ["manbo:info:v2", "manbo:info:meta:v2", "manbo:info:v1"],
         )
 
 

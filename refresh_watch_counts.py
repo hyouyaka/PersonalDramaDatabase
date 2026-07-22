@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,7 +35,7 @@ from sync_new_drama_ids import (
     upload_watchcount_file,
     upstash_request,
 )
-from upstash_v2 import publish_info_v2_best_effort
+from upstash_v2 import publish_info_v2
 
 
 CACHE_WINDOW = timedelta(hours=1)
@@ -44,14 +43,6 @@ UTC = timezone.utc
 MISSEVAN_BLOCKLIST = {"47639", "25812"}
 MISSEVAN_ARCHIVED_INFO_PATH = MISSEVAN_INFO_PATH.with_name("missevan-archived-drama.json")
 INFO_PATCH_MAX_ATTEMPTS = 3
-INFO_COMPARE_AND_SET_SCRIPT = """
-local current = redis.call('GET', KEYS[1])
-if not current or redis.sha1hex(current) ~= ARGV[1] then
-  return 0
-end
-redis.call('SET', KEYS[1], ARGV[2])
-return 1
-"""
 
 
 class MissevanRefreshInterrupted(RuntimeError):
@@ -182,19 +173,23 @@ def publish_info_observations(
             raise RuntimeError(f"Refusing to update info: {key} is empty or unsupported")
         store = json.loads(raw)
         stats = _apply_info_observations(platform, store, observations)
-        encoded = json.dumps(store, ensure_ascii=False, separators=(",", ":"))
-        result = upstash(
-            ["EVAL", INFO_COMPARE_AND_SET_SCRIPT, 1, key, hashlib.sha1(raw.encode("utf-8")).hexdigest(), encoded]
-        )
-        if int(result or 0) == 1:
-            save_json(path, store)
-            publish_info_v2_best_effort(
+        try:
+            publish_info_v2(
                 key,
                 store,
                 upstash=upstash,
-                source_encoded=encoded,
+                force=True,
+                source_encoded=raw,
             )
-            return stats
+        except RuntimeError as exc:
+            if "concurrently changed" in str(exc):
+                continue
+            raise
+        verified_raw = upstash(["GET", key])
+        if not isinstance(verified_raw, str) or not verified_raw:
+            raise RuntimeError(f"Unable to read back published info: {key}")
+        save_json(path, json.loads(verified_raw))
+        return stats
     raise RuntimeError(f"Refusing to update info: {key} changed concurrently {max_attempts} times")
 
 

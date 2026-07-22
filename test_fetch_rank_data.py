@@ -12,17 +12,31 @@ import fetch_rank_data
 class RankFullStoreKeyTests(unittest.TestCase):
     def test_upload_full_ranks_writes_latest_key_only(self) -> None:
         store = {"_meta": {"updated_at": "2026-05-08T00:33:19+00:00"}}
+        remote: dict[str, str] = {"ranks:meta": "{}"}
+
+        def fake_request(command):
+            if command[0] == "GET":
+                return remote.get(command[1])
+            if command[:2] == ["EVAL", fetch_rank_data.publish_rank_string.__globals__["RANK_STRING_PUBLISH_SCRIPT"]]:
+                remote[command[3]] = command[5]
+                remote[command[4]] = command[6]
+                return 1
+            raise AssertionError(command)
 
         with (
-            patch.object(fetch_rank_data, "upstash_request", return_value="OK") as request,
+            patch.object(fetch_rank_data, "upstash_request", side_effect=fake_request) as request,
             patch("builtins.print"),
         ):
             fetch_rank_data.upload_full_ranks(store)
 
-        request.assert_called_once()
-        command = request.call_args.args[0]
-        self.assertEqual(command[:2], ["SET", "ranks:latest"])
-        self.assertEqual(json.loads(command[2]), store)
+        command = next(
+            call.args[0]
+            for call in request.call_args_list
+            if call.args[0][0] == "EVAL"
+        )
+        self.assertEqual(command[0], "EVAL")
+        self.assertEqual(command[3:5], ["ranks:latest", "ranks:meta"])
+        self.assertEqual(json.loads(command[5]), store)
 
     def test_load_remote_full_ranks_reads_latest_key_only(self) -> None:
         payload = {"_meta": {"updated_at": "2026-05-08T00:33:19+00:00"}}
@@ -59,36 +73,19 @@ class RankFullStoreKeyTests(unittest.TestCase):
             },
             "manbo": {"ranks": {}, "dramas": {}},
         }
-        commands: list[list[object]] = []
-
-        def fake_request(command: list[object]) -> object:
-            commands.append(command)
-            if command[0] == "GET":
-                return None
-            if command[0] == "SET":
-                return "OK"
-            raise AssertionError(command)
-
         with (
             patch.object(fetch_rank_data, "now_iso", return_value="2026-05-16T00:00:00+00:00"),
-            patch.object(fetch_rank_data, "upstash_request", side_effect=fake_request),
+            patch.object(fetch_rank_data, "upload_missevan_peak_trend") as peak,
+            patch.object(fetch_rank_data, "upload_rank_trend_snapshot") as trend,
+            patch.object(fetch_rank_data, "upload_full_ranks") as latest,
             patch.object(fetch_rank_data, "run_cleanup_best_effort") as cleanup,
             patch("builtins.print"),
         ):
             result = fetch_rank_data.upload_rank_outputs(store, ("missevan",))
 
-        written_keys = [str(command[1]) for command in commands if command[0] == "SET"]
-        self.assertEqual(
-            written_keys,
-            ["ranks:trend:peak:missevan", "ranks:trend:missevan", "ranks:latest"],
-        )
-        self.assertFalse(
-            any(
-                key.startswith(("ranks:partial:", "ranks:list:", "ranks:metrics:"))
-                or key == "ranks:index"
-                for key in written_keys
-            )
-        )
+        peak.assert_called_once()
+        trend.assert_called_once()
+        latest.assert_called_once_with(store)
         cleanup.assert_called_once()
         self.assertEqual(result, store)
 
@@ -375,13 +372,18 @@ class RankTrendBackfillTests(unittest.TestCase):
 
         def fake_request(command: list[object]) -> object:
             commands.append(command)
+            if command[:2] == ["EXISTS", "ranks:trend:missevan"]:
+                return 1
             if command[:2] == ["GET", "ranks:trend:missevan"]:
                 raise RuntimeError("temporary read failure")
             if command[0] == "SET":
                 raise AssertionError("trend should not be overwritten after read failure")
             raise AssertionError(command)
 
-        with patch.object(fetch_rank_data, "upstash_request", side_effect=fake_request):
+        with (
+            patch.object(fetch_rank_data, "upstash_request", side_effect=fake_request),
+            patch.object(fetch_rank_data, "publish_trend_v2_best_effort"),
+        ):
             with self.assertRaisesRegex(RuntimeError, "Failed to load ranks:trend:missevan"):
                 fetch_rank_data.upload_rank_trend_snapshot(
                     "missevan",
@@ -403,7 +405,10 @@ class RankTrendBackfillTests(unittest.TestCase):
                     generated_at="2026-05-16T00:00:00+00:00",
                 )
 
-        self.assertEqual(commands, [["GET", "ranks:trend:missevan"]])
+        self.assertEqual(
+            commands,
+            [["EXISTS", "ranks:trend:missevan"], ["GET", "ranks:trend:missevan"]],
+        )
 
     def test_upload_rank_outputs_fails_when_trend_read_fails(self) -> None:
         store = {
@@ -421,6 +426,8 @@ class RankTrendBackfillTests(unittest.TestCase):
             commands.append(command)
             if command[0] == "EVAL":
                 return "[]"
+            if command[:2] == ["EXISTS", "ranks:trend:manbo"]:
+                return 1
             if command[:2] == ["GET", "ranks:trend:manbo"]:
                 raise RuntimeError("temporary trend read failure")
             if command[0] == "GET":
@@ -435,6 +442,7 @@ class RankTrendBackfillTests(unittest.TestCase):
         with (
             patch.object(fetch_rank_data, "now_iso", return_value="2026-05-16T00:00:00+00:00"),
             patch.object(fetch_rank_data, "upstash_request", side_effect=fake_request),
+            patch.object(fetch_rank_data, "publish_trend_v2_best_effort"),
             patch("builtins.print"),
         ):
             with self.assertRaisesRegex(RuntimeError, "temporary trend read failure"):
@@ -609,7 +617,18 @@ class MissevanRankLimitTests(unittest.TestCase):
             },
         }
 
-        with patch.object(fetch_rank_data, "_load_upstash_json_strict", side_effect=lambda key: responses[key]):
+        with (
+            patch.object(
+                fetch_rank_data,
+                "_load_upstash_json_strict",
+                side_effect=lambda key: responses[key],
+            ),
+            patch.object(
+                fetch_rank_data,
+                "_load_normal_trend_v2_strict",
+                return_value=responses["ranks:trend:missevan"],
+            ),
+        ):
             targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers(
                 "missevan",
                 "2026-07-16",
@@ -675,7 +694,7 @@ class NullDanmakuRepairTests(unittest.TestCase):
         with (
             patch.object(
                 fetch_rank_data,
-                "_load_upstash_json_strict",
+                "_load_normal_trend_v2_strict",
                 return_value={"dates": ["2026-05-27", "2026-05-28"]},
             ) as load,
             patch.object(fetch_rank_data, "_load_upstash_json", side_effect=AssertionError("latest fallback not needed")),
@@ -683,12 +702,12 @@ class NullDanmakuRepairTests(unittest.TestCase):
             result = fetch_rank_data.resolve_repair_history_date("missevan")
 
         self.assertEqual(result, "2026-05-28")
-        load.assert_called_once_with("ranks:trend:missevan")
+        load.assert_called_once_with("missevan")
 
     def test_resolve_repair_history_date_falls_back_to_latest_timestamp(self) -> None:
         latest = {"_meta": {"updated_at": "2026-05-28T23:30:00+00:00"}}
         with (
-            patch.object(fetch_rank_data, "_load_upstash_json_strict", return_value={"dates": []}),
+            patch.object(fetch_rank_data, "_load_normal_trend_v2_strict", return_value={"dates": []}),
             patch.object(fetch_rank_data, "_load_upstash_json", return_value=latest) as load_latest,
         ):
             result = fetch_rank_data.resolve_repair_history_date("manbo")
@@ -717,11 +736,18 @@ class NullDanmakuRepairTests(unittest.TestCase):
             },
         }
 
-        with patch.object(
-            fetch_rank_data,
-            "_load_upstash_json_strict",
-            side_effect=lambda key: responses[key],
-        ) as load:
+        with (
+            patch.object(
+                fetch_rank_data,
+                "_load_upstash_json_strict",
+                side_effect=lambda key: responses[key],
+            ) as load,
+            patch.object(
+                fetch_rank_data,
+                "_load_normal_trend_v2_strict",
+                return_value=responses["ranks:trend:missevan"],
+            ),
+        ):
             targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers(
                 "missevan",
                 "2026-05-28",
@@ -731,11 +757,10 @@ class NullDanmakuRepairTests(unittest.TestCase):
         self.assertEqual(sources, {"latest-null": ["latest"], "trend-null": ["trend"]})
         self.assertEqual(
             [call.args[0] for call in load.call_args_list],
-            ["ranks:latest", "ranks:trend:missevan"],
+            ["ranks:latest"],
         )
 
     def test_write_repaired_layers_updates_latest_and_trend_only(self) -> None:
-        written: dict[str, dict] = {}
         payloads = {
             "latest": {
                 "_meta": {"updated_at": "old"},
@@ -756,13 +781,10 @@ class NullDanmakuRepairTests(unittest.TestCase):
             },
         }
 
-        def fake_request(command: list[object]) -> object:
-            self.assertEqual(command[0], "SET")
-            written[str(command[1])] = json.loads(str(command[2]))
-            return "OK"
-
         with (
-            patch.object(fetch_rank_data, "upstash_request", side_effect=fake_request),
+            patch.object(fetch_rank_data, "upstash_request", return_value=0),
+            patch.object(fetch_rank_data, "publish_rank_string") as publish_latest,
+            patch.object(fetch_rank_data, "publish_normal_trend_v2") as publish_trend,
             patch.object(fetch_rank_data, "now_iso", return_value="2026-05-28T12:00:00+00:00"),
             patch("builtins.print"),
         ):
@@ -773,10 +795,11 @@ class NullDanmakuRepairTests(unittest.TestCase):
                 payloads,
             )
 
-        self.assertEqual(set(written), {"ranks:latest", "ranks:trend:missevan"})
-        self.assertEqual(written["ranks:latest"]["missevan"]["dramas"]["1"]["danmaku_uid_count"], 42)
+        latest_written = publish_latest.call_args.args[1]
+        trend_written = publish_trend.call_args.args[1]
+        self.assertEqual(latest_written["missevan"]["dramas"]["1"]["danmaku_uid_count"], 42)
         self.assertEqual(
-            written["ranks:trend:missevan"]["dramas"]["1"]["samples"]["2026-05-28"]["metrics"][
+            trend_written["dramas"]["1"]["samples"]["2026-05-28"]["metrics"][
                 "danmaku_uid_count"
             ],
             42,
@@ -826,7 +849,14 @@ class NullDanmakuRepairTests(unittest.TestCase):
             },
         }
 
-        with patch.object(fetch_rank_data, "_load_upstash_json_strict", side_effect=lambda key: responses.get(key)):
+        with (
+            patch.object(fetch_rank_data, "_load_upstash_json_strict", side_effect=lambda key: responses.get(key)),
+            patch.object(
+                fetch_rank_data,
+                "_load_normal_trend_v2_strict",
+                return_value=responses["ranks:trend:missevan"],
+            ),
+        ):
             targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers("missevan", "2026-05-28")
 
         self.assertEqual(targets, {"latest-missing", "trend-null"})
@@ -867,7 +897,14 @@ class NullDanmakuRepairTests(unittest.TestCase):
             },
         }
 
-        with patch.object(fetch_rank_data, "_load_upstash_json_strict", side_effect=lambda key: responses.get(key)):
+        with (
+            patch.object(fetch_rank_data, "_load_upstash_json_strict", side_effect=lambda key: responses.get(key)),
+            patch.object(
+                fetch_rank_data,
+                "_load_normal_trend_v2_strict",
+                return_value=responses["ranks:trend:missevan"],
+            ),
+        ):
             targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers("missevan", "2026-05-28")
 
         self.assertEqual(targets, {"93038"})
@@ -956,6 +993,11 @@ class NullDanmakuRepairTests(unittest.TestCase):
 
         with (
             patch.object(fetch_rank_data, "_load_upstash_json_strict", side_effect=lambda key: responses.get(key)),
+            patch.object(
+                fetch_rank_data,
+                "_load_normal_trend_v2_strict",
+                return_value=responses["ranks:trend:manbo"],
+            ),
             patch.object(fetch_rank_data, "_load_upstash_json", side_effect=lambda key: responses.get(key)),
         ):
             targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers("manbo", "2026-05-28")
@@ -1013,6 +1055,11 @@ class NullDanmakuRepairTests(unittest.TestCase):
 
         with (
             patch.object(fetch_rank_data, "_load_upstash_json_strict", side_effect=lambda key: responses.get(key)),
+            patch.object(
+                fetch_rank_data,
+                "_load_normal_trend_v2_strict",
+                return_value=responses["ranks:trend:manbo"],
+            ),
             patch.object(fetch_rank_data, "_load_upstash_json", side_effect=lambda key: responses.get(key)),
         ):
             targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers("manbo", "2026-05-28")
@@ -1090,27 +1137,22 @@ class NullDanmakuRepairTests(unittest.TestCase):
                 },
             },
         }
-        written: dict[str, dict] = {}
-
-        def fake_request(command: list[object]) -> object:
-            if command[0] == "SET":
-                written[str(command[1])] = json.loads(str(command[2]))
-                return "OK"
-            raise AssertionError(command)
-
         with (
             patch.object(fetch_rank_data, "collect_null_danmaku_ids_from_layers", return_value=({"600"}, {"600": ["metrics", "partial", "latest", "trend"]}, payloads)),
             patch.object(fetch_rank_data, "fetch_one_manbo_danmaku_count", return_value=("600", 42)),
-            patch.object(fetch_rank_data, "upstash_request", side_effect=fake_request),
+            patch.object(fetch_rank_data, "upstash_request", return_value=0),
+            patch.object(fetch_rank_data, "publish_rank_string") as publish_latest,
+            patch.object(fetch_rank_data, "publish_normal_trend_v2") as publish_trend,
             patch.object(fetch_rank_data, "now_iso", return_value="2026-05-28T12:00:00+00:00"),
             patch("builtins.print"),
         ):
             result = fetch_rank_data.repair_null_danmaku_for_platform("manbo", "2026-05-28")
 
         self.assertEqual(result["repaired"], {"600": 42})
-        self.assertEqual(set(written), {"ranks:latest", "ranks:trend:manbo"})
-        self.assertEqual(written["ranks:latest"]["manbo"]["dramas"]["600"]["danmaku_uid_count"], 42)
-        trend_metrics = written["ranks:trend:manbo"]["dramas"]["600"]["samples"]["2026-05-28"]["metrics"]
+        latest_written = publish_latest.call_args.args[1]
+        trend_written = publish_trend.call_args.args[1]
+        self.assertEqual(latest_written["manbo"]["dramas"]["600"]["danmaku_uid_count"], 42)
+        trend_metrics = trend_written["dramas"]["600"]["samples"]["2026-05-28"]["metrics"]
         self.assertEqual(trend_metrics["danmaku_uid_count"], 42)
 
     def test_repair_creates_metric_entry_when_target_only_in_trend(self) -> None:
@@ -1138,24 +1180,18 @@ class NullDanmakuRepairTests(unittest.TestCase):
                 },
             },
         }
-        written: dict[str, dict] = {}
-
-        def fake_request(command: list[object]) -> object:
-            if command[0] == "SET":
-                written[str(command[1])] = json.loads(str(command[2]))
-                return "OK"
-            raise AssertionError(command)
-
         with (
             patch.object(fetch_rank_data, "collect_null_danmaku_ids_from_layers", return_value=({"93038"}, {"93038": ["trend"]}, payloads)),
             patch.object(fetch_rank_data, "fetch_one_missevan_danmaku_count", return_value=("93038", 7)),
-            patch.object(fetch_rank_data, "upstash_request", side_effect=fake_request),
+            patch.object(fetch_rank_data, "upstash_request", return_value=0),
+            patch.object(fetch_rank_data, "publish_rank_string") as publish_latest,
+            patch.object(fetch_rank_data, "publish_normal_trend_v2"),
             patch.object(fetch_rank_data, "now_iso", return_value="2026-05-28T12:00:00+00:00"),
             patch("builtins.print"),
         ):
             fetch_rank_data.repair_null_danmaku_for_platform("missevan", "2026-05-28")
 
-        latest_entry = written["ranks:latest"]["missevan"]["dramas"]["93038"]
+        latest_entry = publish_latest.call_args.args[1]["missevan"]["dramas"]["93038"]
         self.assertEqual(latest_entry["name"], "猫耳剧")
         self.assertEqual(latest_entry["cover"], "cover-a")
         self.assertEqual(latest_entry["maincvs"], ["甲"])
@@ -1241,6 +1277,29 @@ class NullDanmakuRepairTests(unittest.TestCase):
         write_layers.assert_called_once_with("missevan", "2026-05-28", {"ok": 0}, payloads)
 
 
+class RankRejectionFilteringTests(unittest.TestCase):
+    def test_rejected_id_is_filtered_from_multi_drama_item_without_dropping_series(self) -> None:
+        store = {
+            "missevan": {
+                "ranks": {
+                    "peak": {
+                        "items": [
+                            {"name": "系列剧", "dramaIds": ["100", "200"]},
+                            {"dramaId": "300"},
+                        ]
+                    }
+                }
+            }
+        }
+
+        fetch_rank_data.remove_drama_ids_from_rank_items(store, "missevan", {"100", "300"})
+
+        self.assertEqual(
+            store["missevan"]["ranks"]["peak"]["items"],
+            [{"name": "系列剧", "dramaIds": ["200"]}],
+        )
+
+
 class ManboCvLookupTests(unittest.TestCase):
     def test_lookup_cvs_falls_back_to_nicknames_when_main_cv_names_are_blank(self) -> None:
         store = {
@@ -1253,9 +1312,9 @@ class ManboCvLookupTests(unittest.TestCase):
         }
 
         def load_remote(key: str):
-            if key == "missevan:info:v1":
+            if key == "missevan:info:v2":
                 return {}
-            if key == "manbo:info:v1":
+            if key == "manbo:info:v2":
                 return {
                     "records": [
                         {
@@ -1284,7 +1343,7 @@ class MissevanCvLookupTests(unittest.TestCase):
         }
 
         def load_remote(key: str):
-            if key == "missevan:info:v1":
+            if key == "missevan:info:v2":
                 return {
                     "94602": {
                         "maincvs": [3946],
@@ -1292,7 +1351,7 @@ class MissevanCvLookupTests(unittest.TestCase):
                         "fallbackCvNames": ["林风"],
                     }
                 }
-            if key == "manbo:info:v1":
+            if key == "manbo:info:v2":
                 return {"records": []}
             raise AssertionError(key)
 
@@ -1308,9 +1367,9 @@ class MissevanCvLookupTests(unittest.TestCase):
         }
 
         def load_remote(key: str):
-            if key == "missevan:info:v1":
+            if key == "missevan:info:v2":
                 return {"100": {"cover": "", "maincvs": [1, 2], "cvnames": {"1": "甲", "2": "乙"}}}
-            if key == "manbo:info:v1":
+            if key == "manbo:info:v2":
                 return {"records": [{"dramaId": "200", "cover": "", "mainCvNames": ["丙", "丁"]}]}
             raise AssertionError(key)
 
@@ -1605,6 +1664,30 @@ class MissevanDanmakuLoggingTests(unittest.TestCase):
         self.assertIn("success=1", printed)
         self.assertIn("failed=1", printed)
         self.assertIn("unique_users=1", printed)
+
+
+class TargetCatalogAdmissionTests(unittest.TestCase):
+    def test_manbo_detail_rejects_empty_title(self) -> None:
+        with patch.object(fetch_rank_data, "request_manbo_json", return_value={"data": {"category": 1, "title": ""}}):
+            with self.assertRaisesRegex(fetch_rank_data.RejectedDramaRecord, "empty title"):
+                fetch_rank_data._fetch_one_manbo("200", {})
+
+    def test_manbo_detail_rejects_podcast(self) -> None:
+        payload = {"data": {"category": 4, "title": "播客"}}
+        with patch.object(fetch_rank_data, "request_manbo_json", return_value=payload):
+            with self.assertRaisesRegex(fetch_rank_data.RejectedDramaRecord, "non-target catalog=4"):
+                fetch_rank_data._fetch_one_manbo("200", {})
+
+    def test_manbo_detail_accepts_supported_catalog(self) -> None:
+        entry = {}
+        payload = {"data": {"category": 1, "title": "广播剧", "watchCount": 1}}
+        with (
+            patch.object(fetch_rank_data, "request_manbo_json", return_value=payload),
+            patch.object(fetch_rank_data, "now_iso", return_value="2026-07-22T00:00:00+00:00"),
+        ):
+            fetch_rank_data._fetch_one_manbo("200", entry)
+
+        self.assertEqual(entry["name"], "广播剧")
 
 
 if __name__ == "__main__":

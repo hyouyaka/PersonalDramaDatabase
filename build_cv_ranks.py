@@ -25,7 +25,12 @@ from sync_new_drama_ids import ROOT, configure_stdio, load_env_file, sync_remote
 from sync_new_drama_ids import MANBO_INFO_KEY, MISSEVAN_INFO_KEY
 from sync_remote_libraries import fetch_cvid_map_payload, fetch_info_payload, write_payloads
 from rank_key_cleanup import cleanup_legacy_cv_rank_keys, run_cleanup_best_effort
-from upstash_v2 import publish_cv_trend_v2, publish_trend_v2_best_effort
+from upstash_v2 import (
+    CV_TREND_V2_KEY,
+    publish_cv_trend_v2,
+    publish_rank_string,
+    publish_trend_v2_best_effort,
+)
 
 
 HERE = Path(__file__).resolve().parent
@@ -511,9 +516,7 @@ def build_cv_trend_payload(
 def upload_cv_ranks(payload: dict, *, upstash=upstash_request) -> None:
     encoded = json.dumps(payload, ensure_ascii=False)
     key = "ranks:cv:latest"
-    result = upstash(["SET", key, encoded])
-    if result != "OK":
-        raise RuntimeError(f"Failed to upload {key}: {result!r}")
+    publish_rank_string(key, payload, scope="cv", upstash=upstash)
     print(f"[ok] uploaded {key} ({len(encoded)} bytes)")
 
 
@@ -540,10 +543,26 @@ def upload_cv_trends(
     full_paid_rankings: dict[str, list[dict]],
     upstash=upstash_request,
 ) -> dict[str, dict]:
+    v2_payloads = {
+        platform: build_cv_trend_payload(
+            None,
+            platform,
+            history_date,
+            full_rankings.get(platform) or [],
+            full_paid_rankings.get(platform) or [],
+            generated_at=generated_at,
+        )
+        for platform in PLATFORMS
+    }
+    publish_trend_v2_best_effort(
+        "ranks:trend:cv:v2",
+        lambda: publish_cv_trend_v2(v2_payloads, upstash=upstash),
+    )
     payloads: dict[str, dict] = {}
     for platform in PLATFORMS:
         key = CV_TREND_KEYS[platform]
-        current = load_cv_trend_payload(platform, upstash=upstash)
+        legacy_exists = int(upstash(["EXISTS", key]) or 0) == 1
+        current = load_cv_trend_payload(platform, upstash=upstash) if legacy_exists else None
         payload = build_cv_trend_payload(
             current,
             platform,
@@ -553,19 +572,22 @@ def upload_cv_trends(
             generated_at=generated_at,
         )
         encoded = json.dumps(payload, ensure_ascii=False)
-        result = upstash(["SET", key, encoded])
-        if result != "OK":
-            raise RuntimeError(f"Failed to upload {key}: {result!r}")
-        print(f"[ok] uploaded {key} ({len(encoded)} bytes, date={history_date})")
+        if legacy_exists:
+            result = upstash(["SET", key, encoded])
+            if result != "OK":
+                raise RuntimeError(f"Failed to upload {key}: {result!r}")
+            print(f"[ok] uploaded legacy {key} ({len(encoded)} bytes, date={history_date})")
+        else:
+            print(f"[skip] legacy key is retired: {key}")
         payloads[platform] = payload
-    publish_trend_v2_best_effort(
-        "ranks:trend:cv:v2",
-        lambda: publish_cv_trend_v2(payloads, upstash=upstash),
-    )
     return payloads
 
 
 def backfill_cv_trend_v2(*, upstash=upstash_request) -> None:
+    if int(upstash(["EXISTS", CV_TREND_V2_KEY]) or 0) == 1:
+        raise RuntimeError(
+            f"Refusing legacy backfill: authoritative v2 already exists: {CV_TREND_V2_KEY}"
+        )
     payloads = {
         platform: load_cv_trend_payload(platform, upstash=upstash)
         for platform in PLATFORMS
@@ -667,13 +689,6 @@ def cleanup_remote_cv_trends_by_generated_at(
             "dates": verified.get("dates") or [],
         }
     return results
-
-
-def sync_remote_cvid_map(*, cvid_map_path: Path = COMBINED_CVID_MAP_PATH, upstash=upstash_request) -> dict:
-    _path, payload = fetch_cvid_map_payload(path=cvid_map_path, upstash=upstash)
-    save_json(cvid_map_path, payload)
-    print(f"[ok] downloaded remote data -> {cvid_map_path.name}")
-    return payload
 
 
 def sync_remote_rank_inputs(

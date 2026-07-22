@@ -104,7 +104,7 @@ flowchart LR
 - `missevan:watchcount:history`、`manbo:watchcount:history` 为 Redis Hash；field 为 dramaId，value 为包含 `name` 和升序 `points` 的 JSON 字符串
 - 发布顺序固定为 dated snapshot、latest、HSET 暂存 history、index、清理过期 points/field、淘汰快照；history 或 index 写失败时任务失败，重试保持幂等
 - 首次建立 index 会通过 SCAN 回填现有快照日期；消费端优先读 index，部署过渡期保留带缓存的 SCAN fallback
-- 共享读取函数为 `load_watchcount_snapshot_dates` 和 `load_watchcount_snapshots`
+- 共享读取函数为 `load_watchcount_snapshot_dates`；发布路径按该日期列表读取需要的快照
 
 播放量刷新时，猫耳 `getdrama` 和漫播 `dramaDetail` 响应还会同步更新各自源库中的付费信息、
 会员状态和非空的 `soundIds`；这些字段与播放量共用同一次平台请求。
@@ -308,16 +308,17 @@ flowchart LR
 - 分别调用 `append_missevan_ids.py` 和 `append_manbo_ids.py`
 - 把最新的 `missevan-drama-info.json` / `manbo-drama-info.json` 上传到 Upstash
 - 只有当记录达到“基本可用状态”后才会从队列中 prune
+- 拒绝空标题/空详情以及非目标分类；猫耳仅接受 catalog 89/90/93/96，漫播仅接受 1/5
+- `--purge-non-target-records` 提供固定目标、默认 dry-run、带恢复备份的非 CV 链路清理
 
 当前使用的关键 Upstash key：
 
 - `new:dramaIDs`
-- `missevan:info:v1`
-- `manbo:info:v1`
 - `missevan:info:v2` / `manbo:info:v2`
 - `missevan:info:meta:v2` / `manbo:info:meta:v2`
+- 兼容期镜像：`missevan:info:v1` / `manbo:info:v1`
 
-`upstash_v2.py` 集中处理资料库双写。v1 成功后，helper 以 SHA-1 条件校验当前 v1 正文，并在同一 Lua 操作内写入无缩进 v2 JSON 与对应 meta；并发不匹配时按最新 v1 正文重建后重试。v2 失败只告警。`sync_new_drama_ids.py`、`refresh_watch_counts.py` 和两个封面回填入口均调用同一 helper。
+`upstash_v2.py` 集中处理资料库发布。v2 是权威正文；helper 以原始 v2 正文的 SHA-1 做 CAS，并在同一 Lua 操作内更新 v2、对应 meta 和仍存在的 v1 兼容镜像。正文、meta 或兼容镜像发布失败都会中止任务。`sync_new_drama_ids.py`、`refresh_watch_counts.py`、GUI 编辑器和封面回填入口均沿用该策略。兼容期可用 `--sync-info-v1-from-v2` 先 dry-run、再配合 `--apply` 将已有 v1 校准为 v2；v1 退役删除后，常规发布不会重新创建它。
 
 #### `fetch_ongoing.py`
 
@@ -435,7 +436,7 @@ GUI 现在不是一个简单 launcher，而是一个桌面工作台：
 
 1. 外部流程把待补剧目的 `dramaId` 写入 `new:dramaIDs`
 2. `sync_new_drama_ids.py` 调用 append 脚本补齐源库
-3. 脚本上传最新 `missevan:info:v1` / `manbo:info:v1`
+3. 脚本以 CAS 上传权威 `missevan:info:v2` / `manbo:info:v2`、对应 meta，并同步仍存在的 v1 兼容镜像
 4. 只有“最小可用字段齐全”的 ID 才会从队列删除
 
 ### 3. Ongoing + Rank 发布流程
@@ -493,7 +494,7 @@ GUI 现在不是一个简单 launcher，而是一个桌面工作台：
 
 - `UPSTASH_REDIS_REST_URL`
 - `UPSTASH_REDIS_REST_TOKEN`
-- `UPSTASH_V2_PUBLISH_MODE`：`best-effort`（默认）或 `off`；只控制新增 v2 发布，不改变 v1
+- `UPSTASH_V2_PUBLISH_MODE`：仅供旧版非强制 v1→v2 兼容调用使用；当前权威 v2 发布流程不会被 `off` 关闭，不能作为回滚开关
 
 #### 猫耳 timeline 抓取
 

@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import requests
 
@@ -25,14 +25,15 @@ class BackfillManboCoversTests(unittest.TestCase):
                     {"dramaId": "200", "name": "已有封面", "cover": "old-cover"},
                 ],
             }
-            upstash = Mock(side_effect=[json.dumps(remote_store, ensure_ascii=False), "OK"])
+            upstash = Mock(return_value=json.dumps(remote_store, ensure_ascii=False))
             manbo_request = Mock(return_value={"data": {"coverPic": "https://cover.test/100.jpg"}})
 
-            stats = backfill_manbo_covers.backfill_manbo_covers(
-                path=path,
-                upstash=upstash,
-                manbo_request=manbo_request,
-            )
+            with patch.object(backfill_manbo_covers, "publish_info_v2", return_value={}) as publish:
+                stats = backfill_manbo_covers.backfill_manbo_covers(
+                    path=path,
+                    upstash=upstash,
+                    manbo_request=manbo_request,
+                )
 
             saved = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(saved["records"][0]["cover"], "https://cover.test/100.jpg")
@@ -41,22 +42,27 @@ class BackfillManboCoversTests(unittest.TestCase):
             self.assertEqual(stats["skipped"], 1)
             self.assertEqual(stats["missing_cover"], 0)
             self.assertTrue(stats["uploaded"])
-            self.assertEqual(upstash.call_args_list[0].args[0], ["GET", "manbo:info:v1"])
-            self.assertEqual(upstash.call_args_list[1].args[0][0:2], ["SET", "manbo:info:v1"])
+            self.assertEqual(upstash.call_args_list[0].args[0], ["GET", "manbo:info:v2"])
+            publish.assert_called_once()
+            self.assertEqual(
+                publish.call_args.kwargs["source_encoded"],
+                json.dumps(remote_store, ensure_ascii=False),
+            )
             manbo_request.assert_called_once_with("https://www.kilamanbo.world/web_manbo/dramaDetail?dramaId=100")
 
     def test_uses_first_available_cover_field(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = self.write_store(tmp, {"version": 1, "records": []})
             remote_store = {"version": 1, "records": [{"dramaId": "100", "name": "缺封面"}]}
-            upstash = Mock(side_effect=[json.dumps(remote_store, ensure_ascii=False), "OK"])
+            upstash = Mock(return_value=json.dumps(remote_store, ensure_ascii=False))
             manbo_request = Mock(return_value={"data": {"coverPic": "", "largePic": "large", "cover": "cover"}})
 
-            backfill_manbo_covers.backfill_manbo_covers(
-                path=path,
-                upstash=upstash,
-                manbo_request=manbo_request,
-            )
+            with patch.object(backfill_manbo_covers, "publish_info_v2", return_value={}):
+                backfill_manbo_covers.backfill_manbo_covers(
+                    path=path,
+                    upstash=upstash,
+                    manbo_request=manbo_request,
+                )
 
             saved = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(saved["records"][0]["cover"], "large")
@@ -74,14 +80,15 @@ class BackfillManboCoversTests(unittest.TestCase):
             response = Mock()
             response.status_code = 404
             not_found = requests.HTTPError("404 Client Error", response=response)
-            upstash = Mock(side_effect=[json.dumps(remote_store, ensure_ascii=False), "OK"])
+            upstash = Mock(return_value=json.dumps(remote_store, ensure_ascii=False))
             manbo_request = Mock(side_effect=[not_found, {"data": {"coverPic": "second"}}])
 
-            stats = backfill_manbo_covers.backfill_manbo_covers(
-                path=path,
-                upstash=upstash,
-                manbo_request=manbo_request,
-            )
+            with patch.object(backfill_manbo_covers, "publish_info_v2", return_value={}):
+                stats = backfill_manbo_covers.backfill_manbo_covers(
+                    path=path,
+                    upstash=upstash,
+                    manbo_request=manbo_request,
+                )
 
             saved = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(saved["records"][0]["cover"], "")
