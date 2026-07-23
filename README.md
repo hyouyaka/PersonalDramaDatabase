@@ -284,6 +284,7 @@ python export_sqlite_to_workbook.py
 - 如果某个 drama 的 `fetched_at` 仍在 12 小时内，则默认跳过 detail 刷新
 - 传 `--force` 时忽略 12 小时缓存，直接刷新选中的剧目
 - 双平台同时开启时，猫耳和漫播的榜单抓取并行，detail 刷新也并行
+- 传 `--resume-418-hours 3` 时，猫耳 detail 抓取命中终止性 `418` 会把双平台未完成 ID 原子保存到 `logs/rank-fetch-418-checkpoint.json`；三小时内重跑只处理 pending ID，成功发布后删除 checkpoint，过期后自动全量刷新
 
 弹幕规则：
 
@@ -307,6 +308,7 @@ python export_sqlite_to_workbook.py
 python fetch_rank_data.py
 python fetch_rank_data.py --skip-danmaku
 python fetch_rank_data.py --force
+python fetch_rank_data.py --force --resume-418-hours 3
 python fetch_rank_data.py --only-danmaku
 python fetch_rank_data.py --only-danmaku --force
 python fetch_rank_data.py --missevan-only

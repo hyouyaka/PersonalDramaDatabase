@@ -48,7 +48,7 @@ function Run-Step {
 
 $ExitCodes = @()
 $ExitCodes += Run-Step "fetch_ongoing.py" @("python", "-X", "utf8", "-u", "fetch_ongoing.py")
-$RankExitCode = Run-Step "fetch_rank_data.py" @("python", "-X", "utf8", "-u", "fetch_rank_data.py", "--force")
+$RankExitCode = Run-Step "fetch_rank_data.py" @("python", "-X", "utf8", "-u", "fetch_rank_data.py", "--force", "--resume-418-hours", "3")
 $ExitCodes += $RankExitCode
 $ExitCodes += Run-Step "sync_new_drama_ids.py" @("python", "-X", "utf8", "-u", "sync_new_drama_ids.py", "--backfill-ranks")
 if ([int]$RankExitCode -eq 0) {

@@ -60,6 +60,8 @@ def load_env_file(path: Path) -> None:
 HERE = Path(__file__).resolve().parent
 RANKS_PATH = HERE / "ranks.json"
 SERIES_INFO_PATH = HERE / "drama-series-info.json"
+RANK_FETCH_418_CHECKPOINT_PATH = HERE / "logs" / "rank-fetch-418-checkpoint.json"
+RANK_FETCH_418_CHECKPOINT_VERSION = 1
 CACHE_WINDOW = timedelta(hours=12)
 RANK_TREND_RETENTION_DATES = 90
 SAVE_LOCK = threading.Lock()
@@ -84,6 +86,119 @@ ONGOING_KEYS = {
 def save_json(path: Path, data) -> None:
     with SAVE_LOCK:
         _save_json(path, data)
+
+
+def _parse_iso_datetime(value: object) -> datetime:
+    parsed = datetime.fromisoformat(str(value))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def save_418_checkpoint_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def discard_418_checkpoint(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def clear_418_checkpoint_after_publish(path: Path) -> bool:
+    if not path.exists():
+        return False
+    discard_418_checkpoint(path)
+    print("  [checkpoint] completed and removed saved HTTP 418 progress")
+    return True
+
+
+def checkpoint_invocation(active_platforms: tuple[str, ...] | list[str], *, skip_danmaku: bool, force: bool) -> dict:
+    return {
+        "platforms": list(active_platforms),
+        "skip_danmaku": bool(skip_danmaku),
+        "force": bool(force),
+    }
+
+
+def build_418_checkpoint(
+    store: dict,
+    progress: dict,
+    invocation: dict,
+    *,
+    resume_hours: float,
+    first_rate_limited_at: str | None = None,
+    now: datetime | None = None,
+) -> dict:
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    first = _parse_iso_datetime(first_rate_limited_at) if first_rate_limited_at else current
+    return {
+        "version": RANK_FETCH_418_CHECKPOINT_VERSION,
+        "reason": "HTTP_418",
+        "first_rate_limited_at": first.isoformat(),
+        "updated_at": current.isoformat(),
+        "expires_at": (first + timedelta(hours=resume_hours)).isoformat(),
+        "invocation": invocation,
+        "store": store,
+        "progress": progress,
+    }
+
+
+def load_418_checkpoint(
+    path: Path,
+    *,
+    resume_hours: float,
+    expected_platforms: tuple[str, ...] | list[str],
+    skip_danmaku: bool,
+    now: datetime | None = None,
+) -> dict | None:
+    if resume_hours <= 0 or not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("version") != RANK_FETCH_418_CHECKPOINT_VERSION:
+            raise ValueError("unsupported checkpoint version")
+        if payload.get("reason") != "HTTP_418":
+            raise ValueError("unexpected checkpoint reason")
+        invocation = payload.get("invocation")
+        progress = payload.get("progress")
+        store = payload.get("store")
+        if not isinstance(invocation, dict) or not isinstance(progress, dict) or not isinstance(store, dict):
+            raise ValueError("missing checkpoint data")
+        required_progress_keys = {
+            "missevan": ("target_ids", "pending_ids", "danmaku_ids", "deferred_danmaku_ids"),
+            "manbo": ("target_ids", "pending_ids", "danmaku_ids"),
+        }
+        for platform, keys in required_progress_keys.items():
+            section = progress.get(platform)
+            if not isinstance(section, dict) or any(not isinstance(section.get(key), list) for key in keys):
+                raise ValueError(f"invalid {platform} checkpoint progress")
+        if invocation.get("platforms") != list(expected_platforms) or bool(invocation.get("skip_danmaku")) != bool(skip_danmaku):
+            print("  [checkpoint] incompatible invocation; discarding saved 418 progress")
+            discard_418_checkpoint(path)
+            return None
+        first = _parse_iso_datetime(payload.get("first_rate_limited_at"))
+        expires = first + timedelta(hours=resume_hours)
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        if current > expires:
+            print("  [checkpoint] saved 418 progress expired; starting a full refresh")
+            discard_418_checkpoint(path)
+            return None
+        payload["expires_at"] = expires.isoformat()
+        print(f"  [checkpoint] resuming 418 progress saved at {first.isoformat()}")
+        return payload
+    except Exception as exc:
+        print(f"  [checkpoint] invalid saved 418 progress; discarding: {exc}")
+        discard_418_checkpoint(path)
+        return None
 
 
 def env_int(name: str, default: int) -> int:
@@ -1204,6 +1319,7 @@ def fetch_missevan_drama_details(
     *,
     skip_danmaku: bool,
     danmaku_ids: set[str] | None = None,
+    pending_ids: set[str] | None = None,
 ) -> None:
     """Fetch detailed info for each Missevan drama ID."""
     dramas = store["missevan"].setdefault("dramas", {})
@@ -1225,6 +1341,9 @@ def fetch_missevan_drama_details(
         except RejectedDramaRecord as exc:
             rejected_ids.add(str(drama_id))
             dramas.pop(str(drama_id), None)
+            remove_drama_ids_from_rank_items(store, "missevan", {str(drama_id)})
+            if pending_ids is not None:
+                pending_ids.discard(str(drama_id))
             print(f"  [missevan] rejected {drama_id}: {exc}")
             save_json(RANKS_PATH, store)
             continue
@@ -1239,6 +1358,9 @@ def fetch_missevan_drama_details(
             print(f"  [missevan] ERROR on {drama_id}: {exc}")
         except Exception as exc:
             print(f"  [missevan] ERROR on {drama_id}: {exc}")
+        else:
+            if pending_ids is not None:
+                pending_ids.discard(str(drama_id))
         dramas[str(drama_id)] = entry
         save_json(RANKS_PATH, store)
 
@@ -1252,6 +1374,8 @@ def fetch_missevan_drama_details(
                 skip_danmaku=False,
                 clear_danmaku_on_skip=False,
             )
+            if pending_ids is not None:
+                pending_ids.discard(str(drama_id))
         finally:
             dramas[str(drama_id)] = entry
             save_json(RANKS_PATH, store)
@@ -1415,6 +1539,7 @@ def fetch_manbo_drama_details(
     *,
     skip_danmaku: bool,
     danmaku_ids: set[str] | None = None,
+    pending_ids: set[str] | None = None,
 ) -> None:
     """Fetch detailed info for each Manbo drama ID."""
     dramas = store["manbo"].setdefault("dramas", {})
@@ -1430,6 +1555,8 @@ def fetch_manbo_drama_details(
         except RejectedDramaRecord as exc:
             rejected_ids.add(str(drama_id))
             dramas.pop(str(drama_id), None)
+            if pending_ids is not None:
+                pending_ids.discard(str(drama_id))
             print(f"  [manbo] rejected {drama_id}: {exc}")
             save_counter += 1
             continue
@@ -1454,6 +1581,8 @@ def fetch_manbo_drama_details(
                 failed_danmaku_ids.add(str(drama_id))
         entry.pop("danmaku_paid_episode_count", None)
         dramas[drama_id] = entry
+        if pending_ids is not None and str(drama_id) not in failed_danmaku_ids:
+            pending_ids.discard(str(drama_id))
         save_counter += 1
         if save_counter >= 5:
             save_json(RANKS_PATH, store)
@@ -1468,6 +1597,8 @@ def fetch_manbo_drama_details(
         entry["fetched_at"] = now_iso()
         entry.pop("danmaku_paid_episode_count", None)
         dramas[str(drama_id)] = entry
+        if pending_ids is not None:
+            pending_ids.discard(str(drama_id))
         save_json(RANKS_PATH, store)
 
     def mark_danmaku_failed(drama_id: str) -> None:
@@ -2651,6 +2782,12 @@ def main() -> None:
     parser.add_argument("--repair-null-danmaku", action="store_true", help="Repair empty danmaku UID counts across Upstash rank layers")
     parser.add_argument("--repair-attempts", type=int, default=DANMAKU_DRAMA_RETRY_ATTEMPTS, help="Retry rounds for failed danmaku repairs")
     parser.add_argument("--dry-run", action="store_true", help="List repair targets without fetching or writing")
+    parser.add_argument(
+        "--resume-418-hours",
+        type=float,
+        default=0,
+        help="Resume a compatible local HTTP 418 checkpoint within this many hours; 0 disables recovery",
+    )
     platform_group = parser.add_mutually_exclusive_group()
     platform_group.add_argument("--missevan-only", action="store_true", help="Only process Missevan")
     platform_group.add_argument("--manbo-only", action="store_true", help="Only process Manbo")
@@ -2684,6 +2821,9 @@ def main() -> None:
                 f"repaired={len(result.get('repaired') or {})}, "
                 f"failed={len(result.get('failed') or [])}"
             )
+        repaired_any = any(bool(result.get("repaired")) for result in results.values())
+        if not args.dry_run and repaired_any:
+            clear_418_checkpoint_after_publish(RANK_FETCH_418_CHECKPOINT_PATH)
         print("=== Done (repair-null-danmaku) ===")
         return
 
@@ -2709,8 +2849,21 @@ def main() -> None:
         print(f"[ok] benchmark result saved to {output_path}")
         return
 
-    # Load or init store
-    store = load_initial_rank_store()
+    invocation = checkpoint_invocation(
+        active_platforms,
+        skip_danmaku=args.skip_danmaku,
+        force=args.force,
+    )
+    checkpoint = None if args.only_danmaku else load_418_checkpoint(
+        RANK_FETCH_418_CHECKPOINT_PATH,
+        resume_hours=args.resume_418_hours,
+        expected_platforms=active_platforms,
+        skip_danmaku=args.skip_danmaku,
+    )
+    resumed_from_checkpoint = checkpoint is not None
+
+    # Load or init store. A valid 418 checkpoint must win over ranks:latest.
+    store = checkpoint["store"] if checkpoint is not None else load_initial_rank_store()
     store.setdefault("_meta", {})
     store.setdefault("missevan", {"ranks": {}, "dramas": {}})
     store.setdefault("manbo", {"ranks": {}, "dramas": {}})
@@ -2727,89 +2880,143 @@ def main() -> None:
         store["_meta"]["updated_at"] = now_iso()
         save_json(RANKS_PATH, store)
         upload_rank_outputs(store, active_platforms)
+        clear_418_checkpoint_after_publish(RANK_FETCH_418_CHECKPOINT_PATH)
         print("=== Done (only-danmaku) ===")
         return
 
-    # Phase 2: Fetch rank lists
-    print("=== Phase 2: Fetching rank lists ===")
     requester = MissevanRequester()
-
     missevan_ids: set[str] = set()
     manbo_ids: set[str] = set()
-
     missevan_danmaku_ids: set[str] = set()
     missevan_deferred_danmaku_ids: set[str] = set()
+    manbo_danmaku_ids: set[str] = set()
 
-    if do_missevan and do_manbo:
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {
-                executor.submit(fetch_missevan_ranks, requester, store): "missevan",
-                executor.submit(fetch_manbo_ranks, store): "manbo",
-            }
-            for future in as_completed(futures):
-                platform = futures[future]
-                if platform == "missevan":
-                    missevan_ids, missevan_danmaku_ids, missevan_deferred_danmaku_ids = future.result()
-                else:
-                    manbo_ids = future.result()
+    if resumed_from_checkpoint:
+        print("=== Resuming detail collection from HTTP 418 checkpoint ===")
+        saved_progress = checkpoint["progress"]
+        missevan_progress = saved_progress["missevan"]
+        manbo_progress = saved_progress["manbo"]
+        missevan_targets = set(missevan_progress["target_ids"])
+        manbo_targets = set(manbo_progress["target_ids"])
+        missevan_pending = set(missevan_progress["pending_ids"])
+        manbo_pending = set(manbo_progress["pending_ids"])
+        missevan_danmaku_ids = set(missevan_progress["danmaku_ids"])
+        missevan_deferred_danmaku_ids = set(missevan_progress["deferred_danmaku_ids"])
+        manbo_danmaku_ids = set(manbo_progress["danmaku_ids"])
+        missevan_to_update = set(missevan_pending)
+        manbo_to_update = set(manbo_pending)
+        print(
+            f"  checkpoint pending: missevan={len(missevan_pending)}/{len(missevan_targets)}, "
+            f"manbo={len(manbo_pending)}/{len(manbo_targets)}"
+        )
     else:
+        # Phase 2: Fetch rank lists
+        print("=== Phase 2: Fetching rank lists ===")
+        if do_missevan and do_manbo:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = {
+                    executor.submit(fetch_missevan_ranks, requester, store): "missevan",
+                    executor.submit(fetch_manbo_ranks, store): "manbo",
+                }
+                for future in as_completed(futures):
+                    platform = futures[future]
+                    if platform == "missevan":
+                        missevan_ids, missevan_danmaku_ids, missevan_deferred_danmaku_ids = future.result()
+                    else:
+                        manbo_ids = future.result()
+        else:
+            if do_missevan:
+                missevan_ids, missevan_danmaku_ids, missevan_deferred_danmaku_ids = fetch_missevan_ranks(
+                    requester,
+                    store,
+                )
+            if do_manbo:
+                manbo_ids = fetch_manbo_ranks(store)
+
+        ongoing_missevan_ids: set[str] = set()
+        ongoing_manbo_ids: set[str] = set()
         if do_missevan:
-            missevan_ids, missevan_danmaku_ids, missevan_deferred_danmaku_ids = fetch_missevan_ranks(
-                requester,
-                store,
+            ongoing_missevan_ids = load_ongoing_drama_ids("missevan")
+            rank_count = len(missevan_ids)
+            missevan_ids = merge_rank_and_ongoing_ids(missevan_ids, ongoing_missevan_ids)
+            missevan_danmaku_ids, missevan_deferred_danmaku_ids = classify_missevan_danmaku_ids(
+                missevan_danmaku_ids,
+                missevan_deferred_danmaku_ids,
+                ongoing_missevan_ids,
+            )
+            apply_missevan_danmaku_not_required(store, missevan_deferred_danmaku_ids)
+            print(
+                f"  [missevan] drama IDs: rank={rank_count}, "
+                f"ongoing={len(ongoing_missevan_ids)}, combined={len(missevan_ids)}"
             )
         if do_manbo:
-            manbo_ids = fetch_manbo_ranks(store)
+            ongoing_manbo_ids = load_ongoing_drama_ids("manbo")
+            rank_count = len(manbo_ids)
+            manbo_ids = merge_rank_and_ongoing_ids(manbo_ids, ongoing_manbo_ids)
+            manbo_danmaku_ids = merge_rank_and_ongoing_ids(collect_manbo_danmaku_target_ids(store), ongoing_manbo_ids)
+            print(
+                f"  [manbo] drama IDs: rank={rank_count}, "
+                f"ongoing={len(ongoing_manbo_ids)}, combined={len(manbo_ids)}"
+            )
 
-    ongoing_missevan_ids: set[str] = set()
-    ongoing_manbo_ids: set[str] = set()
-    manbo_danmaku_ids: set[str] = set()
-    if do_missevan:
-        ongoing_missevan_ids = load_ongoing_drama_ids("missevan")
-        rank_count = len(missevan_ids)
-        missevan_ids = merge_rank_and_ongoing_ids(missevan_ids, ongoing_missevan_ids)
-        missevan_danmaku_ids, missevan_deferred_danmaku_ids = classify_missevan_danmaku_ids(
+        save_json(RANKS_PATH, store)
+
+        # Phase 3: Dedup & cache filter
+        print("=== Phase 3: Dedup & cache filtering ===")
+        missevan_dramas_existing = store["missevan"].get("dramas") or {}
+        manbo_dramas_existing = store["manbo"].get("dramas") or {}
+
+        missevan_to_update, missevan_skipped = select_missevan_detail_ids(
+            missevan_ids,
+            missevan_dramas_existing,
             missevan_danmaku_ids,
-            missevan_deferred_danmaku_ids,
-            ongoing_missevan_ids,
+            force=args.force,
         )
-        apply_missevan_danmaku_not_required(store, missevan_deferred_danmaku_ids)
+        manbo_to_update, manbo_skipped = select_stale_ids(
+            manbo_ids,
+            manbo_dramas_existing,
+            force=args.force,
+        )
+        missevan_targets = set(missevan_to_update)
+        manbo_targets = set(manbo_to_update)
+        missevan_pending = set(missevan_to_update)
+        manbo_pending = set(manbo_to_update)
+        print(f"  missevan: total={len(missevan_ids)}, skip={missevan_skipped}, update={len(missevan_to_update)}")
+        print(f"  manbo:    total={len(manbo_ids)}, skip={manbo_skipped}, update={len(manbo_to_update)}")
+
+    def current_checkpoint_progress() -> dict:
+        return {
+            "missevan": {
+                "target_ids": sorted(missevan_targets),
+                "pending_ids": sorted(missevan_pending),
+                "danmaku_ids": sorted(missevan_danmaku_ids),
+                "deferred_danmaku_ids": sorted(missevan_deferred_danmaku_ids),
+            },
+            "manbo": {
+                "target_ids": sorted(manbo_targets),
+                "pending_ids": sorted(manbo_pending),
+                "danmaku_ids": sorted(manbo_danmaku_ids),
+            },
+        }
+
+    first_rate_limited_at = checkpoint.get("first_rate_limited_at") if checkpoint else None
+
+    def persist_418_checkpoint() -> None:
+        nonlocal first_rate_limited_at
+        payload = build_418_checkpoint(
+            store,
+            current_checkpoint_progress(),
+            invocation,
+            resume_hours=args.resume_418_hours,
+            first_rate_limited_at=first_rate_limited_at,
+        )
+        first_rate_limited_at = payload["first_rate_limited_at"]
+        save_418_checkpoint_atomic(RANK_FETCH_418_CHECKPOINT_PATH, payload)
         print(
-            f"  [missevan] drama IDs: rank={rank_count}, "
-            f"ongoing={len(ongoing_missevan_ids)}, combined={len(missevan_ids)}"
+            f"  [checkpoint] saved HTTP 418 progress: "
+            f"missevan_pending={len(missevan_pending)}, manbo_pending={len(manbo_pending)}, "
+            f"expires_at={payload['expires_at']}"
         )
-    if do_manbo:
-        ongoing_manbo_ids = load_ongoing_drama_ids("manbo")
-        rank_count = len(manbo_ids)
-        manbo_ids = merge_rank_and_ongoing_ids(manbo_ids, ongoing_manbo_ids)
-        manbo_danmaku_ids = merge_rank_and_ongoing_ids(collect_manbo_danmaku_target_ids(store), ongoing_manbo_ids)
-        print(
-            f"  [manbo] drama IDs: rank={rank_count}, "
-            f"ongoing={len(ongoing_manbo_ids)}, combined={len(manbo_ids)}"
-        )
-
-    save_json(RANKS_PATH, store)
-
-    # Phase 3: Dedup & cache filter
-    print("=== Phase 3: Dedup & cache filtering ===")
-    missevan_dramas_existing = store["missevan"].get("dramas") or {}
-    manbo_dramas_existing = store["manbo"].get("dramas") or {}
-
-    missevan_to_update, missevan_skipped = select_missevan_detail_ids(
-        missevan_ids,
-        missevan_dramas_existing,
-        missevan_danmaku_ids,
-        force=args.force,
-    )
-
-    manbo_to_update, manbo_skipped = select_stale_ids(
-        manbo_ids,
-        manbo_dramas_existing,
-        force=args.force,
-    )
-
-    print(f"  missevan: total={len(missevan_ids)}, skip={missevan_skipped}, update={len(missevan_to_update)}")
-    print(f"  manbo:    total={len(manbo_ids)}, skip={manbo_skipped}, update={len(manbo_to_update)}")
 
     def update_missevan_details() -> None:
         if not (do_missevan and missevan_to_update):
@@ -2819,6 +3026,7 @@ def main() -> None:
             requester, missevan_to_update, store,
             skip_danmaku=args.skip_danmaku,
             danmaku_ids=missevan_danmaku_ids,
+            pending_ids=missevan_pending,
         )
 
     def update_manbo_details() -> None:
@@ -2828,24 +3036,58 @@ def main() -> None:
                 manbo_to_update, store,
                 skip_danmaku=args.skip_danmaku,
                 danmaku_ids=manbo_danmaku_ids,
+                pending_ids=manbo_pending,
             )
 
+    rate_limit_error: RuntimeError | None = None
     if do_missevan and do_manbo:
         with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = [
-                executor.submit(update_missevan_details),
-                executor.submit(update_manbo_details),
-            ]
+            futures = {
+                executor.submit(update_missevan_details): "missevan",
+                executor.submit(update_manbo_details): "manbo",
+            }
             for future in as_completed(futures):
-                future.result()
+                try:
+                    future.result()
+                except RuntimeError as exc:
+                    if futures[future] == "missevan" and "HTTP_418" in str(exc):
+                        first_rate_limited_at = first_rate_limited_at or now_iso()
+                        rate_limit_error = exc
+                        continue
+                    raise
     else:
-        update_missevan_details()
-        update_manbo_details()
+        try:
+            update_missevan_details()
+            update_manbo_details()
+        except RuntimeError as exc:
+            if do_missevan and "HTTP_418" in str(exc):
+                first_rate_limited_at = first_rate_limited_at or now_iso()
+                rate_limit_error = exc
+            else:
+                raise
 
     if do_missevan:
         # Detail refresh and --skip-danmaku may replace the marker; the final
         # published state must keep rank positions 31-50 terminal and non-null.
         apply_missevan_danmaku_not_required(store, missevan_deferred_danmaku_ids)
+
+    if rate_limit_error is not None:
+        save_json(RANKS_PATH, store)
+        if args.resume_418_hours > 0:
+            persist_418_checkpoint()
+        raise rate_limit_error
+
+    if resumed_from_checkpoint and (missevan_pending or manbo_pending):
+        persist_418_checkpoint()
+        raise RuntimeError(
+            "HTTP 418 recovery remains incomplete: "
+            f"missevan_pending={len(missevan_pending)}, manbo_pending={len(manbo_pending)}"
+        )
+
+    # A resumed run may finish details but fail during lookup or publishing. Save
+    # the empty pending sets first so the next run retries only post-processing.
+    if resumed_from_checkpoint:
+        persist_418_checkpoint()
 
     # Phase 6: Upstash CV lookup
     print("=== Phase 6: Upstash CV lookup ===")
@@ -2861,6 +3103,7 @@ def main() -> None:
     # Upload to Upstash
     print("=== Uploading ranks to Upstash ===")
     upload_rank_outputs(store, active_platforms)
+    clear_418_checkpoint_after_publish(RANK_FETCH_418_CHECKPOINT_PATH)
 
     print("=== Done ===")
 

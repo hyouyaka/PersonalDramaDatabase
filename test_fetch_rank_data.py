@@ -1,12 +1,373 @@
 import json
 import sys
+import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlparse
 
 import requests
 
 import fetch_rank_data
+
+
+class RankFetch418CheckpointTests(unittest.TestCase):
+    def _progress(self, *, missevan_pending=None, manbo_pending=None):
+        return {
+            "missevan": {
+                "target_ids": ["1", "2"],
+                "pending_ids": list(missevan_pending or []),
+                "danmaku_ids": ["1", "2"],
+                "deferred_danmaku_ids": [],
+            },
+            "manbo": {
+                "target_ids": ["m1"],
+                "pending_ids": list(manbo_pending or []),
+                "danmaku_ids": ["m1"],
+            },
+        }
+
+    def _store(self):
+        return {
+            "_meta": {},
+            "missevan": {"ranks": {}, "dramas": {}},
+            "manbo": {"ranks": {}, "dramas": {}},
+        }
+
+    def test_checkpoint_expiry_is_anchored_to_first_418(self) -> None:
+        first = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+        invocation = fetch_rank_data.checkpoint_invocation(("missevan",), skip_danmaku=False, force=True)
+        initial = fetch_rank_data.build_418_checkpoint(
+            self._store(),
+            self._progress(missevan_pending=["2"]),
+            invocation,
+            resume_hours=3,
+            now=first,
+        )
+        repeated = fetch_rank_data.build_418_checkpoint(
+            self._store(),
+            self._progress(missevan_pending=["2"]),
+            invocation,
+            resume_hours=3,
+            first_rate_limited_at=initial["first_rate_limited_at"],
+            now=first + timedelta(hours=2),
+        )
+
+        self.assertEqual(repeated["first_rate_limited_at"], initial["first_rate_limited_at"])
+        self.assertEqual(repeated["expires_at"], initial["expires_at"])
+
+    def test_expired_checkpoint_is_deleted(self) -> None:
+        first = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+        invocation = fetch_rank_data.checkpoint_invocation(("missevan",), skip_danmaku=False, force=True)
+        payload = fetch_rank_data.build_418_checkpoint(
+            self._store(),
+            self._progress(missevan_pending=["2"]),
+            invocation,
+            resume_hours=3,
+            now=first,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "checkpoint.json"
+            fetch_rank_data.save_418_checkpoint_atomic(path, payload)
+            loaded = fetch_rank_data.load_418_checkpoint(
+                path,
+                resume_hours=3,
+                expected_platforms=("missevan",),
+                skip_danmaku=False,
+                now=first + timedelta(hours=3, seconds=1),
+            )
+
+            self.assertIsNone(loaded)
+            self.assertFalse(path.exists())
+
+    def test_incompatible_or_malformed_checkpoint_is_deleted(self) -> None:
+        invocation = fetch_rank_data.checkpoint_invocation(("missevan",), skip_danmaku=False, force=True)
+        payload = fetch_rank_data.build_418_checkpoint(
+            self._store(),
+            self._progress(missevan_pending=["2"]),
+            invocation,
+            resume_hours=3,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "checkpoint.json"
+            fetch_rank_data.save_418_checkpoint_atomic(path, payload)
+            self.assertIsNone(fetch_rank_data.load_418_checkpoint(
+                path,
+                resume_hours=3,
+                expected_platforms=("missevan",),
+                skip_danmaku=True,
+            ))
+            self.assertFalse(path.exists())
+
+            path.write_text("{broken", encoding="utf-8")
+            self.assertIsNone(fetch_rank_data.load_418_checkpoint(
+                path,
+                resume_hours=3,
+                expected_platforms=("missevan",),
+                skip_danmaku=False,
+            ))
+            self.assertFalse(path.exists())
+
+    def test_418_saves_only_pending_ids_after_parallel_manbo_finishes(self) -> None:
+        store = self._store()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "checkpoint.json"
+
+            def fake_missevan(_requester, _ids, _store, **kwargs):
+                kwargs["pending_ids"].discard("1")
+                raise RuntimeError("HTTP_418")
+
+            def fake_manbo(_ids, _store, **kwargs):
+                kwargs["pending_ids"].clear()
+
+            with (
+                patch.object(sys, "argv", ["fetch_rank_data.py", "--force", "--resume-418-hours", "3"]),
+                patch.object(fetch_rank_data, "RANK_FETCH_418_CHECKPOINT_PATH", checkpoint_path),
+                patch.object(fetch_rank_data, "load_initial_rank_store", return_value=store),
+                patch.object(fetch_rank_data, "fetch_missevan_ranks", return_value=({"1", "2"}, {"1", "2"}, set())),
+                patch.object(fetch_rank_data, "fetch_manbo_ranks", return_value={"m1"}),
+                patch.object(fetch_rank_data, "load_ongoing_drama_ids", return_value=set()),
+                patch.object(fetch_rank_data, "collect_manbo_danmaku_target_ids", return_value={"m1"}),
+                patch.object(fetch_rank_data, "fetch_missevan_drama_details", side_effect=fake_missevan),
+                patch.object(fetch_rank_data, "fetch_manbo_drama_details", side_effect=fake_manbo),
+                patch.object(fetch_rank_data, "save_json"),
+                patch("builtins.print"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "HTTP_418"):
+                    fetch_rank_data.main()
+
+            payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["progress"]["missevan"]["pending_ids"], ["2"])
+            self.assertEqual(payload["progress"]["manbo"]["pending_ids"], [])
+
+    def test_rejected_drama_is_removed_from_rank_before_later_418(self) -> None:
+        store = self._store()
+        store["missevan"]["ranks"] = {
+            "new_daily": {"items": ["1", "2"]},
+        }
+        pending = {"1", "2"}
+        with (
+            patch.object(
+                fetch_rank_data,
+                "_fetch_one_missevan",
+                side_effect=[fetch_rank_data.RejectedDramaRecord("non-target"), RuntimeError("HTTP_418")],
+            ),
+            patch.object(fetch_rank_data, "save_json"),
+            patch("builtins.print"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "HTTP_418"):
+                fetch_rank_data.fetch_missevan_drama_details(
+                    Mock(),
+                    {"1", "2"},
+                    store,
+                    skip_danmaku=False,
+                    danmaku_ids={"1", "2"},
+                    pending_ids=pending,
+                )
+
+        self.assertEqual(store["missevan"]["ranks"]["new_daily"]["items"], ["2"])
+        self.assertEqual(pending, {"2"})
+
+    def test_resume_with_pending_failures_keeps_checkpoint_and_skips_publish(self) -> None:
+        store = self._store()
+        invocation = fetch_rank_data.checkpoint_invocation(("missevan",), skip_danmaku=False, force=True)
+        payload = fetch_rank_data.build_418_checkpoint(
+            store,
+            self._progress(missevan_pending=["2"]),
+            invocation,
+            resume_hours=3,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "checkpoint.json"
+            fetch_rank_data.save_418_checkpoint_atomic(checkpoint_path, payload)
+
+            with (
+                patch.object(sys, "argv", ["fetch_rank_data.py", "--force", "--missevan-only", "--resume-418-hours", "3"]),
+                patch.object(fetch_rank_data, "RANK_FETCH_418_CHECKPOINT_PATH", checkpoint_path),
+                patch.object(fetch_rank_data, "fetch_missevan_drama_details"),
+                patch.object(fetch_rank_data, "save_json"),
+                patch.object(fetch_rank_data, "upload_rank_outputs") as upload,
+                patch("builtins.print"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "recovery remains incomplete"):
+                    fetch_rank_data.main()
+
+            upload.assert_not_called()
+            saved = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["progress"]["missevan"]["pending_ids"], ["2"])
+
+    def test_resume_skips_remote_and_rank_fetch_then_deletes_checkpoint_after_publish(self) -> None:
+        store = self._store()
+        invocation = fetch_rank_data.checkpoint_invocation(("missevan",), skip_danmaku=False, force=True)
+        payload = fetch_rank_data.build_418_checkpoint(
+            store,
+            self._progress(missevan_pending=["2"]),
+            invocation,
+            resume_hours=3,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "checkpoint.json"
+            fetch_rank_data.save_418_checkpoint_atomic(checkpoint_path, payload)
+
+            def fake_details(_requester, ids, _store, **kwargs):
+                self.assertEqual(ids, {"2"})
+                kwargs["pending_ids"].clear()
+
+            with (
+                patch.object(sys, "argv", ["fetch_rank_data.py", "--force", "--missevan-only", "--resume-418-hours", "3"]),
+                patch.object(fetch_rank_data, "RANK_FETCH_418_CHECKPOINT_PATH", checkpoint_path),
+                patch.object(fetch_rank_data, "load_initial_rank_store", side_effect=AssertionError("remote must not load")),
+                patch.object(fetch_rank_data, "fetch_missevan_ranks", side_effect=AssertionError("ranks must not refetch")),
+                patch.object(fetch_rank_data, "fetch_missevan_drama_details", side_effect=fake_details),
+                patch.object(fetch_rank_data, "lookup_cvs"),
+                patch.object(fetch_rank_data, "save_json"),
+                patch.object(fetch_rank_data, "upload_rank_outputs") as upload,
+                patch("builtins.print"),
+            ):
+                fetch_rank_data.main()
+
+            upload.assert_called_once()
+            self.assertEqual(upload.call_args.args[1], ("missevan",))
+            self.assertIn("updated_at", upload.call_args.args[0]["_meta"])
+            self.assertFalse(checkpoint_path.exists())
+
+    def test_successful_non_resume_run_discards_incompatible_checkpoint(self) -> None:
+        store = self._store()
+        invocation = fetch_rank_data.checkpoint_invocation(("missevan", "manbo"), skip_danmaku=False, force=True)
+        payload = fetch_rank_data.build_418_checkpoint(
+            store,
+            self._progress(missevan_pending=["2"]),
+            invocation,
+            resume_hours=3,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "checkpoint.json"
+            fetch_rank_data.save_418_checkpoint_atomic(checkpoint_path, payload)
+
+            with (
+                patch.object(sys, "argv", ["fetch_rank_data.py", "--force", "--missevan-only"]),
+                patch.object(fetch_rank_data, "RANK_FETCH_418_CHECKPOINT_PATH", checkpoint_path),
+                patch.object(fetch_rank_data, "load_initial_rank_store", return_value=store),
+                patch.object(fetch_rank_data, "fetch_missevan_ranks", return_value=(set(), set(), set())),
+                patch.object(fetch_rank_data, "load_ongoing_drama_ids", return_value=set()),
+                patch.object(fetch_rank_data, "lookup_cvs"),
+                patch.object(fetch_rank_data, "save_json"),
+                patch.object(fetch_rank_data, "upload_rank_outputs") as upload,
+                patch("builtins.print"),
+            ):
+                fetch_rank_data.main()
+
+            upload.assert_called_once()
+            self.assertFalse(checkpoint_path.exists())
+
+    def test_successful_only_danmaku_run_discards_checkpoint(self) -> None:
+        store = self._store()
+        invocation = fetch_rank_data.checkpoint_invocation(("missevan", "manbo"), skip_danmaku=False, force=True)
+        payload = fetch_rank_data.build_418_checkpoint(
+            store,
+            self._progress(missevan_pending=["2"]),
+            invocation,
+            resume_hours=3,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "checkpoint.json"
+            fetch_rank_data.save_418_checkpoint_atomic(checkpoint_path, payload)
+
+            with (
+                patch.object(sys, "argv", ["fetch_rank_data.py", "--only-danmaku", "--force"]),
+                patch.object(fetch_rank_data, "RANK_FETCH_418_CHECKPOINT_PATH", checkpoint_path),
+                patch.object(fetch_rank_data, "load_initial_rank_store", return_value=store),
+                patch.object(fetch_rank_data, "only_danmaku_mode"),
+                patch.object(fetch_rank_data, "save_json"),
+                patch.object(fetch_rank_data, "upload_rank_outputs") as upload,
+                patch("builtins.print"),
+            ):
+                fetch_rank_data.main()
+
+            upload.assert_called_once()
+            self.assertFalse(checkpoint_path.exists())
+
+    def test_noop_null_danmaku_repair_keeps_checkpoint(self) -> None:
+        invocation = fetch_rank_data.checkpoint_invocation(("missevan", "manbo"), skip_danmaku=False, force=True)
+        payload = fetch_rank_data.build_418_checkpoint(
+            self._store(),
+            self._progress(missevan_pending=["2"]),
+            invocation,
+            resume_hours=3,
+        )
+        results = {
+            "missevan": {"targets": [], "repaired": {}, "failed": []},
+            "manbo": {"targets": ["m1"], "repaired": {}, "failed": ["m1"]},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "checkpoint.json"
+            fetch_rank_data.save_418_checkpoint_atomic(checkpoint_path, payload)
+            with (
+                patch.object(sys, "argv", ["fetch_rank_data.py", "--repair-null-danmaku"]),
+                patch.object(fetch_rank_data, "RANK_FETCH_418_CHECKPOINT_PATH", checkpoint_path),
+                patch.object(fetch_rank_data, "repair_null_danmaku_mode", return_value=results),
+                patch("builtins.print"),
+            ):
+                fetch_rank_data.main()
+
+            self.assertTrue(checkpoint_path.exists())
+
+    def test_successful_null_danmaku_repair_discards_checkpoint(self) -> None:
+        invocation = fetch_rank_data.checkpoint_invocation(("missevan", "manbo"), skip_danmaku=False, force=True)
+        payload = fetch_rank_data.build_418_checkpoint(
+            self._store(),
+            self._progress(missevan_pending=["2"]),
+            invocation,
+            resume_hours=3,
+        )
+        results = {
+            "missevan": {"targets": ["2"], "repaired": {"2": 7}, "failed": []},
+            "manbo": {"targets": [], "repaired": {}, "failed": []},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "checkpoint.json"
+            fetch_rank_data.save_418_checkpoint_atomic(checkpoint_path, payload)
+            with (
+                patch.object(sys, "argv", ["fetch_rank_data.py", "--repair-null-danmaku"]),
+                patch.object(fetch_rank_data, "RANK_FETCH_418_CHECKPOINT_PATH", checkpoint_path),
+                patch.object(fetch_rank_data, "repair_null_danmaku_mode", return_value=results),
+                patch("builtins.print"),
+            ):
+                fetch_rank_data.main()
+
+            self.assertFalse(checkpoint_path.exists())
+
+    def test_publish_failure_keeps_checkpoint_with_empty_pending(self) -> None:
+        store = self._store()
+        invocation = fetch_rank_data.checkpoint_invocation(("missevan",), skip_danmaku=False, force=True)
+        payload = fetch_rank_data.build_418_checkpoint(
+            store,
+            self._progress(missevan_pending=["2"]),
+            invocation,
+            resume_hours=3,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "checkpoint.json"
+            fetch_rank_data.save_418_checkpoint_atomic(checkpoint_path, payload)
+
+            def fake_details(_requester, _ids, _store, **kwargs):
+                kwargs["pending_ids"].clear()
+
+            with (
+                patch.object(sys, "argv", ["fetch_rank_data.py", "--force", "--missevan-only", "--resume-418-hours", "3"]),
+                patch.object(fetch_rank_data, "RANK_FETCH_418_CHECKPOINT_PATH", checkpoint_path),
+                patch.object(fetch_rank_data, "fetch_missevan_drama_details", side_effect=fake_details),
+                patch.object(fetch_rank_data, "lookup_cvs"),
+                patch.object(fetch_rank_data, "save_json"),
+                patch.object(fetch_rank_data, "upload_rank_outputs", side_effect=RuntimeError("publish failed")),
+                patch("builtins.print"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "publish failed"):
+                    fetch_rank_data.main()
+
+            saved = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["progress"]["missevan"]["pending_ids"], [])
 
 
 class RankFullStoreKeyTests(unittest.TestCase):

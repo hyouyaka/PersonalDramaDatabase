@@ -7,7 +7,7 @@ class DailyUpdateScriptTests(unittest.TestCase):
         script = Path(__file__).with_name("run_daily_update.ps1").read_text(encoding="utf-8")
 
         self.assertIn(
-            '$RankExitCode = Run-Step "fetch_rank_data.py" @("python", "-X", "utf8", "-u", "fetch_rank_data.py", "--force")',
+            '$RankExitCode = Run-Step "fetch_rank_data.py" @("python", "-X", "utf8", "-u", "fetch_rank_data.py", "--force", "--resume-418-hours", "3")',
             script,
         )
         self.assertIn("$ExitCodes += $RankExitCode", script)
