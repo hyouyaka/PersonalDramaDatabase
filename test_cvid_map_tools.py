@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +8,20 @@ import cvid_map_tools
 
 
 class RemoteCombinedMapTests(unittest.TestCase):
+    def test_load_tracks_the_exact_remote_body_for_later_cas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            backup = Path(tmp) / "missevan&manbo-cvid-map.json"
+            payload = {"CV A": {"displayName": "CV A"}}
+            encoded = json.dumps(payload, ensure_ascii=False, indent=2)
+            upstash = Mock(return_value=encoded)
+
+            with patch.object(cvid_map_tools, "COMBINED_CVID_MAP_PATH", backup):
+                loaded = cvid_map_tools.load_remote_combined_map(upstash=upstash)
+
+        self.assertEqual(loaded, payload)
+        self.assertEqual(loaded.source_encoded, encoded)
+        self.assertEqual(upstash.call_count, 2)
+
     def test_missing_remote_and_missing_local_backup_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             missing_backup = Path(tmp) / "missevan&manbo-cvid-map.json"

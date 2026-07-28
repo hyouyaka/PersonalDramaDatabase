@@ -55,21 +55,21 @@ class RemoteJsonBackupTests(unittest.TestCase):
             path = Path(tmp) / "cvid-map.json"
             payload = {"CV A": {"displayName": "CV A", "aliases": []}}
             path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            upstash = Mock(side_effect=[None, None, "OK"])
+            upstash = Mock(side_effect=[None, None])
 
-            loaded = sync_new_drama_ids.load_remote_json_or_backup(
-                sync_new_drama_ids.CVID_MAP_KEY,
-                path,
-                {},
-                upstash=upstash,
-                upload_backup_if_missing=True,
-            )
+            with unittest.mock.patch.object(sync_new_drama_ids, "publish_cvid_map") as publish:
+                loaded = sync_new_drama_ids.load_remote_json_or_backup(
+                    sync_new_drama_ids.CVID_MAP_KEY,
+                    path,
+                    {},
+                    upstash=upstash,
+                    upload_backup_if_missing=True,
+                )
 
         self.assertEqual(loaded, payload)
         self.assertEqual(upstash.call_args_list[0].args[0], ["GET", sync_new_drama_ids.CVID_MAP_KEY])
         self.assertEqual(upstash.call_args_list[1].args[0], ["GET", sync_new_drama_ids.CVID_MAP_KEY])
-        self.assertEqual(upstash.call_args_list[2].args[0][:2], ["SET", sync_new_drama_ids.CVID_MAP_KEY])
-        self.assertEqual(json.loads(upstash.call_args_list[2].args[0][2]), payload)
+        publish.assert_called_once_with(payload, upstash=upstash, source_encoded=None)
 
     def test_remote_invalid_falls_back_to_local_without_uploading(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -186,12 +186,17 @@ class UploadJsonValidationTests(unittest.TestCase):
             "CV A": {"displayName": "CV A"},
             "CV B": {"displayName": "CV B"},
         }
-        upstash = Mock(side_effect=[json.dumps(current_remote, ensure_ascii=False), "OK"])
+        upstash = Mock(return_value=json.dumps(current_remote, ensure_ascii=False))
 
-        sync_new_drama_ids.upload_json_payload(sync_new_drama_ids.CVID_MAP_KEY, candidate, upstash=upstash)
+        with unittest.mock.patch.object(sync_new_drama_ids, "publish_cvid_map") as publish:
+            sync_new_drama_ids.upload_json_payload(sync_new_drama_ids.CVID_MAP_KEY, candidate, upstash=upstash)
 
         self.assertEqual(upstash.call_args_list[0].args[0], ["GET", sync_new_drama_ids.CVID_MAP_KEY])
-        self.assertEqual(upstash.call_args_list[1].args[0][:2], ["SET", sync_new_drama_ids.CVID_MAP_KEY])
+        publish.assert_called_once_with(
+            candidate,
+            upstash=upstash,
+            source_encoded=json.dumps(current_remote, ensure_ascii=False),
+        )
 
 
 class WatchcountSyncTests(unittest.TestCase):

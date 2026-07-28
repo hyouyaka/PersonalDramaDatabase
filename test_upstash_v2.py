@@ -34,6 +34,19 @@ class FakeUpstash:
                 result.extend([field, value])
             return result
         if operation == "EVAL":
+            if command[1] == upstash_v2.JSON_WITH_META_PUBLISH_SCRIPT:
+                data_key = str(command[3])
+                meta_key = str(command[4])
+                expected = str(command[5])
+                current = self.strings.get(data_key)
+                if expected == "__missing__":
+                    if current is not None:
+                        return 0
+                elif current is None or hashlib.sha1(current.encode("utf-8")).hexdigest() != expected:
+                    return 0
+                self.strings[data_key] = str(command[6])
+                self.strings[meta_key] = str(command[7])
+                return 1
             if command[1] == upstash_v2.HASH_ACTIVATE_WITH_META_SCRIPT:
                 source, target = str(command[3]), str(command[4])
                 expected_meta = str(command[6])
@@ -110,6 +123,50 @@ class FakeUpstash:
 
 
 class UpstashV2Tests(unittest.TestCase):
+    def test_cvid_map_and_meta_are_published_atomically(self) -> None:
+        fake = FakeUpstash()
+        payload = {
+            "CV A": {"displayName": "CV A"},
+            "CV B": {"displayName": "CV B"},
+        }
+
+        meta = upstash_v2.publish_cvid_map(payload, upstash=fake)
+
+        encoded = fake.strings[upstash_v2.CVID_MAP_KEY]
+        self.assertEqual(json.loads(encoded), payload)
+        self.assertEqual(json.loads(fake.strings[upstash_v2.CVID_MAP_META_KEY]), meta)
+        self.assertEqual(meta["schemaVersion"], 1)
+        self.assertEqual(meta["dataKey"], upstash_v2.CVID_MAP_KEY)
+        self.assertEqual(meta["recordCount"], 2)
+        self.assertEqual(meta["contentSha1"], hashlib.sha1(encoded.encode("utf-8")).hexdigest())
+
+    def test_cvid_map_publish_refuses_a_newer_remote_body_after_a_race(self) -> None:
+        fake = FakeUpstash()
+        original = upstash_v2.compact_json({"CV A": {"displayName": "CV A"}})
+        newer = upstash_v2.compact_json({"CV B": {"displayName": "CV B"}})
+        fake.strings[upstash_v2.CVID_MAP_KEY] = newer
+
+        with self.assertRaisesRegex(RuntimeError, "concurrently changed"):
+            upstash_v2.publish_cvid_map(
+                {"CV A": {"displayName": "CV A", "avatar": "new"}},
+                upstash=fake,
+                source_encoded=original,
+            )
+
+        self.assertEqual(fake.strings[upstash_v2.CVID_MAP_KEY], newer)
+        self.assertNotIn(upstash_v2.CVID_MAP_META_KEY, fake.strings)
+
+    def test_backfill_cvid_map_meta_preserves_current_body(self) -> None:
+        fake = FakeUpstash()
+        encoded = json.dumps({"CV A": {"displayName": "CV A"}}, ensure_ascii=False, indent=2)
+        fake.strings[upstash_v2.CVID_MAP_KEY] = encoded
+
+        meta = upstash_v2.backfill_cvid_map_meta(upstash=fake)
+
+        self.assertEqual(fake.strings[upstash_v2.CVID_MAP_KEY], encoded)
+        self.assertEqual(json.loads(fake.strings[upstash_v2.CVID_MAP_META_KEY]), meta)
+        self.assertEqual(meta["contentSha1"], hashlib.sha1(encoded.encode("utf-8")).hexdigest())
+
     def test_rank_string_publish_retries_meta_race_without_losing_other_resource(self) -> None:
         class RacingMetaUpstash(FakeUpstash):
             def __init__(self) -> None:

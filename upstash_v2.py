@@ -26,6 +26,8 @@ INFO_V2_META_KEYS = {
     "manbo:info:v2": "manbo:info:meta:v2",
 }
 INFO_V1_KEYS = {v2_key: v1_key for v1_key, v2_key in INFO_V2_KEYS.items()}
+CVID_MAP_KEY = "cvid-map:v1"
+CVID_MAP_META_KEY = "cvid-map:meta:v1"
 NORMAL_TREND_V2_KEYS = {
     "missevan": "ranks:trend:missevan:v2",
     "manbo": "ranks:trend:manbo:v2",
@@ -36,6 +38,7 @@ NORMAL_TREND_V2_RETENTION_DATES = 45
 CV_TREND_V2_RETENTION_DATES = 50
 STAGING_TTL_SECONDS = 24 * 60 * 60
 HASH_WRITE_CHUNK_SIZE = 100
+_SOURCE_UNSET = object()
 
 INFO_META_COMPARE_SCRIPT = """
 local current = redis.call('GET', KEYS[1])
@@ -60,6 +63,20 @@ redis.call('SET', KEYS[2], ARGV[3])
 if redis.call('EXISTS', KEYS[3]) == 1 then
   redis.call('SET', KEYS[3], ARGV[2])
 end
+return 1
+"""
+
+JSON_WITH_META_PUBLISH_SCRIPT = """
+local current = redis.call('GET', KEYS[1])
+if ARGV[1] == '__missing__' then
+  if current and current ~= false then
+    return 0
+  end
+elseif not current or redis.sha1hex(current) ~= ARGV[1] then
+  return 0
+end
+redis.call('SET', KEYS[1], ARGV[2])
+redis.call('SET', KEYS[2], ARGV[3])
 return 1
 """
 
@@ -233,6 +250,90 @@ def build_info_v2_meta(key: str, encoded: str, payload: object) -> dict:
         "recordCount": _record_count(v2_key, payload),
         "bytes": len(encoded.encode("utf-8")),
     }
+
+
+def build_cvid_map_meta(encoded: str, payload: object) -> dict:
+    return {
+        "schemaVersion": 1,
+        "dataKey": CVID_MAP_KEY,
+        "contentSha1": hashlib.sha1(encoded.encode("utf-8")).hexdigest(),
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "recordCount": len(payload) if isinstance(payload, dict) else 0,
+        "bytes": len(encoded.encode("utf-8")),
+    }
+
+
+def publish_cvid_map(
+    payload: object,
+    *,
+    upstash: Callable[[list[object]], object],
+    source_encoded: str | None | object = _SOURCE_UNSET,
+) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError(f"{CVID_MAP_KEY} payload must be a JSON object")
+    encoded = compact_json(payload)
+    if source_encoded is _SOURCE_UNSET:
+        source_encoded = upstash(["GET", CVID_MAP_KEY])
+    expected = string_cas_token(source_encoded)
+    meta = build_cvid_map_meta(encoded, payload)
+    result = upstash(
+        [
+            "EVAL",
+            JSON_WITH_META_PUBLISH_SCRIPT,
+            2,
+            CVID_MAP_KEY,
+            CVID_MAP_META_KEY,
+            expected,
+            encoded,
+            compact_json(meta),
+        ]
+    )
+    if int(result or 0) != 1:
+        raise RuntimeError(f"Refusing to overwrite concurrently changed data: {CVID_MAP_KEY}")
+    if upstash(["GET", CVID_MAP_KEY]) != encoded:
+        raise RuntimeError(f"Remote payload verification failed for {CVID_MAP_KEY}")
+    verified_meta_raw = upstash(["GET", CVID_MAP_META_KEY])
+    verified_meta = json.loads(verified_meta_raw) if isinstance(verified_meta_raw, str) else verified_meta_raw
+    if (
+        not isinstance(verified_meta, dict)
+        or verified_meta.get("dataKey") != CVID_MAP_KEY
+        or verified_meta.get("contentSha1") != meta["contentSha1"]
+        or int(verified_meta.get("recordCount", -1)) != meta["recordCount"]
+        or int(verified_meta.get("bytes") or -1) != meta["bytes"]
+        or verified_meta.get("updatedAt") != meta["updatedAt"]
+    ):
+        raise RuntimeError(f"Remote meta verification failed for {CVID_MAP_KEY}")
+    print(f"[ok] published {CVID_MAP_KEY} and {CVID_MAP_META_KEY} ({meta['bytes']} bytes)")
+    return meta
+
+
+def backfill_cvid_map_meta(*, upstash: Callable[[list[object]], object]) -> dict:
+    encoded = upstash(["GET", CVID_MAP_KEY])
+    if not isinstance(encoded, str) or not encoded:
+        raise RuntimeError(f"Unable to backfill {CVID_MAP_META_KEY}: {CVID_MAP_KEY} is empty")
+    payload = json.loads(encoded)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unable to backfill {CVID_MAP_META_KEY}: {CVID_MAP_KEY} is not a JSON object")
+    meta = build_cvid_map_meta(encoded, payload)
+    result = upstash(
+        [
+            "EVAL",
+            INFO_META_COMPARE_SCRIPT,
+            2,
+            CVID_MAP_KEY,
+            CVID_MAP_META_KEY,
+            string_cas_token(encoded),
+            compact_json(meta),
+        ]
+    )
+    if int(result or 0) != 1:
+        raise RuntimeError(f"Refusing to backfill {CVID_MAP_META_KEY}: {CVID_MAP_KEY} changed concurrently")
+    verified = upstash(["GET", CVID_MAP_META_KEY])
+    verified_meta = json.loads(verified) if isinstance(verified, str) else verified
+    if verified_meta != meta:
+        raise RuntimeError(f"Remote meta verification failed for {CVID_MAP_META_KEY}")
+    print(f"[ok] backfilled {CVID_MAP_META_KEY} from current {CVID_MAP_KEY}")
+    return meta
 
 
 def publish_info_v2(

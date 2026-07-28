@@ -316,9 +316,12 @@ flowchart LR
 - `new:dramaIDs`
 - `missevan:info:v2` / `manbo:info:v2`
 - `missevan:info:meta:v2` / `manbo:info:meta:v2`
+- `cvid-map:v1` / `cvid-map:meta:v1`
 - 兼容期镜像：`missevan:info:v1` / `manbo:info:v1`
 
 `upstash_v2.py` 集中处理资料库发布。v2 是权威正文；helper 以原始 v2 正文的 SHA-1 做 CAS，并在同一 Lua 操作内更新 v2、对应 meta 和仍存在的 v1 兼容镜像。正文、meta 或兼容镜像发布失败都会中止任务。`sync_new_drama_ids.py`、`refresh_watch_counts.py`、GUI 编辑器和封面回填入口均沿用该策略。兼容期可用 `--sync-info-v1-from-v2` 先 dry-run、再配合 `--apply` 将已有 v1 校准为 v2；v1 退役删除后，常规发布不会重新创建它。
+
+`cvid-map:v1` 也通过同一类 CAS 原子发布同步更新 `cvid-map:meta:v1`。其 meta 字段与平台 info meta 一致，包含 `schemaVersion`、`dataKey`、`contentSha1`、`updatedAt`、`recordCount` 和 `bytes`。
 
 #### `fetch_ongoing.py`
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import secrets
 from dataclasses import dataclass
@@ -188,26 +189,41 @@ class UpstashGeneratedMissevanCvIdAllocator:
         raise RuntimeError("Generated Missevan CVID range 330000-339999 is exhausted.")
 
 
+class RemoteCombinedMap(dict):
+    def __init__(self, payload: dict, *, source_encoded: str | None) -> None:
+        super().__init__(payload)
+        self.source_encoded = source_encoded
+
+
 def load_remote_combined_map(*, upstash=None) -> dict[str, dict]:
     from sync_new_drama_ids import CVID_MAP_KEY, load_remote_json_or_backup, upstash_request
 
+    client = upstash or upstash_request
     payload = load_remote_json_or_backup(
         CVID_MAP_KEY,
         COMBINED_CVID_MAP_PATH,
         None,
-        upstash=upstash or upstash_request,
+        upstash=client,
         upload_backup_if_missing=True,
     )
     if not isinstance(payload, dict):
         raise RuntimeError(f"Unable to load {CVID_MAP_KEY} from Upstash or local backup.")
-    return payload
+    source_encoded = client(["GET", CVID_MAP_KEY])
+    if not isinstance(source_encoded, str) or json.loads(source_encoded) != payload:
+        raise RuntimeError(f"Refusing to update {CVID_MAP_KEY}: remote data changed while loading.")
+    return RemoteCombinedMap(payload, source_encoded=source_encoded)
 
 
 def save_remote_combined_map(data: dict[str, dict], *, upstash=None) -> None:
     from sync_new_drama_ids import CVID_MAP_KEY, upload_json_payload, upstash_request
 
     save_combined_map(data)
-    upload_json_payload(CVID_MAP_KEY, data, upstash=upstash or upstash_request)
+    upload_json_payload(
+        CVID_MAP_KEY,
+        data,
+        upstash=upstash or upstash_request,
+        source_encoded=getattr(data, "source_encoded", None),
+    )
 
 
 def normalize_avatar_url(value: object) -> str:

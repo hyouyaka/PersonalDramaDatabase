@@ -17,8 +17,11 @@ import requests
 
 from upstash_editor import RANK_META_KEY, build_rank_meta_update
 from upstash_v2 import (
+    CVID_MAP_KEY,
+    CVID_MAP_META_KEY,
     NORMAL_TREND_V2_KEYS,
     backfill_info_v2,
+    publish_cvid_map,
     publish_hash_snapshot_atomic,
     publish_info_v2,
 )
@@ -45,7 +48,6 @@ MANBO_INFO_KEY = "manbo:info:v2"
 MISSEVAN_INFO_KEY = "missevan:info:v2"
 MANBO_INFO_V1_KEY = "manbo:info:v1"
 MISSEVAN_INFO_V1_KEY = "missevan:info:v1"
-CVID_MAP_KEY = "cvid-map:v1"
 SERIES_INFO_KEY = "drama:series-info:v1"
 WATCHCOUNT_KEY_PREFIXES = {
     "missevan": "missevan:watchcount",
@@ -243,7 +245,15 @@ def upload_json_file(
     value = path.read_text(encoding="utf-8")
     assert_info_upload_is_safe(key, value, path)
     if key == CVID_MAP_KEY:
-        assert_cvid_map_upload_meets_remote_floor(json.loads(value), upstash=upstash)
+        payload = json.loads(value)
+        current_source = assert_cvid_map_upload_meets_remote_floor(payload, upstash=upstash)
+        publish_cvid_map(
+            payload,
+            upstash=upstash,
+            source_encoded=source_encoded if source_encoded is not None else current_source,
+        )
+        print(f"[ok] uploaded {path.name} -> {key}")
+        return
     if key in (MISSEVAN_INFO_KEY, MANBO_INFO_KEY):
         if source_encoded is None:
             raise RuntimeError(
@@ -264,11 +274,24 @@ def upload_json_file(
     print(f"[ok] uploaded {path.name} -> {key}")
 
 
-def upload_json_payload(key: str, payload: object, *, upstash=upstash_request) -> None:
+def upload_json_payload(
+    key: str,
+    payload: object,
+    *,
+    upstash=upstash_request,
+    source_encoded: str | None = None,
+) -> None:
     value = json.dumps(payload, ensure_ascii=False)
     assert_info_upload_is_safe(key, value, Path(key))
     if key == CVID_MAP_KEY:
-        assert_cvid_map_upload_meets_remote_floor(payload, upstash=upstash)
+        current_source = assert_cvid_map_upload_meets_remote_floor(payload, upstash=upstash)
+        publish_cvid_map(
+            payload,
+            upstash=upstash,
+            source_encoded=source_encoded if source_encoded is not None else current_source,
+        )
+        print(f"[ok] uploaded payload -> {key}")
+        return
     if key in (MISSEVAN_INFO_KEY, MANBO_INFO_KEY):
         current = upstash(["GET", key])
         publish_info_v2(
@@ -312,18 +335,23 @@ def remote_json_count(key: str, *, upstash=upstash_request) -> int | None:
     return None
 
 
-def assert_cvid_map_upload_meets_remote_floor(payload: object, *, upstash=upstash_request) -> None:
+def assert_cvid_map_upload_meets_remote_floor(payload: object, *, upstash=upstash_request) -> str | None:
     if not isinstance(payload, dict):
         raise RuntimeError(f"Refusing to upload {CVID_MAP_KEY}: expected a JSON object.")
-    remote_count = remote_json_count(CVID_MAP_KEY, upstash=upstash)
+    raw = upstash(["GET", CVID_MAP_KEY])
+    if raw in (None, ""):
+        return None
+    remote_payload = decode_remote_json_payload(CVID_MAP_KEY, raw)
+    remote_count = len(remote_payload) if isinstance(remote_payload, dict) else None
     if remote_count in (None, 0):
-        return
+        return raw if isinstance(raw, str) else None
     minimum = (remote_count + 1) // 2
     if len(payload) < minimum:
         raise RuntimeError(
             f"Refusing to upload {CVID_MAP_KEY}: {len(payload)} entries found, "
             f"expected at least {minimum} (half of current remote count {remote_count})."
         )
+    return raw if isinstance(raw, str) else None
 
 
 def assert_info_upload_is_safe(key: str, value: str, path: Path) -> None:
@@ -1766,6 +1794,7 @@ def purge_non_target_records(*, apply: bool, upstash=upstash_request) -> dict[st
         MANBO_INFO_V1_KEY,
         "missevan:info:meta:v2",
         "manbo:info:meta:v2",
+        CVID_MAP_META_KEY,
         RANK_META_KEY,
         "ranks:latest",
         "ranks:trend:missevan",
