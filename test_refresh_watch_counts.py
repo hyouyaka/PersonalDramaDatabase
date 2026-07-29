@@ -14,6 +14,16 @@ class RefreshWatchCountsCliTests(unittest.TestCase):
         self.download_info_patcher = patch.object(refresh_watch_counts, "download_info_file")
         self.download_info = self.download_info_patcher.start()
         self.addCleanup(self.download_info_patcher.stop)
+        self.load_archives_patcher = patch.object(refresh_watch_counts, "load_local_archives")
+        self.load_archives = self.load_archives_patcher.start()
+        self.load_archives.return_value = (
+            {"version": 1, "platform": "test", "updatedAt": None, "records": {}},
+            {"version": 1, "platform": "test", "updatedAt": None, "records": {}},
+        )
+        self.addCleanup(self.load_archives_patcher.stop)
+        self.ensure_archives_patcher = patch.object(refresh_watch_counts, "ensure_remote_archive_keys")
+        self.ensure_archives_patcher.start()
+        self.addCleanup(self.ensure_archives_patcher.stop)
 
     def test_default_all_mode_runs_missevan_and_manbo_concurrently(self) -> None:
         missevan_started = threading.Event()
@@ -111,7 +121,11 @@ class RefreshWatchCountsCliTests(unittest.TestCase):
 
         self.assertEqual(result, 2)
         publish_info.assert_called_once_with("missevan", stats["info_observations"])
-        upload.assert_called_once_with("missevan", refresh_watch_counts.MISSEVAN_COUNTS_PATH)
+        upload.assert_called_once_with(
+            "missevan",
+            refresh_watch_counts.MISSEVAN_COUNTS_PATH,
+            excluded_drama_ids=set(),
+        )
 
     def test_parallel_418_still_publishes_completed_manbo_result(self) -> None:
         missevan_stats = {
@@ -149,8 +163,16 @@ class RefreshWatchCountsCliTests(unittest.TestCase):
         self.assertEqual(
             upload.call_args_list,
             [
-                call("missevan", refresh_watch_counts.MISSEVAN_COUNTS_PATH),
-                call("manbo", refresh_watch_counts.MANBO_COUNTS_PATH),
+                call(
+                    "missevan",
+                    refresh_watch_counts.MISSEVAN_COUNTS_PATH,
+                    excluded_drama_ids=set(),
+                ),
+                call(
+                    "manbo",
+                    refresh_watch_counts.MANBO_COUNTS_PATH,
+                    excluded_drama_ids=set(),
+                ),
             ],
         )
 
@@ -205,8 +227,16 @@ class RefreshWatchCountsCliTests(unittest.TestCase):
         self.assertEqual(
             upload.call_args_list,
             [
-                call("missevan", refresh_watch_counts.MISSEVAN_COUNTS_PATH),
-                call("manbo", refresh_watch_counts.MANBO_COUNTS_PATH),
+                call(
+                    "missevan",
+                    refresh_watch_counts.MISSEVAN_COUNTS_PATH,
+                    excluded_drama_ids=set(),
+                ),
+                call(
+                    "manbo",
+                    refresh_watch_counts.MANBO_COUNTS_PATH,
+                    excluded_drama_ids=set(),
+                ),
             ],
         )
 
@@ -329,6 +359,84 @@ class RefreshWatchCountsCliTests(unittest.TestCase):
                 refresh_watch_counts.main(["--platform", "missevan"])
 
         upload.assert_not_called()
+
+
+class ArchiveRetryQueueTests(unittest.TestCase):
+    @staticmethod
+    def http_error(status: int) -> Exception:
+        exc = RuntimeError(f"HTTP {status}")
+        exc.response = Mock(status_code=status)
+        return exc
+
+    def test_failed_item_does_not_block_later_first_attempts(self) -> None:
+        now = [0.0]
+        calls = []
+        attempts = {"100": 0, "101": 0}
+        completed = []
+
+        def request_one(drama_id, request_number):
+            calls.append((drama_id, request_number, now[0]))
+            attempts[drama_id] += 1
+            if drama_id == "100" and attempts[drama_id] < 4:
+                raise self.http_error(403)
+            return {"id": drama_id}
+
+        stats = refresh_watch_counts.run_archive_retry_queue(
+            "missevan",
+            ["100", "101"],
+            drama_id_of=lambda drama_id: drama_id,
+            request_one=request_one,
+            on_success=lambda drama_id, _payload: completed.append(drama_id),
+            on_archive=lambda _drama_id, _reason: self.fail("should not archive"),
+            monotonic=lambda: now[0],
+            sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+
+        self.assertEqual(
+            [(drama_id, request_number) for drama_id, request_number, _at in calls],
+            [("100", 1), ("101", 1), ("100", 2), ("100", 3), ("100", 4)],
+        )
+        self.assertEqual([at for drama_id, _request, at in calls if drama_id == "100"], [0, 30, 90, 210])
+        self.assertEqual(completed, ["101", "100"])
+        self.assertEqual(stats["retry_requests"], 3)
+
+    def test_four_target_status_responses_archive_for_each_platform(self) -> None:
+        for platform, status in (("missevan", 403), ("manbo", 404)):
+            with self.subTest(platform=platform):
+                now = [0.0]
+                archived = []
+
+                def request_one(_item, _request_number):
+                    raise self.http_error(status)
+
+                refresh_watch_counts.run_archive_retry_queue(
+                    platform,
+                    ["1"],
+                    drama_id_of=lambda drama_id: drama_id,
+                    request_one=request_one,
+                    on_success=lambda _item, _payload: self.fail("should not succeed"),
+                    on_archive=lambda drama_id, reason: archived.append((drama_id, reason)),
+                    monotonic=lambda: now[0],
+                    sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+                )
+
+                self.assertEqual(archived, [("1", f"HTTP_{status}")])
+                self.assertEqual(now[0], 210)
+
+    def test_non_archive_status_still_fails_fast(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "HTTP 404"):
+            refresh_watch_counts.run_archive_retry_queue(
+                "missevan",
+                ["1"],
+                drama_id_of=lambda drama_id: drama_id,
+                request_one=lambda _item, _request_number: (_ for _ in ()).throw(
+                    self.http_error(404)
+                ),
+                on_success=lambda _item, _payload: None,
+                on_archive=lambda _item, _reason: None,
+                monotonic=lambda: 0,
+                sleep=lambda _seconds: None,
+            )
 
 
 class InfoRefreshTests(unittest.TestCase):

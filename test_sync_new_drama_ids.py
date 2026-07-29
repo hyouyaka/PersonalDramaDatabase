@@ -330,6 +330,42 @@ class WatchcountSyncTests(unittest.TestCase):
             "dates": ["2026-06-19", "2026-06-26", "2026-07-03", "2026-07-10"],
         })
 
+    def test_history_rebuild_does_not_restore_excluded_archived_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_cache(
+                tmp,
+                {"_meta": {"updated_at": "2026-07-10T04:06:41+00:00"}, "counts": {}},
+            )
+            old_snapshot = json.dumps(
+                {
+                    "_meta": {"updated_at": "2026-07-03T04:06:41+00:00"},
+                    "counts": {"100": {"name": "已归档", "view_count": 30}},
+                }
+            )
+            current_snapshot = path.read_text(encoding="utf-8")
+            upstash = Mock(
+                side_effect=[
+                    "OK",
+                    "OK",
+                    [],
+                    None,
+                    ["0", ["missevan:watchcount:2026-07-03", "missevan:watchcount:2026-07-10"]],
+                    [old_snapshot, current_snapshot],
+                    "OK",
+                ]
+            )
+
+            sync_new_drama_ids.upload_watchcount_file(
+                "missevan",
+                path,
+                upstash=upstash,
+                excluded_drama_ids={"100"},
+            )
+
+        commands = [call.args[0] for call in upstash.call_args_list]
+        self.assertFalse(any(command[:2] == ["HSET", "missevan:watchcount:history"] for command in commands))
+        self.assertEqual(commands[-1][:2], ["SET", "missevan:watchcount:index"])
+
     def test_upload_watchcount_file_prunes_old_dates_only_after_index_write(self) -> None:
         dates = [f"2026-05-{day:02d}" for day in range(1, 32)] + ["2026-06-01"]
         current_index = json.dumps({

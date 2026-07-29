@@ -892,7 +892,13 @@ def sync_remote_watchcount_if_newer(
     return True
 
 
-def upload_watchcount_file(platform: str, path: Path, *, upstash=upstash_request) -> None:
+def upload_watchcount_file(
+    platform: str,
+    path: Path,
+    *,
+    upstash=upstash_request,
+    excluded_drama_ids: set[str] | None = None,
+) -> None:
     payload = load_watchcount_payload(path)
     latest_key = watchcount_key(platform, "latest")
     assert_watchcount_payload_is_safe(latest_key, payload)
@@ -941,6 +947,8 @@ def upload_watchcount_file(platform: str, path: Path, *, upstash=upstash_request
             staging_dates,
             max_points=None,
         )
+    for drama_id in excluded_drama_ids or set():
+        staged_history.pop(str(drama_id), None)
     desired_history = filter_watchcount_history(staged_history, retained_dates)
 
     staged_history_args = encode_watchcount_history(staged_history)

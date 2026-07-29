@@ -109,11 +109,12 @@ flowchart LR
 播放量刷新时，猫耳 `getdrama` 和漫播 `dramaDetail` 响应还会同步更新各自源库中的付费信息、
 会员状态和非空的 `soundIds`；这些字段与播放量共用同一次平台请求。
 
-#### `missevan-archived-drama.json`
+#### 双平台 archive 文件
 
-- 只在猫耳播放量刷新阶段写入
-- 当某个剧目详情请求返回 HTTP 403 时，当前活跃源库里的节点会被移出并归档到这里
-- 归档节点会额外记录：`archivedReason`、`archivedAt`、`archivedWatchCount`
+- info：`missevan-archived-drama.json`、`manbo-archived-drama.json`
+- watchcount：`missevan-archived-watch-counts.json`、`manbo-archived-watch-counts.json`
+- 统一结构为 `version/platform/updatedAt/records`；info 保存完整源记录，watchcount 保存归档时的 latest 和 history points
+- 对应远端 key 为 `{platform}:info:archive:v1` 和 `{platform}:watchcount:archive:v1`
 
 #### `missevan&manbo-cvid-map.json`
 
@@ -240,7 +241,10 @@ flowchart LR
 - 猫耳和漫播分别在同一次 `getdrama` / `dramaDetail` 请求中同步付费信息、会员状态和非空的 `soundIds`
 - 源库动态字段通过 Upstash CAS 合并发布，避免覆盖并发更新的其他 metadata
 - 猫耳命中 418 时会先保存并发布已完成剧目的当前进度，再以退出码 `2` 退出
-- 猫耳命中 403 时会把剧目移出活跃源库并写入 `missevan-archived-drama.json`
+- 猫耳 HTTP 403、漫播 HTTP 404 使用 30/60/120 秒延迟重试，共最多 4 次请求
+- 重试使用延迟队列，等待期间继续抓取其他作品；连续 4 次命中后才生成归档候选
+- info、latest、history 与 archive key 通过单次 Upstash CAS/Lua 原子迁移；旧日期快照不重写
+- watchcount history 重建时会排除全部 archive ID，避免旧日期快照令已归档剧目复活
 
 注意：
 

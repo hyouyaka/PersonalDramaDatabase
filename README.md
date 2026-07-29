@@ -126,15 +126,17 @@ python append_manbo_ids.py 2067945724439429338 2118896513449984153
 
 用途：
 
-- 只更新 `missevan-watch-counts.json`
-- 只更新 `manbo-watch-counts.json`
-- 不更新 `drama-info`
+- 更新双平台 watchcount 缓存
+- 复用详情响应更新 info 中的付费、会员和 `soundIds`
+- 对确认下架的剧目执行 info/watchcount 归档
 - 不更新 SQLite
 
 缓存规则：
 
 - 如果某条 `fetched_at` 距当前不足 1 小时，则跳过
 - 适合猫耳触发 `418` 后断点继续
+- 猫耳 HTTP 403、漫播 HTTP 404 按 30/60/120 秒延迟重试；包含首次请求共 4 次
+- 命中归档状态码的作品进入延迟队列，首轮继续抓取其他作品
 
 远端 Upstash 播放量存储：
 
@@ -142,6 +144,8 @@ python append_manbo_ids.py 2067945724439429338 2118896513449984153
 - `missevan:watchcount:latest` / `manbo:watchcount:latest`：当前最新快照
 - `missevan:watchcount:index` / `manbo:watchcount:index`：快照日期索引，最多保留 32 期
 - `missevan:watchcount:history` / `manbo:watchcount:history`：Redis Hash，field 为 dramaId，value 为包含 `name` 和 `points` 的 JSON 字符串
+- `{platform}:info:archive:v1`：已归档 info 记录
+- `{platform}:watchcount:archive:v1`：归档时的 latest 和 history points
 - 发布顺序为“dated snapshot → latest → HSET 暂存 history → index → 清理过期 points/field → 删除淘汰快照”；index 或 history 写入失败会使任务失败，重试可安全重复执行
 - 首次发布 index 时会通过 SCAN 回填已有日期；读取端优先使用 index，过渡期 index 缺失或不可用时使用带缓存的 SCAN fallback
 

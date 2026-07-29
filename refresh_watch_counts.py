@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
-from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+import time
+
+from archive_manager import (
+    ARCHIVE_HTTP_STATUS,
+    ARCHIVE_RETRY_DELAYS,
+    apply_local_archive_candidates,
+    ensure_remote_archive_keys,
+    load_local_archives,
+    publish_archive_candidates,
+)
 
 from clean_manbo_pricing import MANBO_PRICING_EXCLUSIONS, classify_manbo_pricing
 from platform_sync import (
@@ -18,7 +28,6 @@ from platform_sync import (
     load_cache,
     load_json,
     normalize,
-    remove_missevan_node as remove_missevan_store_node,
     request_manbo_json,
     save_cache,
     save_json,
@@ -41,7 +50,6 @@ from upstash_v2 import publish_info_v2
 CACHE_WINDOW = timedelta(hours=1)
 UTC = timezone.utc
 MISSEVAN_BLOCKLIST = {"47639", "25812"}
-MISSEVAN_ARCHIVED_INFO_PATH = MISSEVAN_INFO_PATH.with_name("missevan-archived-drama.json")
 INFO_PATCH_MAX_ATTEMPTS = 3
 
 
@@ -49,6 +57,10 @@ class MissevanRefreshInterrupted(RuntimeError):
     def __init__(self, message: str, stats: dict):
         super().__init__(message)
         self.stats = stats
+
+
+def deepcopy_json(payload):
+    return json.loads(json.dumps(payload, ensure_ascii=False))
 
 
 def missevan_pricing_observation(drama: dict) -> tuple[dict[str, object], bool]:
@@ -212,45 +224,80 @@ def should_skip_recent(cache_entry: dict, now: datetime) -> bool:
     return now - fetched_at < CACHE_WINDOW
 
 
-def is_http_403(exc: Exception) -> bool:
+def http_status(exc: Exception) -> int | None:
     response = getattr(exc, "response", None)
-    return getattr(response, "status_code", None) == 403
+    return getattr(response, "status_code", None)
 
 
-def archive_missevan_node(archive: dict, series_title: str, season_key: str, node: dict, watch_count: dict | None) -> None:
-    archived_node = deepcopy(node)
-    archived_node["archivedReason"] = "HTTP_403"
-    archived_node["archivedAt"] = utc_now()
-    archived_node["archivedWatchCount"] = deepcopy(watch_count)
-    archive.setdefault(series_title, {})[season_key] = archived_node
+def run_archive_retry_queue(
+    platform: str,
+    items: list[object],
+    *,
+    drama_id_of,
+    request_one,
+    on_success,
+    on_archive,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+) -> dict[str, int]:
+    status = ARCHIVE_HTTP_STATUS[platform]
+    retry_heap: list[tuple[float, int, int, object]] = []
+    sequence = 0
+    retry_requests = 0
 
+    def enqueue(item: object, requests_done: int) -> None:
+        nonlocal sequence
+        delay = ARCHIVE_RETRY_DELAYS[requests_done - 1]
+        sequence += 1
+        heapq.heappush(retry_heap, (monotonic() + delay, sequence, requests_done, item))
+        print(
+            f"[{platform}] ID={drama_id_of(item)} HTTP_{status}; "
+            f"{int(delay)}秒后进行第{requests_done + 1}次请求"
+        )
 
-def remove_missevan_node(store: dict, series_title: str, season_key: str) -> None:
-    remove_missevan_store_node(store, series_title, season_key)
+    for item in items:
+        try:
+            payload = request_one(item, 1)
+        except Exception as exc:
+            if http_status(exc) != status:
+                raise
+            enqueue(item, 1)
+            continue
+        on_success(item, payload)
 
+    while retry_heap:
+        due_at, _sequence, requests_done, item = heapq.heappop(retry_heap)
+        remaining = due_at - monotonic()
+        if remaining > 0:
+            sleep(remaining)
+        retry_requests += 1
+        next_request_number = requests_done + 1
+        try:
+            payload = request_one(item, next_request_number)
+        except Exception as exc:
+            if http_status(exc) != status:
+                raise
+            if next_request_number >= 4:
+                on_archive(item, f"HTTP_{status}")
+            else:
+                enqueue(item, next_request_number)
+            continue
+        on_success(item, payload)
 
-def archive_missevan_contexts(store: dict, archive: dict, cache: dict, contexts: list[tuple[str, str, dict]], drama_id: str) -> int:
-    watch_count = (cache.get("counts") or {}).get(drama_id)
-    archived = 0
-    for series_title, season_key, node in contexts:
-        archive_missevan_node(archive, series_title, season_key, node, watch_count)
-        remove_missevan_node(store, series_title, season_key)
-        archived += 1
-        print(f"[猫耳] 403归档 ID={drama_id} {season_key} title={normalize(node.get('title') or series_title)}")
-    cache.get("counts", {}).pop(drama_id, None)
-    return archived
+    return {"retry_requests": retry_requests}
 
 
 def refresh_missevan_watch_counts(*, target_ids: set[str] | None = None) -> dict:
     store = load_json(MISSEVAN_INFO_PATH, {})
-    archive = load_json(MISSEVAN_ARCHIVED_INFO_PATH, {})
     cache = load_cache(MISSEVAN_COUNTS_PATH)
     requester = MissevanRequester()
     processed = 0
     skipped = 0
     archived = 0
+    retry_requests = 0
     pricing_skipped = 0
     info_observations: dict[str, dict[str, object]] = {}
+    archive_candidates: dict[str, dict[str, str]] = {}
     now = datetime.now(UTC)
 
     def current_stats() -> dict:
@@ -260,9 +307,11 @@ def refresh_missevan_watch_counts(*, target_ids: set[str] | None = None) -> dict
             "archived": archived,
             "request_count": requester.request_count,
             "last_backoff_seconds": requester.last_backoff_seconds,
+            "archive_retry_requests": retry_requests,
             "pricing_checked": processed - pricing_skipped,
             "pricing_skipped": pricing_skipped,
             "info_observations": info_observations,
+            "archive_candidates": deepcopy_json(archive_candidates),
         }
 
     drama_ids: list[str] = []
@@ -277,34 +326,28 @@ def refresh_missevan_watch_counts(*, target_ids: set[str] | None = None) -> dict
         if drama_id not in drama_ids:
             drama_ids.append(drama_id)
 
+    target_drama_ids: list[str] = []
     for idx, drama_id in enumerate(drama_ids, start=1):
         cached = (cache.get("counts") or {}).get(drama_id) or {}
         if should_skip_recent(cached, now):
             print(f"[猫耳] 跳过 ID={drama_id} ({idx}/{len(drama_ids)})")
             skipped += 1
             continue
-        print(f"[猫耳] 正在刷新 ID={drama_id} ({idx}/{len(drama_ids)})")
-        try:
-            payload = requester.request_json(f"https://www.missevan.com/dramaapi/getdrama?drama_id={drama_id}")
-        except RuntimeError as exc:
-            save_missevan_store(MISSEVAN_INFO_PATH, store)
-            save_json(MISSEVAN_ARCHIVED_INFO_PATH, archive)
-            save_cache(MISSEVAN_COUNTS_PATH, cache)
-            if "HTTP_418" in str(exc):
-                raise MissevanRefreshInterrupted(str(exc), current_stats()) from exc
-            raise
-        except Exception as exc:
-            if is_http_403(exc):
-                archived += archive_missevan_contexts(store, archive, cache, drama_contexts.get(drama_id, []), drama_id)
-                save_missevan_store(MISSEVAN_INFO_PATH, store)
-                save_json(MISSEVAN_ARCHIVED_INFO_PATH, archive)
-                save_cache(MISSEVAN_COUNTS_PATH, cache)
-                continue
-            save_missevan_store(MISSEVAN_INFO_PATH, store)
-            save_json(MISSEVAN_ARCHIVED_INFO_PATH, archive)
-            save_cache(MISSEVAN_COUNTS_PATH, cache)
-            print(f"Failed while refreshing 猫耳 watch counts. Progress has been saved. dramaId={drama_id} error={type(exc).__name__}: {exc}")
-            raise
+        target_drama_ids.append(drama_id)
+
+    target_positions = {
+        drama_id: idx for idx, drama_id in enumerate(target_drama_ids, start=1)
+    }
+
+    def request_one(drama_id: str, request_number: int) -> dict:
+        print(
+            f"[猫耳] 正在刷新 ID={drama_id} "
+            f"(作品 {target_positions[drama_id]}/{len(target_drama_ids)}, 请求 {request_number}/4)"
+        )
+        return requester.request_json(f"https://www.missevan.com/dramaapi/getdrama?drama_id={drama_id}")
+
+    def on_success(drama_id: str, payload: dict) -> None:
+        nonlocal processed, pricing_skipped
         info = (payload or {}).get("info") or {}
         drama = info.get("drama") or {}
         pricing_fields, pricing_complete = missevan_pricing_observation(drama)
@@ -325,11 +368,46 @@ def refresh_missevan_watch_counts(*, target_ids: set[str] | None = None) -> dict
             "fetched_at": utc_now(),
         }
         processed += 1
-        if processed % 20 == 0 or idx == len(drama_ids):
+        if processed % 20 == 0:
             save_cache(MISSEVAN_COUNTS_PATH, cache)
 
-    save_cache(MISSEVAN_COUNTS_PATH, cache)
-    save_missevan_store(MISSEVAN_INFO_PATH, store)
+    def on_archive(drama_id: str, reason: str) -> None:
+        nonlocal archived
+        archive_candidates[drama_id] = {
+            "archivedAt": utc_now(),
+            "archivedReason": reason,
+        }
+        archived += 1
+        contexts = drama_contexts.get(drama_id, [])
+        title = normalize(contexts[0][2].get("title")) if contexts else ""
+        print(f"[猫耳] 4次HTTP 403后归档 ID={drama_id} title={title}")
+
+    def save_progress() -> None:
+        if archive_candidates:
+            apply_local_archive_candidates("missevan", store, cache, archive_candidates)
+        save_cache(MISSEVAN_COUNTS_PATH, cache)
+        save_missevan_store(MISSEVAN_INFO_PATH, store)
+
+    try:
+        retry_stats = run_archive_retry_queue(
+            "missevan",
+            target_drama_ids,
+            drama_id_of=lambda drama_id: drama_id,
+            request_one=request_one,
+            on_success=on_success,
+            on_archive=on_archive,
+        )
+        retry_requests = retry_stats["retry_requests"]
+    except Exception as exc:
+        save_progress()
+        if isinstance(exc, RuntimeError) and "HTTP_418" in str(exc):
+            raise MissevanRefreshInterrupted(str(exc), current_stats()) from exc
+        print(
+            "Failed while refreshing 猫耳 watch counts. Progress has been saved. "
+            f"error={type(exc).__name__}: {exc}"
+        )
+        raise
+    save_progress()
     return current_stats()
 
 
@@ -338,12 +416,16 @@ def refresh_manbo_watch_counts(*, target_ids: set[str] | None = None) -> dict:
     cache = load_cache(MANBO_COUNTS_PATH)
     processed = 0
     skipped = 0
+    archived = 0
+    retry_requests = 0
     pricing_skipped = 0
     info_observations: dict[str, dict[str, object]] = {}
+    archive_candidates: dict[str, dict[str, str]] = {}
     now = datetime.now(UTC)
     records = store.get("records", [])
 
     target_records = [record for record in records if str(record.get("dramaId") or "").strip() and (target_ids is None or str(record.get("dramaId") or "").strip() in target_ids)]
+    queued_records: list[dict] = []
     for idx, record in enumerate(target_records, start=1):
         drama_id = str(record.get("dramaId") or "").strip()
         cached = (cache.get("counts") or {}).get(drama_id) or {}
@@ -351,8 +433,26 @@ def refresh_manbo_watch_counts(*, target_ids: set[str] | None = None) -> dict:
             print(f"[漫播] 跳过 ID={drama_id} ({idx}/{len(target_records)})")
             skipped += 1
             continue
-        print(f"[漫播] 正在刷新 ID={drama_id} ({idx}/{len(target_records)})")
-        payload = request_manbo_json(f"https://www.kilamanbo.world/web_manbo/dramaDetail?dramaId={drama_id}")
+        queued_records.append(record)
+
+    queued_positions = {
+        str(record.get("dramaId") or "").strip(): idx
+        for idx, record in enumerate(queued_records, start=1)
+    }
+
+    def request_one(record: dict, request_number: int) -> dict:
+        drama_id = str(record.get("dramaId") or "").strip()
+        print(
+            f"[漫播] 正在刷新 ID={drama_id} "
+            f"(作品 {queued_positions[drama_id]}/{len(queued_records)}, 请求 {request_number}/4)"
+        )
+        return request_manbo_json(
+            f"https://www.kilamanbo.world/web_manbo/dramaDetail?dramaId={drama_id}"
+        )
+
+    def on_success(record: dict, payload: dict) -> None:
+        nonlocal processed, pricing_skipped
+        drama_id = str(record.get("dramaId") or "").strip()
         data = payload.get("data") or {}
         pricing_fields, pricing_complete = manbo_pricing_observation(drama_id, payload)
         info_fields = dict(pricing_fields)
@@ -371,17 +471,48 @@ def refresh_manbo_watch_counts(*, target_ids: set[str] | None = None) -> dict:
             "fetched_at": utc_now(),
         }
         processed += 1
-        if processed % 50 == 0 or idx == len(target_records):
+        if processed % 50 == 0:
             save_cache(MANBO_COUNTS_PATH, cache)
 
-    save_cache(MANBO_COUNTS_PATH, cache)
-    save_json(MANBO_INFO_PATH, store)
+    def on_archive(record: dict, reason: str) -> None:
+        nonlocal archived
+        drama_id = str(record.get("dramaId") or "").strip()
+        archive_candidates[drama_id] = {
+            "archivedAt": utc_now(),
+            "archivedReason": reason,
+        }
+        archived += 1
+        print(f"[漫播] 4次HTTP 404后归档 ID={drama_id} title={normalize(record.get('name'))}")
+
+    def save_progress() -> None:
+        if archive_candidates:
+            apply_local_archive_candidates("manbo", store, cache, archive_candidates)
+        save_cache(MANBO_COUNTS_PATH, cache)
+        save_json(MANBO_INFO_PATH, store)
+
+    try:
+        retry_stats = run_archive_retry_queue(
+            "manbo",
+            queued_records,
+            drama_id_of=lambda record: str(record.get("dramaId") or "").strip(),
+            request_one=request_one,
+            on_success=on_success,
+            on_archive=on_archive,
+        )
+        retry_requests = retry_stats["retry_requests"]
+    except Exception:
+        save_progress()
+        raise
+    save_progress()
     return {
         "processed": processed,
         "skipped": skipped,
+        "archived": archived,
+        "archive_retry_requests": retry_requests,
         "pricing_checked": processed - pricing_skipped,
         "pricing_skipped": pricing_skipped,
         "info_observations": info_observations,
+        "archive_candidates": deepcopy_json(archive_candidates),
     }
 
 
@@ -398,6 +529,8 @@ def print_missevan_stats(stats: dict) -> None:
 def print_manbo_stats(stats: dict) -> None:
     print("漫播 watch counts processed:", stats["processed"])
     print("漫播 watch counts skipped:", stats["skipped"])
+    print("漫播 watch counts archived:", stats.get("archived", 0))
+    print("漫播 archive retry requests:", stats.get("archive_retry_requests", 0))
     print("漫播 pricing checked:", stats.get("pricing_checked", 0))
     print("漫播 pricing skipped:", stats.get("pricing_skipped", 0))
 
@@ -415,10 +548,20 @@ def publish_refresh_results(platforms: list[str] | tuple[str, ...], refresh_resu
         result = refresh_results.get(platform)
         if result is None:
             continue
+        archive_stats = publish_archive_candidates(
+            platform,
+            result.get("archive_candidates") or {},
+        )
+        print(f"{platform} archive published:", archive_stats.get("archived", 0))
         info_stats = publish_info_observations(platform, result.get("info_observations") or {})
         print_info_publish_stats(platform, info_stats)
         path = MISSEVAN_COUNTS_PATH if platform == "missevan" else MANBO_COUNTS_PATH
-        upload_watchcount_file(platform, path)
+        _info_archive, watch_archive = load_local_archives(platform)
+        upload_watchcount_file(
+            platform,
+            path,
+            excluded_drama_ids=set(watch_archive.get("records") or {}),
+        )
 
 
 def run_missevan_refresh(target_ids: set[str] | None) -> dict:
@@ -456,6 +599,16 @@ def main(argv: list[str] | None = None) -> int:
     do_manbo = bool(manbo_ids or (not explicit_target_mode and args.platform in ("all", "manbo")))
     refreshed_platforms: list[str] = []
     refresh_results: dict[str, dict] = {}
+
+    selected_platforms = [
+        platform
+        for platform, enabled in (("missevan", do_missevan), ("manbo", do_manbo))
+        if enabled
+    ]
+    for platform in selected_platforms:
+        load_local_archives(platform)
+        if not args.no_upload:
+            ensure_remote_archive_keys(platform)
 
     if do_missevan:
         download_info_file(MISSEVAN_INFO_KEY, MISSEVAN_INFO_PATH)
