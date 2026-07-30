@@ -8,8 +8,8 @@ from datetime import datetime, timedelta, timezone
 import time
 
 from archive_manager import (
-    ARCHIVE_HTTP_STATUS,
     ARCHIVE_RETRY_DELAYS,
+    ARCHIVE_SIGNALS,
     apply_local_archive_candidates,
     ensure_remote_archive_keys,
     load_local_archives,
@@ -229,6 +229,31 @@ def http_status(exc: Exception) -> int | None:
     return getattr(response, "status_code", None)
 
 
+def archive_reason(
+    platform: str,
+    *,
+    payload: dict | None = None,
+    exc: Exception | None = None,
+) -> str | None:
+    signal = ARCHIVE_SIGNALS[platform]
+    if exc is not None:
+        if "httpStatus" not in signal:
+            return None
+        return signal["reason"] if http_status(exc) == signal["httpStatus"] else None
+    if not isinstance(payload, dict) or "payloadCode" not in signal:
+        return None
+    try:
+        response_code = int(payload.get("code"))
+    except (TypeError, ValueError):
+        return None
+    if (
+        response_code == signal["payloadCode"]
+        and normalize(payload.get("msg")) == signal["payloadMessage"]
+    ):
+        return signal["reason"]
+    return None
+
+
 def run_archive_retry_queue(
     platform: str,
     items: list[object],
@@ -240,18 +265,17 @@ def run_archive_retry_queue(
     monotonic=time.monotonic,
     sleep=time.sleep,
 ) -> dict[str, int]:
-    status = ARCHIVE_HTTP_STATUS[platform]
     retry_heap: list[tuple[float, int, int, object]] = []
     sequence = 0
     retry_requests = 0
 
-    def enqueue(item: object, requests_done: int) -> None:
+    def enqueue(item: object, requests_done: int, reason: str) -> None:
         nonlocal sequence
         delay = ARCHIVE_RETRY_DELAYS[requests_done - 1]
         sequence += 1
         heapq.heappush(retry_heap, (monotonic() + delay, sequence, requests_done, item))
         print(
-            f"[{platform}] ID={drama_id_of(item)} HTTP_{status}; "
+            f"[{platform}] ID={drama_id_of(item)} {reason}; "
             f"{int(delay)}秒后进行第{requests_done + 1}次请求"
         )
 
@@ -259,9 +283,14 @@ def run_archive_retry_queue(
         try:
             payload = request_one(item, 1)
         except Exception as exc:
-            if http_status(exc) != status:
+            reason = archive_reason(platform, exc=exc)
+            if reason is None:
                 raise
-            enqueue(item, 1)
+            enqueue(item, 1, reason)
+            continue
+        reason = archive_reason(platform, payload=payload)
+        if reason is not None:
+            enqueue(item, 1, reason)
             continue
         on_success(item, payload)
 
@@ -275,12 +304,20 @@ def run_archive_retry_queue(
         try:
             payload = request_one(item, next_request_number)
         except Exception as exc:
-            if http_status(exc) != status:
+            reason = archive_reason(platform, exc=exc)
+            if reason is None:
                 raise
             if next_request_number >= 4:
-                on_archive(item, f"HTTP_{status}")
+                on_archive(item, reason)
             else:
-                enqueue(item, next_request_number)
+                enqueue(item, next_request_number, reason)
+            continue
+        reason = archive_reason(platform, payload=payload)
+        if reason is not None:
+            if next_request_number >= 4:
+                on_archive(item, reason)
+            else:
+                enqueue(item, next_request_number, reason)
             continue
         on_success(item, payload)
 
@@ -482,7 +519,10 @@ def refresh_manbo_watch_counts(*, target_ids: set[str] | None = None) -> dict:
             "archivedReason": reason,
         }
         archived += 1
-        print(f"[漫播] 4次HTTP 404后归档 ID={drama_id} title={normalize(record.get('name'))}")
+        print(
+            f"[漫播] 4次返回code=400、msg=作品已下架后归档 "
+            f"ID={drama_id} title={normalize(record.get('name'))}"
+        )
 
     def save_progress() -> None:
         if archive_candidates:

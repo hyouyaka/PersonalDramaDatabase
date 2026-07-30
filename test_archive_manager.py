@@ -113,7 +113,7 @@ class LocalArchiveMigrationTests(unittest.TestCase):
             "records": {
                 "200": {
                     "archivedAt": "2026-07-29T00:00:00+00:00",
-                    "archivedReason": "HTTP_404",
+                    "archivedReason": "MANBO_CODE_400_作品已下架",
                     "record": {"dramaId": "200", "name": "已归档"},
                 }
             },
@@ -310,7 +310,7 @@ class RemoteArchivePublishTests(unittest.TestCase):
                 {
                     "200": {
                         "archivedAt": "2026-07-29T01:00:00+00:00",
-                        "archivedReason": "HTTP_404",
+                        "archivedReason": "MANBO_CODE_400_作品已下架",
                     }
                 },
                 upstash=fake,

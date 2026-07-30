@@ -31,7 +31,17 @@ from upstash_v2 import build_info_v2_meta, compact_json, string_cas_token
 
 
 ARCHIVE_VERSION = 1
-ARCHIVE_HTTP_STATUS = {"missevan": 403, "manbo": 404}
+ARCHIVE_SIGNALS = {
+    "missevan": {
+        "reason": "HTTP_403",
+        "httpStatus": 403,
+    },
+    "manbo": {
+        "reason": "MANBO_CODE_400_作品已下架",
+        "payloadCode": 400,
+        "payloadMessage": "作品已下架",
+    },
+}
 ARCHIVE_RETRY_DELAYS = (30.0, 60.0, 120.0)
 ARCHIVE_PUBLISH_MAX_ATTEMPTS = 3
 
@@ -114,7 +124,7 @@ def _empty_archive(platform: str) -> dict:
 
 
 def _validate_platform(platform: str) -> None:
-    if platform not in ARCHIVE_HTTP_STATUS:
+    if platform not in ARCHIVE_SIGNALS:
         raise ValueError(f"Unsupported platform: {platform}")
 
 

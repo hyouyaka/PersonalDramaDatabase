@@ -400,14 +400,19 @@ class ArchiveRetryQueueTests(unittest.TestCase):
         self.assertEqual(completed, ["101", "100"])
         self.assertEqual(stats["retry_requests"], 3)
 
-    def test_four_target_status_responses_archive_for_each_platform(self) -> None:
-        for platform, status in (("missevan", 403), ("manbo", 404)):
+    def test_four_archive_signals_archive_for_each_platform(self) -> None:
+        for platform, expected_reason in (
+            ("missevan", "HTTP_403"),
+            ("manbo", "MANBO_CODE_400_作品已下架"),
+        ):
             with self.subTest(platform=platform):
                 now = [0.0]
                 archived = []
 
                 def request_one(_item, _request_number):
-                    raise self.http_error(status)
+                    if platform == "missevan":
+                        raise self.http_error(403)
+                    return {"code": 400, "msg": "作品已下架", "data": None}
 
                 refresh_watch_counts.run_archive_retry_queue(
                     platform,
@@ -420,8 +425,29 @@ class ArchiveRetryQueueTests(unittest.TestCase):
                     sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
                 )
 
-                self.assertEqual(archived, [("1", f"HTTP_{status}")])
+                self.assertEqual(archived, [("1", expected_reason)])
                 self.assertEqual(now[0], 210)
+
+    def test_manbo_archive_signal_requires_both_code_and_message(self) -> None:
+        self.assertEqual(
+            refresh_watch_counts.archive_reason(
+                "manbo",
+                payload={"code": 400, "msg": "作品已下架", "data": None},
+            ),
+            "MANBO_CODE_400_作品已下架",
+        )
+        self.assertIsNone(
+            refresh_watch_counts.archive_reason(
+                "manbo",
+                payload={"code": 400, "msg": "其他错误", "data": None},
+            )
+        )
+        self.assertIsNone(
+            refresh_watch_counts.archive_reason(
+                "manbo",
+                payload={"code": 200, "msg": "作品已下架", "data": {}},
+            )
+        )
 
     def test_non_archive_status_still_fails_fast(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "HTTP 404"):
@@ -437,6 +463,29 @@ class ArchiveRetryQueueTests(unittest.TestCase):
                 monotonic=lambda: 0,
                 sleep=lambda _seconds: None,
             )
+
+    def test_manbo_network_error_does_not_trigger_archive_retries(self) -> None:
+        requests = []
+        archived = []
+
+        def request_one(_item, request_number):
+            requests.append(request_number)
+            raise RuntimeError("connection timeout")
+
+        with self.assertRaisesRegex(RuntimeError, "connection timeout"):
+            refresh_watch_counts.run_archive_retry_queue(
+                "manbo",
+                ["1"],
+                drama_id_of=lambda drama_id: drama_id,
+                request_one=request_one,
+                on_success=lambda _item, _payload: None,
+                on_archive=lambda drama_id, reason: archived.append((drama_id, reason)),
+                monotonic=lambda: 0,
+                sleep=lambda _seconds: self.fail("network errors must not enter the retry queue"),
+            )
+
+        self.assertEqual(requests, [1])
+        self.assertEqual(archived, [])
 
 
 class InfoRefreshTests(unittest.TestCase):

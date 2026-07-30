@@ -241,7 +241,7 @@ flowchart LR
 - 猫耳和漫播分别在同一次 `getdrama` / `dramaDetail` 请求中同步付费信息、会员状态和非空的 `soundIds`
 - 源库动态字段通过 Upstash CAS 合并发布，避免覆盖并发更新的其他 metadata
 - 猫耳命中 418 时会先保存并发布已完成剧目的当前进度，再以退出码 `2` 退出
-- 猫耳 HTTP 403、漫播 HTTP 404 使用 30/60/120 秒延迟重试，共最多 4 次请求
+- 猫耳 HTTP 403、漫播 HTTP 200 响应体中的 `code=400` 且 `msg=作品已下架` 使用 30/60/120 秒延迟重试，共最多 4 次请求
 - 重试使用延迟队列，等待期间继续抓取其他作品；连续 4 次命中后才生成归档候选
 - info、latest、history 与 archive key 通过单次 Upstash CAS/Lua 原子迁移；旧日期快照不重写
 - watchcount history 重建时会排除全部 archive ID，避免旧日期快照令已归档剧目复活
