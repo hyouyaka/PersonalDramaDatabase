@@ -360,6 +360,37 @@ class RefreshWatchCountsCliTests(unittest.TestCase):
 
         upload.assert_not_called()
 
+    def test_publish_results_preserves_fresh_local_watchcount_during_archive(self) -> None:
+        result = {
+            "archive_candidates": {
+                "100": {
+                    "archivedAt": "2026-07-31T04:00:00+00:00",
+                    "archivedReason": "HTTP_403",
+                }
+            },
+            "info_observations": {},
+        }
+        with (
+            patch.object(
+                refresh_watch_counts,
+                "publish_archive_candidates",
+                return_value={"archived": 1},
+            ) as publish_archive,
+            patch.object(refresh_watch_counts, "publish_info_observations", return_value={}),
+            patch.object(refresh_watch_counts, "upload_watchcount_file"),
+            patch("builtins.print"),
+        ):
+            refresh_watch_counts.publish_refresh_results(
+                ("missevan",),
+                {"missevan": result},
+            )
+
+        publish_archive.assert_called_once_with(
+            "missevan",
+            result["archive_candidates"],
+            sync_local_watchcount=False,
+        )
+
 
 class ArchiveRetryQueueTests(unittest.TestCase):
     @staticmethod

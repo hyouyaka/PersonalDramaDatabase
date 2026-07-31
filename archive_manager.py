@@ -380,6 +380,7 @@ def publish_archive_candidates(
     *,
     upstash: Callable[[list[object]], object] = upstash_request,
     max_attempts: int = ARCHIVE_PUBLISH_MAX_ATTEMPTS,
+    sync_local_watchcount: bool = True,
 ) -> dict[str, int]:
     if not candidates:
         return {"archived": 0}
@@ -487,7 +488,8 @@ def publish_archive_candidates(
             upstash(["GET", watch_archive_key]), platform, key=watch_archive_key
         )
         save_json(ACTIVE_INFO_PATHS[platform], verified_active)
-        save_json(ACTIVE_WATCHCOUNT_PATHS[platform], verified_latest)
+        if sync_local_watchcount:
+            save_json(ACTIVE_WATCHCOUNT_PATHS[platform], verified_latest)
         save_local_archives(platform, verified_info_archive, verified_watch_archive)
         return {"archived": changed}
 

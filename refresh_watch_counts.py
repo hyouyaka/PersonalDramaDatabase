@@ -588,9 +588,13 @@ def publish_refresh_results(platforms: list[str] | tuple[str, ...], refresh_resu
         result = refresh_results.get(platform)
         if result is None:
             continue
+        # The local cache already contains this run's fresh API results. The
+        # archive transaction reads the older remote latest, so it must not
+        # write that verified payload back over the local cache.
         archive_stats = publish_archive_candidates(
             platform,
             result.get("archive_candidates") or {},
+            sync_local_watchcount=False,
         )
         print(f"{platform} archive published:", archive_stats.get("archived", 0))
         info_stats = publish_info_observations(platform, result.get("info_observations") or {})

@@ -273,6 +273,71 @@ class RemoteArchivePublishTests(unittest.TestCase):
         self.assertEqual(fake.move_attempts, 2)
         self.assertEqual(json.loads(fake.strings["missevan:info:v2"])["101"]["title"], "并发更新标题")
 
+    def test_archive_publish_can_preserve_fresher_local_watchcount(self):
+        fake = self.build_remote()
+        fresh_local = {
+            "_meta": {"updated_at": "2026-07-31T04:00:00+00:00"},
+            "counts": {
+                "101": {
+                    "name": "保留",
+                    "view_count": 25,
+                    "fetched_at": "2026-07-31T04:00:00+00:00",
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+            active_info_path = Path(tmp) / "missevan-info.json"
+            active_watch_path = Path(tmp) / "missevan-watch.json"
+            active_watch_path.write_text(
+                json.dumps(fresh_local, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            stack.enter_context(
+                patch.dict(
+                    archive_manager.ACTIVE_INFO_PATHS,
+                    {"missevan": active_info_path},
+                )
+            )
+            stack.enter_context(
+                patch.dict(
+                    archive_manager.ACTIVE_WATCHCOUNT_PATHS,
+                    {"missevan": active_watch_path},
+                )
+            )
+            stack.enter_context(
+                patch.dict(
+                    archive_manager.ARCHIVE_INFO_PATHS,
+                    {"missevan": Path(tmp) / "missevan-info-archive.json"},
+                )
+            )
+            stack.enter_context(
+                patch.dict(
+                    archive_manager.ARCHIVE_WATCHCOUNT_PATHS,
+                    {"missevan": Path(tmp) / "missevan-watch-archive.json"},
+                )
+            )
+
+            archive_manager.publish_archive_candidates(
+                "missevan",
+                {
+                    "100": {
+                        "archivedAt": "2026-07-31T04:00:00+00:00",
+                        "archivedReason": "HTTP_403",
+                    }
+                },
+                upstash=fake,
+                sync_local_watchcount=False,
+            )
+
+            self.assertEqual(
+                json.loads(active_watch_path.read_text(encoding="utf-8")),
+                fresh_local,
+            )
+
+        remote_latest = json.loads(fake.strings["missevan:watchcount:latest"])
+        self.assertEqual(set(remote_latest["counts"]), {"101"})
+        self.assertEqual(remote_latest["counts"]["101"]["view_count"], 20)
+
     def test_manbo_archive_removes_record_and_preserves_other_records(self):
         active = {
             "version": 1,
