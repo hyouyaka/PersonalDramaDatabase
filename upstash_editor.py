@@ -17,10 +17,18 @@ CURRENT_MIRROR_ROOT = BACKUP_ROOT / "current"
 RANK_META_KEY = "ranks:meta"
 STAGING_TTL_SECONDS = 24 * 60 * 60
 HASH_WRITE_CHUNK_SIZE = 100
+GENERATED_MISSEVAN_CVID_MIN = 330000
+GENERATED_MISSEVAN_CVID_MAX = 339999
 
 INFO_META_KEYS = {
     "missevan:info:v2": "missevan:info:meta:v2",
     "manbo:info:v2": "manbo:info:meta:v2",
+}
+CVID_MAP_KEY = "cvid-map:v1"
+CVID_MAP_META_KEY = "cvid-map:meta:v1"
+JSON_META_KEYS = {
+    **INFO_META_KEYS,
+    CVID_MAP_KEY: CVID_MAP_META_KEY,
 }
 
 STRING_SAVE_SCRIPT = """
@@ -138,6 +146,13 @@ RESOURCE_SPECS: dict[str, ResourceSpec] = {
             "string",
             "info_manbo",
             local_path=ROOT / "manbo-drama-info.json",
+        ),
+        ResourceSpec(
+            CVID_MAP_KEY,
+            "CVID 映射",
+            "string",
+            "cvid_map",
+            local_path=ROOT / "missevan&manbo-cvid-map.json",
         ),
         ResourceSpec(
             "ranks:latest",
@@ -322,6 +337,7 @@ def _loaded_meta_status(
     *,
     digest: str,
     byte_count: int,
+    record_count: int | None,
     hash_meta: dict | None,
     upstash: Callable[[list[object]], object],
 ) -> tuple[str, str | None]:
@@ -334,15 +350,16 @@ def _loaded_meta_status(
                 or int(meta.get("bytes") or -1) != byte_count
             ):
                 return "Hash __meta__ 摘要不匹配", updated_at
-        elif spec.key in INFO_META_KEYS:
-            meta = _decode_json_object(upstash(["GET", INFO_META_KEYS[spec.key]]))
+        elif spec.key in JSON_META_KEYS:
+            meta = _decode_json_object(upstash(["GET", JSON_META_KEYS[spec.key]]))
             updated_at = str(meta.get("updatedAt") or "") or None
             if (
                 meta.get("dataKey") != spec.key
                 or meta.get("contentSha1") != digest
                 or int(meta.get("bytes") or -1) != byte_count
+                or int(meta.get("recordCount") or -1) != record_count
             ):
-                return "Info Meta 摘要不匹配", updated_at
+                return "JSON Meta 摘要不匹配", updated_at
             return "有效", updated_at
         else:
             updated_at = None
@@ -388,6 +405,7 @@ def load_resource(
             spec,
             digest=digest,
             byte_count=byte_count,
+            record_count=_json_record_count(spec, payload) if spec.key in JSON_META_KEYS else None,
             hash_meta=None,
             upstash=upstash,
         )
@@ -417,6 +435,7 @@ def load_resource(
         spec,
         digest=digest,
         byte_count=byte_count,
+        record_count=None,
         hash_meta=meta,
         upstash=upstash,
     )
@@ -471,6 +490,56 @@ def validate_payload(spec: ResourceSpec, payload: object, *, hash_meta: dict | N
                 raise ValueError(f"Duplicate dramaId in {spec.key}: {drama_id}")
             seen.add(drama_id)
         return
+    if spec.kind == "cvid_map":
+        root = _require_dict(payload, spec.key)
+        if len(root) < 50:
+            raise ValueError(f"{spec.key} contains fewer than 50 records.")
+        missevan_ids: dict[int, str] = {}
+        manbo_ids: dict[int, str] = {}
+        for field, record in root.items():
+            name = str(field).strip()
+            if not name:
+                raise ValueError(f"{spec.key} contains an empty record key.")
+            item = _require_dict(record, f"{spec.key}[{field!r}]")
+            if not str(item.get("displayName") or "").strip():
+                raise ValueError(f"{spec.key}[{field!r}].displayName must not be empty.")
+            aliases = item.get("aliases")
+            if not isinstance(aliases, list) or any(
+                not isinstance(alias, str) or not alias.strip() for alias in aliases
+            ):
+                raise ValueError(f"{spec.key}[{field!r}].aliases must be an array of non-empty strings.")
+            for id_field in ("cvId", "missevanCvId", "manboCvId"):
+                value = item.get(id_field)
+                if value not in (None, ""):
+                    _validate_numeric_id(value, f"{spec.key}[{field!r}].{id_field}")
+            cv_id = item.get("cvId")
+            missevan_cv_id = item.get("missevanCvId")
+            if (
+                cv_id not in (None, "")
+                and missevan_cv_id not in (None, "")
+                and int(cv_id) != int(missevan_cv_id)
+            ):
+                raise ValueError(
+                    f"{spec.key}[{field!r}].cvId and missevanCvId must match."
+                )
+            effective_missevan_id = (
+                missevan_cv_id if missevan_cv_id not in (None, "") else cv_id
+            )
+            for platform, value, seen in (
+                ("missevan", effective_missevan_id, missevan_ids),
+                ("manbo", item.get("manboCvId"), manbo_ids),
+            ):
+                if value in (None, ""):
+                    continue
+                numeric_id = int(value)
+                previous = seen.get(numeric_id)
+                if previous is not None:
+                    raise ValueError(
+                        f"Duplicate {platform} CVID {numeric_id} in "
+                        f"{spec.key}[{previous!r}] and {spec.key}[{field!r}]."
+                    )
+                seen[numeric_id] = str(field)
+        return
     if spec.kind == "ranks_latest":
         root = _require_dict(payload, spec.key)
         for platform in ("missevan", "manbo"):
@@ -522,6 +591,8 @@ def collection_refs(spec: ResourceSpec, payload: object) -> list[CollectionRef]:
     if spec.kind == "info_manbo":
         root = _require_dict(payload, spec.key)
         return [CollectionRef("剧目", root["records"], "dramaId")]
+    if spec.kind == "cvid_map":
+        return [CollectionRef("CV 映射", _require_dict(payload, spec.key), None)]
     if spec.kind == "ranks_latest":
         root = _require_dict(payload, spec.key)
         result: list[CollectionRef] = []
@@ -664,13 +735,40 @@ def build_rank_meta_update(
     return meta
 
 
-def build_info_meta(spec: ResourceSpec, encoded: str, payload: object, now: str) -> dict:
+def _json_record_count(spec: ResourceSpec, payload: object) -> int:
+    if spec.kind == "cvid_map":
+        return len(_require_dict(payload, spec.key))
     if spec.kind == "info_missevan":
-        count = len(_require_dict(payload, spec.key))
-    else:
-        count = len(_require_dict(payload, spec.key).get("records") or [])
+        return len(_require_dict(payload, spec.key))
+    return len(_require_dict(payload, spec.key).get("records") or [])
+
+
+def _generated_missevan_cvid_identities(payload: object) -> dict[int, tuple[str, str]]:
+    root = _require_dict(payload, CVID_MAP_KEY)
+    identities: dict[int, tuple[str, str]] = {}
+    for field, record in root.items():
+        item = _require_dict(record, f"{CVID_MAP_KEY}[{field!r}]")
+        value = item.get("missevanCvId")
+        if value in (None, ""):
+            value = item.get("cvId")
+        if value in (None, ""):
+            continue
+        cv_id = int(value)
+        if GENERATED_MISSEVAN_CVID_MIN <= cv_id <= GENERATED_MISSEVAN_CVID_MAX:
+            display_name = re.sub(
+                r"\s+",
+                "",
+                str(item.get("displayName") or "").strip(),
+            ).casefold()
+            identities[cv_id] = (str(field), display_name)
+    return identities
+
+
+def build_json_meta(spec: ResourceSpec, encoded: str, payload: object, now: str) -> dict:
+    count = _json_record_count(spec, payload)
+    schema_version = 1 if spec.kind == "cvid_map" else 2
     return {
-        "schemaVersion": 2,
+        "schemaVersion": schema_version,
         "dataKey": spec.key,
         "contentSha1": sha1_text(encoded),
         "updatedAt": now,
@@ -679,13 +777,27 @@ def build_info_meta(spec: ResourceSpec, encoded: str, payload: object, now: str)
     }
 
 
-def _verify_info_meta(raw: object, *, key: str, digest: str, byte_count: int, updated_at: str) -> None:
+def build_info_meta(spec: ResourceSpec, encoded: str, payload: object, now: str) -> dict:
+    """Backward-compatible wrapper for callers that build platform info metadata."""
+    return build_json_meta(spec, encoded, payload, now)
+
+
+def _verify_json_meta(
+    raw: object,
+    *,
+    key: str,
+    digest: str,
+    byte_count: int,
+    updated_at: str,
+    record_count: int,
+) -> None:
     meta = _decode_json_object(raw)
     if (
         meta.get("dataKey") != key
         or meta.get("contentSha1") != digest
         or int(meta.get("bytes") or -1) != byte_count
         or meta.get("updatedAt") != updated_at
+        or int(meta.get("recordCount") or -1) != record_count
     ):
         raise RuntimeError(f"Remote meta verification failed for {key}.")
 
@@ -780,16 +892,25 @@ def save_resource(
         normalized, encoded = _normalize_string_payload(spec, payload, timestamp)
         digest = sha1_text(encoded)
         byte_count = len(encoded.encode("utf-8"))
-        if spec.key in INFO_META_KEYS:
-            meta_key = INFO_META_KEYS[spec.key]
-            meta = build_info_meta(spec, encoded, normalized, timestamp)
+        if spec.kind == "cvid_map":
+            original = _parse_string_payload(spec, loaded.raw_string)
+            if _generated_missevan_cvid_identities(
+                original
+            ) != _generated_missevan_cvid_identities(normalized):
+                raise ValueError(
+                    "Generated Missevan CVID key, displayName, and ID are registry-managed "
+                    "and cannot be added, removed, or changed in the editor."
+                )
+        if spec.key in JSON_META_KEYS:
+            meta_key = JSON_META_KEYS[spec.key]
+            meta = build_json_meta(spec, encoded, normalized, timestamp)
         else:
             meta_key = RANK_META_KEY
             meta = {}
         saved = False
         for _attempt in range(3):
             current_meta = upstash(["GET", meta_key])
-            if spec.key not in INFO_META_KEYS:
+            if spec.key not in JSON_META_KEYS:
                 meta = build_rank_meta_update(
                     current_meta,
                     scope=str(spec.rank_scope),
@@ -835,13 +956,14 @@ def save_resource(
         if verified != encoded:
             raise RuntimeError(f"Remote verification failed for {spec.key}.")
         verified_meta = upstash(["GET", meta_key])
-        if spec.key in INFO_META_KEYS:
-            _verify_info_meta(
+        if spec.key in JSON_META_KEYS:
+            _verify_json_meta(
                 verified_meta,
                 key=spec.key,
                 digest=digest,
                 byte_count=byte_count,
                 updated_at=timestamp,
+                record_count=_json_record_count(spec, normalized),
             )
         else:
             _verify_rank_meta(

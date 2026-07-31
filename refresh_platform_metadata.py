@@ -11,6 +11,7 @@ from clean_manbo_pricing import MANBO_PRICING_EXCLUSIONS, classify_manbo_pricing
 from cvid_map_tools import (
     ensure_generated_missevan_cv_entry,
     ensure_name_only_cv_entry,
+    has_conflicting_manbo_cvid,
     is_generated_missevan_cvid,
     load_combined_map,
     save_combined_map,
@@ -74,6 +75,7 @@ MISSEVAN_INTRO_SECTION_PATTERN = re.compile(
 )
 MISSEVAN_INTRO_ROLE_CV_PATTERN = re.compile(r"^(?P<role>[^：:\n]{1,40})[：:](?P<cv>.+)$")
 MISSEVAN_CV_SUFFIX_PATTERN = re.compile(r"\s*(?:@|＠|【|\[|（|\(|<|《).*$")
+MISSEVAN_CV_ACCOUNT_END_PATTERN = re.compile(r"[\s、，,；;【\[（\(<《]")
 MISSEVAN_INTRO_STAFF_ROLE_NAMES = {
     "配音团队",
     "配音导演",
@@ -343,6 +345,21 @@ def clean_missevan_intro_cv_name(value: object) -> str:
     return normalize(name)
 
 
+def extract_missevan_intro_cv_identity(value: object) -> tuple[str, str]:
+    raw = normalize(value)
+    if not raw:
+        return "", ""
+    display_name = clean_missevan_intro_cv_name(raw)
+    account_name = ""
+    separator = re.search(r"[@＠]", raw)
+    if separator:
+        suffix = normalize(raw[separator.end() :])
+        account_name = normalize(MISSEVAN_CV_ACCOUNT_END_PATTERN.split(suffix, maxsplit=1)[0])
+        if normalize_match(account_name) == normalize_match(display_name):
+            account_name = ""
+    return display_name, account_name
+
+
 def is_missevan_intro_narrator_role(role_name: object) -> bool:
     role = normalize(role_name)
     if is_narrator_role(role):
@@ -378,18 +395,31 @@ def extract_missevan_intro_cv_candidates(intro: object, *, limit: int = 2) -> li
         role_name = normalize(match.group("role"))
         if is_missevan_intro_narrator_role(role_name) or is_missevan_intro_staff_role(role_name):
             continue
-        display_name = clean_missevan_intro_cv_name(match.group("cv"))
+        display_name, account_name = extract_missevan_intro_cv_identity(match.group("cv"))
         if not display_name:
             continue
         if any(item["display_name"] == display_name for item in candidates):
             continue
-        candidates.append({"role_name": role_name, "display_name": display_name})
+        candidate = {"role_name": role_name, "display_name": display_name}
+        if account_name:
+            candidate["account_name"] = account_name
+        candidates.append(candidate)
         if len(candidates) >= limit:
             break
     return candidates
 
 
 def missevan_cv_entry_from_combined_map(display_name: str, combined_map: dict) -> tuple[str | None, int | None, str]:
+    matches = _missevan_cv_entries_from_combined_map(display_name, combined_map)
+    if len(matches) == 1:
+        return matches[0]
+    return None, None, ""
+
+
+def _missevan_cv_entries_from_combined_map(
+    display_name: str,
+    combined_map: dict,
+) -> list[tuple[str, int, str]]:
     norm = normalize_match(display_name)
     matches: list[tuple[str, int, str]] = []
     for key, payload in (combined_map or {}).items():
@@ -401,10 +431,20 @@ def missevan_cv_entry_from_combined_map(display_name: str, combined_map: dict) -
             continue
         mapped_name = normalize(payload.get("displayName") or key or display_name)
         matches.append((str(key), int(cv_id), mapped_name))
-    unique = {(key, cv_id, name) for key, cv_id, name in matches}
-    if len(unique) == 1:
-        return next(iter(unique))
-    return None, None, ""
+    return sorted({(key, cv_id, name) for key, cv_id, name in matches})
+
+
+def _missevan_cv_name_only_keys_from_combined_map(display_name: str, combined_map: dict) -> list[str]:
+    norm = normalize_match(display_name)
+    matches: set[str] = set()
+    for key, payload in (combined_map or {}).items():
+        candidates = [key, payload.get("displayName"), *(payload.get("aliases") or [])]
+        if norm not in {normalize_match(candidate) for candidate in candidates if normalize_match(candidate)}:
+            continue
+        cv_id = payload.get("missevanCvId") or payload.get("cvId")
+        if cv_id in (None, ""):
+            matches.add(str(key))
+    return sorted(matches)
 
 
 def search_missevan_cv(name: str, requester: MissevanRequester) -> dict | None:
@@ -414,10 +454,9 @@ def search_missevan_cv(name: str, requester: MissevanRequester) -> dict | None:
     payload = requester.request_json(f"https://www.missevan.com/sound/getsearch?s={query}&type=4&p=1&page_size=20")
     rows = ((payload or {}).get("info") or {}).get("Datas") or []
     exact_rows = [row for row in rows if normalize_match(row.get("name")) == normalize_match(name)]
-    candidates = exact_rows or rows
-    if len(candidates) != 1:
+    if len(exact_rows) != 1:
         return None
-    candidate = candidates[0] or {}
+    candidate = exact_rows[0] or {}
     cv_id = candidate.get("id")
     display_name = normalize(candidate.get("name"))
     if cv_id in (None, "") or not display_name:
@@ -458,9 +497,17 @@ def upsert_missevan_cv_map_entry(
     ]
     if len(real_id_keys) > 1:
         return MissevanCvMapUpsertResult("ambiguous", conflicting_keys=tuple(sorted(real_id_keys)))
-    if len(real_id_keys) == 1 and replaced_generated_id is not None:
+    if len(real_id_keys) == 1 and (replaced_generated_id is not None or existing in (None, "")):
         target_key = real_id_keys[0]
         target = dict(combined_map[target_key])
+        if has_conflicting_manbo_cvid(
+            target.get("manboCvId"),
+            payload.get("manboCvId"),
+        ):
+            return MissevanCvMapUpsertResult(
+                "ambiguous",
+                conflicting_keys=tuple(sorted((key, target_key))),
+            )
         target_name = normalize(target.get("displayName") or target_key)
         aliases = [
             *(target.get("aliases") or []),
@@ -480,7 +527,11 @@ def upsert_missevan_cv_map_entry(
         if target.get("manboCvId") in (None, "") and payload.get("manboCvId") not in (None, ""):
             target["manboCvId"] = payload.get("manboCvId")
         target["updatedAt"] = utc_now()
-        target["notes"] = f"自动生成 CVID {replaced_generated_id} 已合并到真实猫耳 CVID {int(cv_id)}"
+        if replaced_generated_id is not None:
+            upgrade_note = f"自动生成 CVID {replaced_generated_id} 已合并到真实猫耳 CVID {int(cv_id)}"
+            current_notes = normalize(target.get("notes"))
+            if upgrade_note not in current_notes:
+                target["notes"] = f"{current_notes}；{upgrade_note}" if current_notes else upgrade_note
         combined_map[target_key] = target
         del combined_map[key]
         return MissevanCvMapUpsertResult("updated", replaced_generated_id)
@@ -530,6 +581,7 @@ def apply_missevan_intro_cv_fallback(
     resolved_entries: list[dict] = []
     unresolved_names: list[str] = []
     unresolved_roles: dict[str, str] = {}
+    resolved_source_name_keys: set[str] = set()
     changed_map = False
     replaced_generated_ids: set[int] = set()
     existing_main_entries = missevan_main_cv_entries(node)
@@ -543,51 +595,147 @@ def apply_missevan_intro_cv_fallback(
 
     for idx, candidate in enumerate(candidates):
         display_name = normalize(candidate.get("display_name"))
+        account_name = normalize(candidate.get("account_name"))
         role_name = normalize(candidate.get("role_name"))
         if not display_name:
             continue
         existing_matches = existing_by_name.get(normalize_match(display_name), [])
+        display_map_matches = _missevan_cv_entries_from_combined_map(display_name, active_map)
+        display_name_only_keys = _missevan_cv_name_only_keys_from_combined_map(display_name, active_map)
         matched_map_key: str | None = None
         if len(existing_matches) == 1:
             cv_id = int(existing_matches[0]["cv_id"])
             mapped_name = normalize(existing_matches[0]["display_name"])
-            matched_map_key, _mapped_id, _mapped_name = missevan_cv_entry_from_combined_map(display_name, active_map)
+            if len(display_map_matches) == 1:
+                matched_map_key = display_map_matches[0][0]
         else:
-            matched_map_key, cv_id, mapped_name = missevan_cv_entry_from_combined_map(display_name, active_map)
+            if len(display_map_matches) == 1:
+                matched_map_key, cv_id, mapped_name = display_map_matches[0]
+            elif not display_map_matches and len(display_name_only_keys) == 1:
+                matched_map_key = display_name_only_keys[0]
+                cv_id = None
+                mapped_name = normalize(
+                    (active_map.get(matched_map_key) or {}).get("displayName") or matched_map_key
+                )
+            else:
+                cv_id, mapped_name = None, ""
         final_name = mapped_name or display_name
-        upgrade_ambiguous = False
-        if (cv_id is None or is_generated_missevan_cvid(cv_id)) and search_func is not None:
-            found = search_func(display_name)
-            if found:
+        display_map_ambiguous = (
+            len(display_map_matches) > 1 or len(display_name_only_keys) > 1
+        ) and not (
+            len(existing_matches) == 1
+            and not is_generated_missevan_cvid(existing_matches[0]["cv_id"])
+        )
+        resolution_ambiguous = False
+
+        def report_ambiguity(detail: str) -> None:
+            nonlocal resolution_ambiguous
+            resolution_ambiguous = True
+            conflict = f"missevan:{display_name} account={account_name or '-'} {detail}"
+            if cv_upgrade_ambiguities is not None and conflict not in cv_upgrade_ambiguities:
+                cv_upgrade_ambiguities.append(conflict)
+
+        def accept_real_match(found_cv_id: int, found_name: str) -> None:
+            nonlocal cv_id, final_name, changed_map, resolution_ambiguous
+            previous_generated_id = int(cv_id) if is_generated_missevan_cvid(cv_id) else None
+            upsert_map = active_map if update_combined_map else dict(active_map)
+            upsert_result = upsert_missevan_cv_map_entry(
+                upsert_map,
+                found_name,
+                found_cv_id,
+                existing_key=matched_map_key,
+            )
+            if upsert_result.status == "ambiguous":
+                report_ambiguity(
+                    f"generated={cv_id} real={found_cv_id} "
+                    f"targets={','.join(upsert_result.conflicting_keys)}"
+                )
+                return
+            if update_combined_map:
+                replaced_id = upsert_result.replaced_generated_id or previous_generated_id
+                if replaced_id is not None:
+                    replaced_generated_ids.add(replaced_id)
+                    if generated_id_replacements is not None:
+                        generated_id_replacements[replaced_id] = found_cv_id
+                    for existing_entry in existing_main_entries:
+                        if existing_entry["cv_id"] == replaced_id:
+                            existing_entry["cv_id"] = found_cv_id
+                            existing_entry["display_name"] = found_name
+                changed_map = upsert_result.status == "updated" or changed_map
+            elif previous_generated_id is not None and previous_generated_id != found_cv_id:
+                replaced_generated_ids.add(previous_generated_id)
+                for existing_entry in existing_main_entries:
+                    if existing_entry["cv_id"] == previous_generated_id:
+                        existing_entry["cv_id"] = found_cv_id
+                        existing_entry["display_name"] = found_name
+            cv_id = found_cv_id
+            final_name = found_name
+            resolution_ambiguous = False
+
+        if display_map_ambiguous:
+            report_ambiguity("display name map has multiple targets")
+
+        if (
+            (cv_id is None or is_generated_missevan_cvid(cv_id))
+            and account_name
+            and not resolution_ambiguous
+        ):
+            account_matches = _missevan_cv_entries_from_combined_map(account_name, active_map)
+            if len(account_matches) > 1:
+                report_ambiguity("account map has multiple targets")
+            elif len(account_matches) == 1:
+                account_key, account_cv_id, account_display_name = account_matches[0]
+                if not is_generated_missevan_cvid(account_cv_id):
+                    accept_real_match(account_cv_id, account_display_name)
+                    if (
+                        not resolution_ambiguous
+                        and update_combined_map
+                        and matched_map_key is None
+                        and account_key in active_map
+                    ):
+                        target = dict(active_map[account_key])
+                        target_name = normalize(target.get("displayName") or account_key)
+                        aliases = [normalize(alias) for alias in (target.get("aliases") or []) if normalize(alias)]
+                        if (
+                            normalize_match(display_name) != normalize_match(target_name)
+                            and all(normalize_match(alias) != normalize_match(display_name) for alias in aliases)
+                        ):
+                            target["aliases"] = [*aliases, display_name]
+                            target["updatedAt"] = utc_now()
+                            active_map[account_key] = target
+                            changed_map = True
+
+        if (
+            (cv_id is None or is_generated_missevan_cvid(cv_id))
+            and not resolution_ambiguous
+            and search_func is not None
+        ):
+            found_by_id: dict[int, dict] = {}
+            search_names = list(
+                dict.fromkeys(
+                    name
+                    for name in (display_name, account_name)
+                    if name and normalize_match(name)
+                )
+            )
+            for search_name in search_names:
+                found = search_func(search_name)
+                if not found:
+                    continue
                 found_cv_id = int(found["cv_id"])
-                if update_combined_map:
-                    upsert_result = upsert_missevan_cv_map_entry(
-                        active_map,
-                        normalize(found.get("display_name") or display_name),
-                        found_cv_id,
-                        existing_key=matched_map_key,
-                    )
-                    if upsert_result.status == "ambiguous":
-                        upgrade_ambiguous = True
-                        conflict = (
-                            f"missevan:{display_name} generated={cv_id} real={found_cv_id} "
-                            f"targets={','.join(upsert_result.conflicting_keys)}"
-                        )
-                        if cv_upgrade_ambiguities is not None and conflict not in cv_upgrade_ambiguities:
-                            cv_upgrade_ambiguities.append(conflict)
-                    else:
-                        replaced_id = upsert_result.replaced_generated_id
-                        if replaced_id is not None:
-                            replaced_generated_ids.add(replaced_id)
-                            if generated_id_replacements is not None:
-                                generated_id_replacements[replaced_id] = found_cv_id
-                        changed_map = upsert_result.status == "updated" or changed_map
-                        cv_id = found_cv_id
-                        final_name = normalize(found.get("display_name") or display_name)
-                else:
-                    cv_id = found_cv_id
-                    final_name = normalize(found.get("display_name") or display_name)
-        if cv_id is None and not upgrade_ambiguous:
+                found_name = normalize(found.get("display_name") or search_name)
+                if normalize_match(found_name) != normalize_match(search_name):
+                    continue
+                existing_found = found_by_id.get(found_cv_id)
+                if existing_found is None:
+                    found_by_id[found_cv_id] = {"cv_id": found_cv_id, "display_name": found_name}
+            if len(found_by_id) > 1:
+                report_ambiguity(f"search returned conflicting ids={','.join(map(str, sorted(found_by_id)))}")
+            elif len(found_by_id) == 1:
+                found = next(iter(found_by_id.values()))
+                accept_real_match(int(found["cv_id"]), normalize(found["display_name"]))
+
+        if cv_id is None and not resolution_ambiguous:
             if update_combined_map and generated_cv_id_allocator is not None:
                 cv_id, created = ensure_generated_missevan_cv_entry(
                     active_map,
@@ -612,6 +760,11 @@ def apply_missevan_intro_cv_fallback(
                 "role_name": role_name,
                 "raw_role_name": role_name,
             }
+        )
+        resolved_source_name_keys.update(
+            name_key
+            for name_key in (normalize_match(display_name), normalize_match(final_name))
+            if name_key
         )
 
     limit = 4 if int(node.get("type") or 0) == 3 else 2
@@ -641,6 +794,7 @@ def apply_missevan_intro_cv_fallback(
             for entry in final_resolved_entries
             if normalize_match(entry["display_name"])
         }
+        resolved_name_keys.update(resolved_source_name_keys)
         merged_unresolved_names: list[str] = []
         merged_unresolved_roles: dict[str, str] = {}
         for entry in existing_main_entries:

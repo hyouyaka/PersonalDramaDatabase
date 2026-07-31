@@ -140,6 +140,27 @@ class GeneratedMissevanCvIdTests(unittest.TestCase):
         self.assertEqual(generated, 335214)
         self.assertEqual(upstash.call_count, 1)
 
+    def test_allocator_rejects_stale_name_mapping_to_occupied_id(self) -> None:
+        upstash = Mock(return_value=335214)
+        allocator = cvid_map_tools.UpstashGeneratedMissevanCvIdAllocator(
+            upstash=upstash,
+            randbelow=Mock(side_effect=[0, 0]),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "occupied ID 335214"):
+            allocator(
+                {
+                    "其他身份": {
+                        "cvId": 335214,
+                        "missevanCvId": 335214,
+                        "displayName": "其他身份",
+                    }
+                },
+                "旧注册名",
+            )
+
+        self.assertEqual(upstash.call_count, 1)
+
     def test_load_generated_replacements_ignores_other_registry_fields(self) -> None:
         upstash = Mock(
             return_value=[
@@ -192,6 +213,175 @@ class GeneratedMissevanCvIdTests(unittest.TestCase):
 
         self.assertEqual(saved["林风"]["missevanCvId"], 1234)
         self.assertEqual(stats["missevan_generated_replacements"], {331111: 1234})
+
+    def test_persisted_upgrade_merges_generated_key_into_existing_real_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            map_path = Path(tmp) / "map.json"
+            map_path.write_text(
+                json.dumps(
+                    {
+                        "心念": {
+                            "cvId": 337329,
+                            "missevanCvId": 337329,
+                            "manboCvId": None,
+                            "displayName": "心念",
+                            "aliases": [],
+                            "avatar": "",
+                        },
+                        "心念多个心": {
+                            "cvId": 3853,
+                            "missevanCvId": 3853,
+                            "manboCvId": 2948274737182,
+                            "displayName": "心念多个心",
+                            "aliases": [],
+                            "avatar": "real-avatar",
+                            "notes": "人工确认记录",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(cvid_map_tools, "COMBINED_CVID_MAP_PATH", map_path):
+                cvid_map_tools.update_combined_cvid_map(
+                    {},
+                    {"records": []},
+                    persistent_generated_replacements={337329: 3853},
+                )
+                saved = cvid_map_tools.load_json(map_path, {})
+
+        self.assertEqual(set(saved), {"心念多个心"})
+        self.assertEqual(saved["心念多个心"]["missevanCvId"], 3853)
+        self.assertEqual(saved["心念多个心"]["manboCvId"], 2948274737182)
+        self.assertEqual(saved["心念多个心"]["avatar"], "real-avatar")
+        self.assertIn("心念", saved["心念多个心"]["aliases"])
+        self.assertIn("人工确认记录", saved["心念多个心"]["notes"])
+        self.assertIn("自动生成 CVID 337329", saved["心念多个心"]["notes"])
+
+    def test_persisted_upgrade_preserves_conflicting_manbo_mappings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            map_path = Path(tmp) / "map.json"
+            original = {
+                "心念": {
+                    "cvId": 337329,
+                    "missevanCvId": 337329,
+                    "manboCvId": 111,
+                    "displayName": "心念",
+                    "aliases": [],
+                },
+                "心念多个心": {
+                    "cvId": 3853,
+                    "missevanCvId": 3853,
+                    "manboCvId": 222,
+                    "displayName": "心念多个心",
+                    "aliases": [],
+                },
+            }
+            map_path.write_text(json.dumps(original, ensure_ascii=False), encoding="utf-8")
+            with patch.object(cvid_map_tools, "COMBINED_CVID_MAP_PATH", map_path):
+                stats = cvid_map_tools.update_combined_cvid_map(
+                    {},
+                    {"records": []},
+                    persistent_generated_replacements={337329: 3853},
+                )
+                saved = cvid_map_tools.load_json(map_path, {})
+
+        self.assertEqual(saved, original)
+        self.assertEqual(stats["updated"], 0)
+        self.assertEqual(stats["ambiguous_count"], 1)
+        self.assertIn("manbo-conflict", stats["ambiguous_samples"][0])
+
+    def test_persisted_upgrade_retry_merges_already_converted_duplicate_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            map_path = Path(tmp) / "map.json"
+            map_path.write_text(
+                json.dumps(
+                    {
+                        "心念": {
+                            "cvId": 3853,
+                            "missevanCvId": 3853,
+                            "displayName": "心念",
+                            "aliases": [],
+                            "notes": "自动生成 CVID 337329 已升级为真实猫耳 CVID 3853",
+                        },
+                        "心念多个心": {
+                            "cvId": 3853,
+                            "missevanCvId": 3853,
+                            "displayName": "心念多个心",
+                            "aliases": [],
+                            "avatar": "real-avatar",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(cvid_map_tools, "COMBINED_CVID_MAP_PATH", map_path):
+                cvid_map_tools.update_combined_cvid_map(
+                    {},
+                    {"records": []},
+                    persistent_generated_replacements={337329: 3853},
+                )
+                saved = cvid_map_tools.load_json(map_path, {})
+
+        self.assertEqual(set(saved), {"心念多个心"})
+        self.assertIn("心念", saved["心念多个心"]["aliases"])
+
+    def test_completed_upgrade_is_idempotent_on_later_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            map_path = Path(tmp) / "map.json"
+            original = {
+                "心念多个心": {
+                    "cvId": 3853,
+                    "missevanCvId": 3853,
+                    "displayName": "心念多个心",
+                    "aliases": ["心念"],
+                    "notes": "人工确认记录；自动生成 CVID 337329 已合并到真实猫耳 CVID 3853",
+                }
+            }
+            map_path.write_text(json.dumps(original, ensure_ascii=False), encoding="utf-8")
+            with patch.object(cvid_map_tools, "COMBINED_CVID_MAP_PATH", map_path):
+                first = cvid_map_tools.update_combined_cvid_map(
+                    {},
+                    {"records": []},
+                    persistent_generated_replacements={337329: 3853},
+                )
+                after_first = cvid_map_tools.load_json(map_path, {})
+                second = cvid_map_tools.update_combined_cvid_map(
+                    {},
+                    {"records": []},
+                    persistent_generated_replacements={337329: 3853},
+                )
+                after_second = cvid_map_tools.load_json(map_path, {})
+
+        self.assertEqual(after_first, original)
+        self.assertEqual(after_second, original)
+        self.assertEqual(first["updated"], 0)
+        self.assertEqual(second["updated"], 0)
+
+    def test_converted_upgrade_without_duplicate_target_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            map_path = Path(tmp) / "map.json"
+            original = {
+                "旧账号名": {
+                    "cvId": 1234,
+                    "missevanCvId": 1234,
+                    "displayName": "正式名",
+                    "aliases": ["旧账号名"],
+                    "notes": "自动生成 CVID 331111 已升级为真实猫耳 CVID 1234",
+                }
+            }
+            map_path.write_text(json.dumps(original, ensure_ascii=False), encoding="utf-8")
+            with patch.object(cvid_map_tools, "COMBINED_CVID_MAP_PATH", map_path):
+                stats = cvid_map_tools.update_combined_cvid_map(
+                    {},
+                    {"records": []},
+                    persistent_generated_replacements={331111: 1234},
+                )
+                saved = cvid_map_tools.load_json(map_path, {})
+
+        self.assertEqual(saved, original)
+        self.assertEqual(stats["updated"], 0)
 
 
 class UpdateCombinedMapAvatarTests(unittest.TestCase):

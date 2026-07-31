@@ -66,6 +66,15 @@ def is_generated_missevan_cvid(value: object) -> bool:
     return GENERATED_MISSEVAN_CVID_MIN <= cv_id <= GENERATED_MISSEVAN_CVID_MAX
 
 
+def has_conflicting_manbo_cvid(left: object, right: object) -> bool:
+    if left in (None, "") or right in (None, ""):
+        return False
+    try:
+        return int(left) != int(right)
+    except (TypeError, ValueError):
+        return True
+
+
 def collect_generated_missevan_cvids(combined_map: dict, missevan_store: dict | None = None) -> set[int]:
     generated: set[int] = set()
     for payload in (combined_map or {}).values():
@@ -185,6 +194,16 @@ class UpstashGeneratedMissevanCvIdAllocator:
             )
             reserved_id = int(reserved or 0)
             if reserved_id != 0:
+                if not is_generated_missevan_cvid(reserved_id):
+                    raise RuntimeError(
+                        f"Generated Missevan CVID registry returned invalid ID {reserved_id} "
+                        f"for {normalize(display_name)}."
+                    )
+                if reserved_id in used:
+                    raise RuntimeError(
+                        f"Generated Missevan CVID registry returned occupied ID {reserved_id} "
+                        f"for {normalize(display_name)}."
+                    )
                 return reserved_id
         raise RuntimeError("Generated Missevan CVID range 330000-339999 is exhausted.")
 
@@ -459,15 +478,82 @@ def update_combined_cvid_map(
     for key, existing_payload in list(current.items()):
         payload = dict(existing_payload)
         existing_id = payload.get("missevanCvId") or payload.get("cvId")
-        if not is_generated_missevan_cvid(existing_id):
+        upgrade_source_id: int | None = int(existing_id) if is_generated_missevan_cvid(existing_id) else None
+        retry_converted_upgrade = False
+        if upgrade_source_id is None and existing_id not in (None, ""):
+            notes = normalize(payload.get("notes"))
+            matching_sources = [
+                int(old_id)
+                for old_id, replacement_id in generated_replacements.items()
+                if int(replacement_id) == int(existing_id)
+                and (
+                    f"自动生成 CVID {int(old_id)} 已升级为真实猫耳 CVID "
+                    f"{int(replacement_id)}"
+                )
+                in notes
+            ]
+            if len(matching_sources) == 1:
+                upgrade_source_id = matching_sources[0]
+                retry_converted_upgrade = True
+        if upgrade_source_id is None:
             continue
-        real_id = generated_replacements.get(int(existing_id))
+        real_id = generated_replacements.get(upgrade_source_id)
         if real_id is None:
+            continue
+        real_id_keys = [
+            str(candidate_key)
+            for candidate_key, candidate_payload in current.items()
+            if str(candidate_key) != str(key)
+            and (candidate_payload.get("missevanCvId") or candidate_payload.get("cvId")) not in (None, "")
+            and int(candidate_payload.get("missevanCvId") or candidate_payload.get("cvId")) == int(real_id)
+        ]
+        if len(real_id_keys) > 1:
+            ambiguous.append(f"猫耳:{key}:upgrade-targets={','.join(sorted(real_id_keys))}")
+            continue
+        if len(real_id_keys) == 1:
+            target_key = real_id_keys[0]
+            target = dict(current[target_key])
+            if has_conflicting_manbo_cvid(
+                target.get("manboCvId"),
+                payload.get("manboCvId"),
+            ):
+                ambiguous.append(
+                    f"猫耳:{key}:manbo-conflict={target_key}"
+                )
+                continue
+            target_name = normalize(target.get("displayName") or target_key)
+            aliases = [
+                *(target.get("aliases") or []),
+                *(payload.get("aliases") or []),
+                normalize(payload.get("displayName")),
+                normalize(key),
+            ]
+            target["aliases"] = list(
+                dict.fromkeys(
+                    normalize(alias)
+                    for alias in aliases
+                    if normalize(alias) and normalize_match(alias) != normalize_match(target_name)
+                )
+            )
+            if not target.get("avatar") and payload.get("avatar"):
+                target["avatar"] = payload.get("avatar")
+            if target.get("manboCvId") in (None, "") and payload.get("manboCvId") not in (None, ""):
+                target["manboCvId"] = payload.get("manboCvId")
+            target["updatedAt"] = now
+            upgrade_note = f"自动生成 CVID {upgrade_source_id} 已合并到真实猫耳 CVID {int(real_id)}"
+            current_notes = normalize(target.get("notes"))
+            if upgrade_note not in current_notes:
+                target["notes"] = f"{current_notes}；{upgrade_note}" if current_notes else upgrade_note
+            current[target_key] = target
+            del current[key]
+            updated += 1
+            continue
+        if retry_converted_upgrade:
             continue
         payload["cvId"] = int(real_id)
         payload["missevanCvId"] = int(real_id)
         payload["source"] = "observed"
-        payload["notes"] = f"自动生成 CVID {int(existing_id)} 已升级为真实猫耳 CVID {int(real_id)}"
+        payload["notes"] = f"自动生成 CVID {upgrade_source_id} 已升级为真实猫耳 CVID {int(real_id)}"
         payload["updatedAt"] = now
         current[key] = payload
         updated += 1

@@ -48,6 +48,7 @@ from upstash_editor import (
     find_list_item_by_identity,
     load_resource,
     save_resource,
+    utc_now_iso,
 )
 
 
@@ -1122,7 +1123,7 @@ class UpstashEditorPage(QWidget):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(12)
 
-        remote_box = QGroupBox("Upstash v2 权威数据")
+        remote_box = QGroupBox("Upstash 权威数据")
         remote_layout = QGridLayout(remote_box)
         self.key_box = QComboBox()
         self.key_box.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
@@ -1446,6 +1447,8 @@ class UpstashEditorPage(QWidget):
                     f"{collection.identity_field} 不可直接修改；请删除旧条目后新增。",
                 )
                 return False
+        if self.loaded and self.loaded.spec.kind == "cvid_map" and isinstance(new_item, dict):
+            new_item["updatedAt"] = utc_now_iso()
         collection.container[self.current_identity] = new_item
         self.dirty = True
         self.apply_button.setText("应用条目修改")
@@ -1470,6 +1473,18 @@ class UpstashEditorPage(QWidget):
                     QMessageBox.warning(self, "ID 无效", "dramaId 必须为 ASCII 数字。")
                     return
                 new_item: object = {"dramaId": int(identity), "title": ""}
+            elif self.loaded and self.loaded.spec.kind == "cvid_map":
+                new_item = {
+                    "cvId": None,
+                    "missevanCvId": None,
+                    "manboCvId": None,
+                    "displayName": identity,
+                    "aliases": [],
+                    "source": "manual",
+                    "updatedAt": utc_now_iso(),
+                    "notes": "",
+                    "avatar": "",
+                }
             elif self.loaded and self.loaded.spec.kind == "trend_normal":
                 new_item = {"version": 2, "id": identity, "name": identity, "samples": {}}
             elif self.loaded and self.loaded.spec.kind == "trend_peak":

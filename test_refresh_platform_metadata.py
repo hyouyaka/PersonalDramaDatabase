@@ -250,9 +250,13 @@ class MissevanCvMapEntryTests(unittest.TestCase):
                     "cvroles": {"331234": "角色"},
                 },
                 "drama-1",
-                [{"role_name": "角色", "display_name": "旧账号名"}],
+                [{"role_name": "角色", "display_name": "旧账号名", "account_name": "正式名"}],
                 combined_map=combined_map,
-                search_cv=Mock(return_value={"cv_id": 1234, "display_name": "正式名"}),
+                search_cv=Mock(
+                    side_effect=lambda name: (
+                        {"cv_id": 1234, "display_name": "正式名"} if name == "正式名" else None
+                    )
+                ),
                 generated_id_replacements=replacements,
             )
 
@@ -278,6 +282,7 @@ class MissevanCvMapEntryTests(unittest.TestCase):
                 "displayName": "正式名",
                 "aliases": [],
                 "avatar": "",
+                "notes": "人工确认记录",
             },
         }
         replacements: dict[int, int] = {}
@@ -290,9 +295,13 @@ class MissevanCvMapEntryTests(unittest.TestCase):
                     "cvroles": {"331234": "角色"},
                 },
                 "drama-1",
-                [{"role_name": "角色", "display_name": "旧账号名"}],
+                [{"role_name": "角色", "display_name": "旧账号名", "account_name": "正式名"}],
                 combined_map=combined_map,
-                search_cv=Mock(return_value={"cv_id": 1234, "display_name": "正式名"}),
+                search_cv=Mock(
+                    side_effect=lambda name: (
+                        {"cv_id": 1234, "display_name": "正式名"} if name == "正式名" else None
+                    )
+                ),
                 generated_id_replacements=replacements,
             )
 
@@ -301,8 +310,367 @@ class MissevanCvMapEntryTests(unittest.TestCase):
         self.assertEqual(combined_map["正式名"]["avatar"], "old-avatar")
         self.assertIn("旧账号名", combined_map["正式名"]["aliases"])
         self.assertIn("旧别名", combined_map["正式名"]["aliases"])
+        self.assertIn("人工确认记录", combined_map["正式名"]["notes"])
+        self.assertIn("自动生成 CVID 331234", combined_map["正式名"]["notes"])
         self.assertEqual(updated["maincvs"], [1234])
         self.assertEqual(replacements, {331234: 1234})
+
+    def test_account_name_merges_existing_name_only_record_into_real_record(self) -> None:
+        combined_map = {
+            "署名": {
+                "cvId": None,
+                "missevanCvId": None,
+                "displayName": "署名",
+                "aliases": [],
+            },
+            "账号": {
+                "cvId": 123,
+                "missevanCvId": 123,
+                "displayName": "账号",
+                "aliases": [],
+                "notes": "人工确认记录",
+            },
+        }
+
+        with patch.object(refresh_platform_metadata, "save_combined_map"):
+            updated = refresh_platform_metadata.apply_missevan_intro_cv_fallback(
+                {"type": 4, "maincvs": [], "cvnames": {}, "cvroles": {}},
+                "drama-1",
+                [{"role_name": "角色", "display_name": "署名", "account_name": "账号"}],
+                combined_map=combined_map,
+                search_cv=None,
+            )
+
+        self.assertEqual(set(combined_map), {"账号"})
+        self.assertIn("署名", combined_map["账号"]["aliases"])
+        self.assertEqual(combined_map["账号"]["notes"], "人工确认记录")
+        self.assertEqual(updated["maincvs"], [123])
+
+    def test_account_name_preserves_conflicting_manbo_mappings(self) -> None:
+        combined_map = {
+            "署名": {
+                "cvId": None,
+                "missevanCvId": None,
+                "manboCvId": 111,
+                "displayName": "署名",
+                "aliases": [],
+            },
+            "账号": {
+                "cvId": 123,
+                "missevanCvId": 123,
+                "manboCvId": 222,
+                "displayName": "账号",
+                "aliases": [],
+            },
+        }
+        ambiguities: list[str] = []
+
+        with patch.object(refresh_platform_metadata, "save_combined_map") as save_map:
+            updated = refresh_platform_metadata.apply_missevan_intro_cv_fallback(
+                {"type": 4, "maincvs": [], "cvnames": {}, "cvroles": {}},
+                "drama-1",
+                [{"role_name": "角色", "display_name": "署名", "account_name": "账号"}],
+                combined_map=combined_map,
+                search_cv=None,
+                cv_upgrade_ambiguities=ambiguities,
+            )
+
+        self.assertEqual(set(combined_map), {"署名", "账号"})
+        self.assertEqual(combined_map["署名"]["manboCvId"], 111)
+        self.assertEqual(combined_map["账号"]["manboCvId"], 222)
+        self.assertEqual(updated["fallbackCvNames"], ["署名"])
+        self.assertEqual(len(ambiguities), 1)
+        save_map.assert_not_called()
+
+    def test_account_name_conflict_is_preserved_without_map_updates(self) -> None:
+        combined_map = {
+            "署名": {
+                "cvId": None,
+                "missevanCvId": None,
+                "manboCvId": 111,
+                "displayName": "署名",
+                "aliases": [],
+            },
+            "账号": {
+                "cvId": 123,
+                "missevanCvId": 123,
+                "manboCvId": 222,
+                "displayName": "账号",
+                "aliases": [],
+            },
+        }
+        ambiguities: list[str] = []
+
+        updated = refresh_platform_metadata.apply_missevan_intro_cv_fallback(
+            {"type": 4, "maincvs": [], "cvnames": {}, "cvroles": {}},
+            "drama-1",
+            [{"role_name": "角色", "display_name": "署名", "account_name": "账号"}],
+            combined_map=combined_map,
+            search_cv=None,
+            update_combined_map=False,
+            cv_upgrade_ambiguities=ambiguities,
+        )
+
+        self.assertEqual(set(combined_map), {"署名", "账号"})
+        self.assertEqual(updated["fallbackCvNames"], ["署名"])
+        self.assertEqual(len(ambiguities), 1)
+
+    def test_account_resolution_removes_existing_fallback_alias(self) -> None:
+        combined_map = {
+            "署名": {
+                "cvId": None,
+                "missevanCvId": None,
+                "displayName": "署名",
+                "aliases": [],
+            },
+            "账号": {
+                "cvId": 123,
+                "missevanCvId": 123,
+                "displayName": "账号",
+                "aliases": [],
+            },
+        }
+        node = {
+            "type": 4,
+            "maincvs": [],
+            "cvnames": {},
+            "cvroles": {},
+            "fallbackCvNames": ["署名"],
+            "fallbackCvRoles": {"署名": "角色"},
+        }
+
+        with patch.object(refresh_platform_metadata, "save_combined_map"):
+            updated = refresh_platform_metadata.apply_missevan_intro_cv_fallback(
+                node,
+                "drama-1",
+                [{"role_name": "角色", "display_name": "署名", "account_name": "账号"}],
+                combined_map=combined_map,
+                search_cv=None,
+                existing_entries_first=True,
+            )
+
+        self.assertEqual(updated["maincvs"], [123])
+        self.assertNotIn("fallbackCvNames", updated)
+        self.assertNotIn("fallbackCvRoles", updated)
+        self.assertEqual(len(refresh_platform_metadata.missevan_main_cv_entries(updated)), 1)
+
+    def test_account_name_merges_generated_display_record_into_real_record(self) -> None:
+        combined_map = {
+            "心念": {
+                "cvId": 337329,
+                "missevanCvId": 337329,
+                "manboCvId": None,
+                "displayName": "心念",
+                "aliases": [],
+                "avatar": "",
+            },
+            "心念多个心": {
+                "cvId": 3853,
+                "missevanCvId": 3853,
+                "manboCvId": 2948274737182,
+                "displayName": "心念多个心",
+                "aliases": [],
+                "avatar": "real-avatar",
+            },
+        }
+        replacements: dict[int, int] = {}
+        search = Mock()
+
+        with patch.object(refresh_platform_metadata, "save_combined_map"):
+            updated = refresh_platform_metadata.apply_missevan_intro_cv_fallback(
+                {
+                    "type": 4,
+                    "maincvs": [337329, 3363],
+                    "cvnames": {"337329": "心念", "3363": "刘一鸣"},
+                    "cvroles": {"337329": "江也", "3363": "陆远之"},
+                },
+                "94915",
+                [{"role_name": "江也", "display_name": "心念", "account_name": "心念多个心"}],
+                combined_map=combined_map,
+                search_cv=search,
+                generated_id_replacements=replacements,
+                existing_entries_first=True,
+            )
+
+        self.assertEqual(set(combined_map), {"心念多个心"})
+        self.assertEqual(combined_map["心念多个心"]["missevanCvId"], 3853)
+        self.assertEqual(combined_map["心念多个心"]["manboCvId"], 2948274737182)
+        self.assertEqual(combined_map["心念多个心"]["avatar"], "real-avatar")
+        self.assertIn("心念", combined_map["心念多个心"]["aliases"])
+        self.assertEqual(updated["maincvs"], [3853, 3363])
+        self.assertEqual(replacements, {337329: 3853})
+        search.assert_not_called()
+
+    def test_account_resolution_migrates_stale_generated_drama_after_map_was_merged(self) -> None:
+        combined_map = {
+            "心念多个心": {
+                "cvId": 3853,
+                "missevanCvId": 3853,
+                "manboCvId": 2948274737182,
+                "displayName": "心念多个心",
+                "aliases": ["心念"],
+                "avatar": "real-avatar",
+            },
+        }
+        replacements: dict[int, int] = {}
+
+        with patch.object(refresh_platform_metadata, "save_combined_map"):
+            updated = refresh_platform_metadata.apply_missevan_intro_cv_fallback(
+                {
+                    "type": 4,
+                    "maincvs": [337329, 3363],
+                    "cvnames": {"337329": "心念", "3363": "刘一鸣"},
+                    "cvroles": {"337329": "江也", "3363": "陆远之"},
+                },
+                "94915",
+                [{"role_name": "江也", "display_name": "心念", "account_name": "心念多个心"}],
+                combined_map=combined_map,
+                search_cv=Mock(),
+                generated_id_replacements=replacements,
+                existing_entries_first=True,
+            )
+
+        self.assertEqual(updated["maincvs"], [3853, 3363])
+        self.assertEqual(replacements, {337329: 3853})
+
+    def test_existing_generated_entry_does_not_suppress_ambiguous_display_map(self) -> None:
+        combined_map = {
+            "署名甲": {
+                "cvId": 100,
+                "missevanCvId": 100,
+                "displayName": "署名甲",
+                "aliases": ["署名"],
+            },
+            "署名乙": {
+                "cvId": 200,
+                "missevanCvId": 200,
+                "displayName": "署名乙",
+                "aliases": ["署名", "账号"],
+            },
+        }
+        ambiguities: list[str] = []
+
+        updated = refresh_platform_metadata.apply_missevan_intro_cv_fallback(
+            {
+                "type": 4,
+                "maincvs": [337329],
+                "cvnames": {"337329": "署名"},
+                "cvroles": {"337329": "角色"},
+            },
+            "drama-1",
+            [{"role_name": "角色", "display_name": "署名", "account_name": "账号"}],
+            combined_map=combined_map,
+            search_cv=Mock(),
+            update_combined_map=False,
+            cv_upgrade_ambiguities=ambiguities,
+            existing_entries_first=True,
+        )
+
+        self.assertEqual(updated["maincvs"], [337329])
+        self.assertEqual(len(ambiguities), 1)
+        self.assertIn("display name map has multiple targets", ambiguities[0])
+
+    def test_existing_real_display_match_is_not_overridden_by_account(self) -> None:
+        combined_map = {
+            "刘一鸣": {
+                "cvId": 3363,
+                "missevanCvId": 3363,
+                "displayName": "刘一鸣",
+                "aliases": [],
+            },
+            "无关账号": {
+                "cvId": 999,
+                "missevanCvId": 999,
+                "displayName": "无关账号",
+                "aliases": [],
+            },
+        }
+        search = Mock()
+
+        updated = refresh_platform_metadata.apply_missevan_intro_cv_fallback(
+            {"type": 4, "maincvs": [], "cvnames": {}, "cvroles": {}},
+            "drama-1",
+            [{"role_name": "角色", "display_name": "刘一鸣", "account_name": "无关账号"}],
+            combined_map=combined_map,
+            search_cv=search,
+            update_combined_map=False,
+        )
+
+        self.assertEqual(updated["maincvs"], [3363])
+        search.assert_not_called()
+
+    def test_conflicting_display_and_account_search_results_fail_closed(self) -> None:
+        search = Mock(
+            side_effect=lambda name: {
+                "cv_id": 100 if name == "署名" else 200,
+                "display_name": name,
+            }
+        )
+        allocator = Mock()
+        ambiguities: list[str] = []
+
+        with patch.object(refresh_platform_metadata, "save_combined_map") as save_map:
+            updated = refresh_platform_metadata.apply_missevan_intro_cv_fallback(
+                {"type": 4, "maincvs": [], "cvnames": {}, "cvroles": {}},
+                "drama-1",
+                [{"role_name": "角色", "display_name": "署名", "account_name": "账号"}],
+                combined_map={},
+                search_cv=search,
+                generated_cv_id_allocator=allocator,
+                cv_upgrade_ambiguities=ambiguities,
+            )
+
+        self.assertEqual(updated["fallbackCvNames"], ["署名"])
+        self.assertEqual(len(ambiguities), 1)
+        allocator.assert_not_called()
+        save_map.assert_not_called()
+
+    def test_ambiguous_display_map_is_not_bypassed_by_account_match(self) -> None:
+        combined_map = {
+            "署名甲": {
+                "cvId": 100,
+                "missevanCvId": 100,
+                "displayName": "署名甲",
+                "aliases": ["署名"],
+            },
+            "署名乙": {
+                "cvId": 200,
+                "missevanCvId": 200,
+                "displayName": "署名乙",
+                "aliases": ["署名", "账号"],
+            },
+        }
+        ambiguities: list[str] = []
+
+        updated = refresh_platform_metadata.apply_missevan_intro_cv_fallback(
+            {"type": 4, "maincvs": [], "cvnames": {}, "cvroles": {}},
+            "drama-1",
+            [{"role_name": "角色", "display_name": "署名", "account_name": "账号"}],
+            combined_map=combined_map,
+            search_cv=Mock(),
+            update_combined_map=False,
+            cv_upgrade_ambiguities=ambiguities,
+        )
+
+        self.assertEqual(updated["fallbackCvNames"], ["署名"])
+        self.assertEqual(len(ambiguities), 1)
+        self.assertIn("display name map has multiple targets", ambiguities[0])
+
+    def test_non_exact_injected_search_result_is_rejected(self) -> None:
+        allocator = Mock()
+
+        updated = refresh_platform_metadata.apply_missevan_intro_cv_fallback(
+            {"type": 4, "maincvs": [], "cvnames": {}, "cvroles": {}},
+            "drama-1",
+            [{"role_name": "角色", "display_name": "心念"}],
+            combined_map={},
+            search_cv=Mock(return_value={"cv_id": 3853, "display_name": "心念多个心"}),
+            update_combined_map=False,
+            generated_cv_id_allocator=allocator,
+        )
+
+        self.assertEqual(updated["fallbackCvNames"], ["心念"])
+        allocator.assert_not_called()
 
     def test_generated_id_upgrade_with_multiple_real_targets_is_reported_and_preserved(self) -> None:
         combined_map = {
@@ -322,9 +690,13 @@ class MissevanCvMapEntryTests(unittest.TestCase):
                     "cvroles": {"331234": "角色"},
                 },
                 "drama-1",
-                [{"role_name": "角色", "display_name": "旧账号名"}],
+                [{"role_name": "角色", "display_name": "旧账号名", "account_name": "正式名"}],
                 combined_map=combined_map,
-                search_cv=Mock(return_value={"cv_id": 1234, "display_name": "正式名"}),
+                search_cv=Mock(
+                    side_effect=lambda name: (
+                        {"cv_id": 1234, "display_name": "正式名"} if name == "正式名" else None
+                    )
+                ),
                 generated_id_replacements=replacements,
                 cv_upgrade_ambiguities=ambiguities,
             )
@@ -410,6 +782,42 @@ class MissevanCvMapEntryTests(unittest.TestCase):
 
 
 class MissevanIntroCvCandidateTests(unittest.TestCase):
+    def test_extracts_social_account_and_truncates_following_text(self) -> None:
+        self.assertEqual(
+            refresh_platform_metadata.extract_missevan_intro_cv_identity("心念@心念多个心 其他内容"),
+            ("心念", "心念多个心"),
+        )
+
+    def test_search_requires_one_exact_normalized_name(self) -> None:
+        requester = Mock()
+        requester.request_json.return_value = {
+            "info": {
+                "Datas": [
+                    {"id": 3853, "name": "心念多个心"},
+                    {"id": 1417, "name": "彭尧"},
+                    {"id": 2975, "name": "家康"},
+                ]
+            }
+        }
+
+        self.assertIsNone(refresh_platform_metadata.search_missevan_cv("心念", requester))
+
+    def test_search_accepts_exact_name_among_other_results(self) -> None:
+        requester = Mock()
+        requester.request_json.return_value = {
+            "info": {
+                "Datas": [
+                    {"id": 3853, "name": "心念多个心"},
+                    {"id": 1417, "name": "彭尧"},
+                ]
+            }
+        }
+
+        self.assertEqual(
+            refresh_platform_metadata.search_missevan_cv("心念多个心", requester),
+            {"cv_id": 3853, "display_name": "心念多个心"},
+        )
+
     def test_filters_all_production_role_keywords_and_compounds(self) -> None:
         roles = [
             "配音团队", "配音导演", "声音导演", "导演", "录音", "录音棚", "录音师", "录制",
@@ -439,8 +847,8 @@ class MissevanIntroCvCandidateTests(unittest.TestCase):
         self.assertEqual(
             candidates,
             [
-                {"role_name": "温然/李述", "display_name": "孙路路"},
-                {"role_name": "顾昀迟", "display_name": "张福正"},
+                {"role_name": "温然/李述", "display_name": "孙路路", "account_name": "孙路路729"},
+                {"role_name": "顾昀迟", "display_name": "张福正", "account_name": "歪歪福正了"},
             ],
         )
 
@@ -458,7 +866,7 @@ class MissevanIntroCvCandidateTests(unittest.TestCase):
                 self.assertEqual(
                     candidates,
                     [
-                        {"role_name": "角色甲", "display_name": "甲声优"},
+                        {"role_name": "角色甲", "display_name": "甲声优", "account_name": "alias"},
                         {"role_name": "角色乙", "display_name": "乙声优"},
                     ],
                 )
@@ -478,8 +886,8 @@ class MissevanIntroCvCandidateTests(unittest.TestCase):
         self.assertEqual(
             candidates,
             [
-                {"role_name": "张沉", "display_name": "孙睿扬"},
-                {"role_name": "程声", "display_name": "云惟一"},
+                {"role_name": "张沉", "display_name": "孙睿扬", "account_name": "Sun睿扬"},
+                {"role_name": "程声", "display_name": "云惟一", "account_name": "-云惟一"},
             ],
         )
 
@@ -498,8 +906,8 @@ class MissevanIntroCvCandidateTests(unittest.TestCase):
         self.assertEqual(
             candidates,
             [
-                {"role_name": "谢岫", "display_name": "吴晛"},
-                {"role_name": "霍无归", "display_name": "云惟一"},
+                {"role_name": "谢岫", "display_name": "吴晛", "account_name": "吴晛Hsien"},
+                {"role_name": "霍无归", "display_name": "云惟一", "account_name": "-云惟一"},
             ],
         )
 
@@ -532,8 +940,8 @@ class MissevanIntroCvCandidateTests(unittest.TestCase):
         self.assertEqual(
             candidates,
             [
-                {"role_name": "刑鸣", "display_name": "路知行"},
-                {"role_name": "虞仲夜", "display_name": "郑希"},
+                {"role_name": "刑鸣", "display_name": "路知行", "account_name": "路知知"},
+                {"role_name": "虞仲夜", "display_name": "郑希", "account_name": "96度希"},
             ],
         )
 
@@ -606,7 +1014,7 @@ class MissevanBatchIntroTests(unittest.TestCase):
             candidates,
             [
                 {"role_name": "萧华雍", "display_name": "柯暮卿"},
-                {"role_name": "沈羲和", "display_name": "醋醋"},
+                {"role_name": "沈羲和", "display_name": "醋醋", "account_name": "醋醋cucu"},
             ],
         )
 

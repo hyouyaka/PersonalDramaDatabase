@@ -235,6 +235,208 @@ class UpstashEditorTests(unittest.TestCase):
 
         self.assertNotIn("missevan:info:v1", fake.strings)
 
+    def test_cvid_map_save_updates_body_and_meta_atomically(self) -> None:
+        fake = FakeUpstash()
+        source = {
+            f"CV {index}": {
+                "cvId": index,
+                "missevanCvId": index,
+                "manboCvId": None,
+                "displayName": f"CV {index}",
+                "aliases": [],
+            }
+            for index in range(1, 51)
+        }
+        fake.strings[upstash_editor.CVID_MAP_KEY] = upstash_editor.compact_json(source)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            loaded = upstash_editor.load_resource(
+                upstash_editor.CVID_MAP_KEY,
+                upstash=fake,
+                backup_root=Path(temp_dir),
+            )
+        source["CV 1"]["aliases"] = ["一号"]
+
+        with patch.object(upstash_editor, "_write_local_mirrors"):
+            result = upstash_editor.save_resource(
+                loaded,
+                source,
+                upstash=fake,
+                now=lambda: "2026-07-30T12:00:00+00:00",
+            )
+
+        self.assertEqual(
+            json.loads(fake.strings[upstash_editor.CVID_MAP_KEY])["CV 1"]["aliases"],
+            ["一号"],
+        )
+        meta = json.loads(fake.strings[upstash_editor.CVID_MAP_META_KEY])
+        self.assertEqual(meta["schemaVersion"], 1)
+        self.assertEqual(meta["dataKey"], upstash_editor.CVID_MAP_KEY)
+        self.assertEqual(meta["recordCount"], 50)
+        self.assertEqual(meta["contentSha1"], result.content_sha1)
+
+    def test_cvid_map_load_reports_record_count_mismatch(self) -> None:
+        fake = FakeUpstash()
+        source = {
+            f"CV {index}": {"displayName": f"CV {index}", "aliases": []}
+            for index in range(1, 51)
+        }
+        encoded = upstash_editor.compact_json(source)
+        fake.strings[upstash_editor.CVID_MAP_KEY] = encoded
+        fake.strings[upstash_editor.CVID_MAP_META_KEY] = upstash_editor.compact_json(
+            {
+                "schemaVersion": 1,
+                "dataKey": upstash_editor.CVID_MAP_KEY,
+                "contentSha1": upstash_editor.sha1_text(encoded),
+                "updatedAt": "2026-07-30T12:00:00+00:00",
+                "recordCount": 49,
+                "bytes": len(encoded.encode("utf-8")),
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            loaded = upstash_editor.load_resource(
+                upstash_editor.CVID_MAP_KEY,
+                upstash=fake,
+                backup_root=Path(temp_dir),
+            )
+
+        self.assertEqual(loaded.meta_status, "JSON Meta 摘要不匹配")
+
+    def test_cvid_map_collection_uses_record_key_as_edit_identity(self) -> None:
+        spec = upstash_editor.RESOURCE_SPECS[upstash_editor.CVID_MAP_KEY]
+        payload = {"旧键": {"displayName": "可编辑显示名", "aliases": []}}
+
+        collection = upstash_editor.collection_refs(spec, payload)[0]
+
+        self.assertIsNone(collection.identity_field)
+        self.assertIs(collection.container, payload)
+
+    def test_cvid_map_allows_display_name_to_differ_from_record_key(self) -> None:
+        spec = upstash_editor.RESOURCE_SPECS[upstash_editor.CVID_MAP_KEY]
+        payload = {
+            f"CV {index}": {
+                "displayName": "正式名" if index == 1 else f"CV {index}",
+                "aliases": [],
+            }
+            for index in range(1, 51)
+        }
+
+        upstash_editor.validate_payload(spec, payload)
+
+    def test_cvid_map_rejects_empty_display_name(self) -> None:
+        spec = upstash_editor.RESOURCE_SPECS[upstash_editor.CVID_MAP_KEY]
+        payload = {
+            f"CV {index}": {
+                "displayName": "" if index == 1 else f"CV {index}",
+                "aliases": [],
+            }
+            for index in range(1, 51)
+        }
+
+        with self.assertRaisesRegex(ValueError, "displayName must not be empty"):
+            upstash_editor.validate_payload(spec, payload)
+
+    def test_cvid_map_rejects_mismatched_missevan_id_fields(self) -> None:
+        spec = upstash_editor.RESOURCE_SPECS[upstash_editor.CVID_MAP_KEY]
+        payload = {
+            f"CV {index}": {
+                "cvId": index,
+                "missevanCvId": 999 if index == 1 else index,
+                "manboCvId": None,
+                "displayName": f"CV {index}",
+                "aliases": [],
+            }
+            for index in range(1, 51)
+        }
+
+        with self.assertRaisesRegex(ValueError, "cvId and missevanCvId must match"):
+            upstash_editor.validate_payload(spec, payload)
+
+    def test_cvid_map_rejects_duplicate_missevan_id(self) -> None:
+        spec = upstash_editor.RESOURCE_SPECS[upstash_editor.CVID_MAP_KEY]
+        payload = {
+            f"CV {index}": {
+                "cvId": 1 if index == 2 else index,
+                "missevanCvId": 1 if index == 2 else index,
+                "manboCvId": None,
+                "displayName": f"CV {index}",
+                "aliases": [],
+            }
+            for index in range(1, 51)
+        }
+
+        with self.assertRaisesRegex(ValueError, "Duplicate missevan CVID 1"):
+            upstash_editor.validate_payload(spec, payload)
+
+    def test_cvid_map_rejects_duplicate_manbo_id(self) -> None:
+        spec = upstash_editor.RESOURCE_SPECS[upstash_editor.CVID_MAP_KEY]
+        payload = {
+            f"CV {index}": {
+                "cvId": index,
+                "missevanCvId": index,
+                "manboCvId": 101 if index in (1, 2) else None,
+                "displayName": f"CV {index}",
+                "aliases": [],
+            }
+            for index in range(1, 51)
+        }
+
+        with self.assertRaisesRegex(ValueError, "Duplicate manbo CVID 101"):
+            upstash_editor.validate_payload(spec, payload)
+
+    def test_cvid_map_editor_rejects_generated_identity_changes(self) -> None:
+        original = {
+            f"CV {index}": {
+                "cvId": 330001 if index == 1 else index,
+                "missevanCvId": 330001 if index == 1 else index,
+                "manboCvId": None,
+                "displayName": f"CV {index}",
+                "aliases": [],
+            }
+            for index in range(1, 52)
+        }
+
+        def assert_rejected(mutator) -> None:
+            fake = FakeUpstash()
+            source = json.loads(json.dumps(original))
+            fake.strings[upstash_editor.CVID_MAP_KEY] = upstash_editor.compact_json(source)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                loaded = upstash_editor.load_resource(
+                    upstash_editor.CVID_MAP_KEY,
+                    upstash=fake,
+                    backup_root=Path(temp_dir),
+                )
+            mutator(source)
+            with (
+                patch.object(upstash_editor, "_write_local_mirrors"),
+                self.assertRaisesRegex(ValueError, "registry-managed"),
+            ):
+                upstash_editor.save_resource(loaded, source, upstash=fake)
+
+        with self.subTest("display name"):
+            assert_rejected(lambda source: source["CV 1"].__setitem__("displayName", "新名字"))
+        with self.subTest("generated ID"):
+            assert_rejected(
+                lambda source: source["CV 1"].update(
+                    {"cvId": 50001, "missevanCvId": 50001}
+                )
+            )
+        with self.subTest("delete"):
+            assert_rejected(lambda source: source.pop("CV 1"))
+        with self.subTest("add"):
+            assert_rejected(
+                lambda source: source.__setitem__(
+                    "新增生成身份",
+                    {
+                        "cvId": 330002,
+                        "missevanCvId": 330002,
+                        "manboCvId": None,
+                        "displayName": "新增生成身份",
+                        "aliases": [],
+                    },
+                )
+            )
+
     def test_string_conflict_does_not_write_payload_or_meta(self) -> None:
         fake = FakeUpstash()
         source = build_missevan_info()
