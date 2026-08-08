@@ -21,6 +21,7 @@ from platform_sync import (
     MANBO_CATALOG_NAME_ALIASES,
     MANBO_CATALOG_NAME_BY_ID,
     MANBO_CATALOG_OVERRIDES,
+    MANBO_COVER_FIELDS,
     MANBO_COUNTS_PATH,
     MANBO_INFO_PATH,
     MERGED_PATH,
@@ -62,7 +63,6 @@ from platform_sync import (
 
 MISSEVAN_BLOCKLIST = {"47639", "25812"}
 MISSEVAN_ARCHIVED_INFO_PATH = MISSEVAN_INFO_PATH.with_name("missevan-archived-drama.json")
-MANBO_COVER_FIELDS = ("coverPic", "largePic", "cover", "sharePicUrl")
 MISSEVAN_INTRO_CV_SECTION_PATTERN = re.compile(
     r"^(?:[^A-Za-z0-9\u4e00-\u9fff]{0,20})?(?:配音组|配音|CAST|CV)(?:[^A-Za-z0-9\u4e00-\u9fff]{0,20})?$",
     re.I,

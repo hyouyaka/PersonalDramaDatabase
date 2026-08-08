@@ -529,7 +529,13 @@ class InfoRefreshTests(unittest.TestCase):
         requester.request_json.side_effect = [
             {
                 "info": {
-                    "drama": {"name": "已完成", "view_count": 10, "pay_type": 2, "price": 199},
+                    "drama": {
+                        "name": "已完成",
+                        "cover": "https://cover.test/missevan-completed.jpg",
+                        "view_count": 10,
+                        "pay_type": 2,
+                        "price": 199,
+                    },
                     "episodes": {"episode": [{"sound_id": "2001"}]},
                 }
             },
@@ -551,11 +557,18 @@ class InfoRefreshTests(unittest.TestCase):
         self.assertEqual(caught.exception.stats["processed"], 1)
         self.assertEqual(
             caught.exception.stats["info_observations"],
-            {"100": {"needpay": True, "soundIds": ["2001"]}},
+            {
+                "100": {
+                    "needpay": True,
+                    "cover": "https://cover.test/missevan-completed.jpg",
+                    "soundIds": ["2001"],
+                }
+            },
         )
+        self.assertEqual(store["100"]["cover"], "https://cover.test/missevan-completed.jpg")
         self.assertEqual(store["100"]["soundIds"], ["2001"])
 
-    def test_missevan_watchcount_request_also_collects_pricing_and_sound_ids(self) -> None:
+    def test_missevan_watchcount_request_also_collects_cover_pricing_and_sound_ids(self) -> None:
         store = {
             "100": {
                 "dramaId": 100,
@@ -568,7 +581,14 @@ class InfoRefreshTests(unittest.TestCase):
         requester = Mock()
         requester.request_json.return_value = {
             "info": {
-                "drama": {"name": "测试", "view_count": 10, "pay_type": 2, "price": 199, "vip": 1},
+                "drama": {
+                    "name": "测试",
+                    "cover": "https://cover.test/missevan-new.jpg",
+                    "view_count": 10,
+                    "pay_type": 2,
+                    "price": 199,
+                    "vip": 1,
+                },
                 "episodes": {
                     "episode": [
                         {"sound_id": "2002"},
@@ -593,8 +613,16 @@ class InfoRefreshTests(unittest.TestCase):
         requester.request_json.assert_called_once()
         self.assertEqual(
             stats["info_observations"],
-            {"100": {"needpay": True, "is_member": True, "soundIds": ["2002", "2001"]}},
+            {
+                "100": {
+                    "needpay": True,
+                    "is_member": True,
+                    "cover": "https://cover.test/missevan-new.jpg",
+                    "soundIds": ["2002", "2001"],
+                }
+            },
         )
+        self.assertEqual(store["100"]["cover"], "https://cover.test/missevan-new.jpg")
         self.assertEqual(store["100"]["soundIds"], ["2002", "2001"])
         self.assertEqual(stats["pricing_checked"], 1)
 
@@ -624,7 +652,7 @@ class InfoRefreshTests(unittest.TestCase):
                 self.assertEqual(store["100"]["soundIds"], ["old"])
                 self.assertNotIn("soundIds", stats["info_observations"]["100"])
 
-    def test_manbo_watchcount_request_also_collects_pricing_and_sound_ids(self) -> None:
+    def test_manbo_watchcount_request_also_collects_cover_pricing_and_sound_ids(self) -> None:
         record = {
             "dramaId": "200",
             "name": "漫播测试",
@@ -636,6 +664,9 @@ class InfoRefreshTests(unittest.TestCase):
         payload = {
             "data": {
                 "title": "漫播测试",
+                "coverPic": "",
+                "largePic": "https://cover.test/manbo-new.jpg",
+                "cover": "https://cover.test/manbo-fallback.jpg",
                 "watchCount": 20,
                 "price": 1990,
                 "memberPrice": 1592,
@@ -661,9 +692,84 @@ class InfoRefreshTests(unittest.TestCase):
         request_json.assert_called_once()
         self.assertEqual(
             stats["info_observations"],
-            {"200": {"needpay": True, "vipFree": 1, "soundIds": ["3002", "3001"]}},
+            {
+                "200": {
+                    "needpay": True,
+                    "vipFree": 1,
+                    "cover": "https://cover.test/manbo-new.jpg",
+                    "soundIds": ["3002", "3001"],
+                }
+            },
         )
+        self.assertEqual(record["cover"], "https://cover.test/manbo-new.jpg")
         self.assertEqual(record["soundIds"], ["3002", "3001"])
+
+    def test_missing_or_empty_cover_preserves_existing_cover_without_extra_requests(self) -> None:
+        missevan_store = {
+            "100": {
+                "dramaId": 100,
+                "title": "测试",
+                "cover": "https://cover.test/old-missevan.jpg",
+            }
+        }
+        requester = Mock()
+        requester.request_json.return_value = {
+            "info": {
+                "drama": {
+                    "name": "测试",
+                    "cover": "",
+                    "view_count": 10,
+                    "pay_type": 0,
+                    "price": 0,
+                }
+            }
+        }
+        requester.request_count = 1
+        requester.last_backoff_seconds = 0
+        with (
+            patch.object(refresh_watch_counts, "load_json", return_value=missevan_store),
+            patch.object(refresh_watch_counts, "load_cache", return_value={"_meta": {}, "counts": {}}),
+            patch.object(refresh_watch_counts, "MissevanRequester", return_value=requester),
+            patch.object(refresh_watch_counts, "save_cache"),
+            patch.object(refresh_watch_counts, "save_missevan_store"),
+        ):
+            missevan_stats = refresh_watch_counts.refresh_missevan_watch_counts()
+
+        manbo_record = {
+            "dramaId": "200",
+            "name": "漫播测试",
+            "cover": "https://cover.test/old-manbo.jpg",
+        }
+        manbo_store = {"records": [manbo_record]}
+        manbo_payload = {
+            "data": {
+                "title": "漫播测试",
+                "coverPic": "",
+                "largePic": None,
+                "cover": " ",
+                "sharePicUrl": "",
+                "watchCount": 20,
+                "price": 0,
+                "memberPrice": 0,
+                "vipFree": 0,
+                "setRespList": [{}],
+            }
+        }
+        with (
+            patch.object(refresh_watch_counts, "load_json", return_value=manbo_store),
+            patch.object(refresh_watch_counts, "load_cache", return_value={"_meta": {}, "counts": {}}),
+            patch.object(refresh_watch_counts, "request_manbo_json", return_value=manbo_payload) as request_json,
+            patch.object(refresh_watch_counts, "save_cache"),
+            patch.object(refresh_watch_counts, "save_json"),
+        ):
+            manbo_stats = refresh_watch_counts.refresh_manbo_watch_counts()
+
+        requester.request_json.assert_called_once()
+        request_json.assert_called_once()
+        self.assertEqual(missevan_store["100"]["cover"], "https://cover.test/old-missevan.jpg")
+        self.assertNotIn("cover", missevan_stats["info_observations"]["100"])
+        self.assertEqual(manbo_record["cover"], "https://cover.test/old-manbo.jpg")
+        self.assertNotIn("cover", manbo_stats["info_observations"]["200"])
 
     def test_manbo_missing_or_empty_sets_preserve_existing_sound_ids(self) -> None:
         for sets in (None, [], [{"id": ""}, {}]):
@@ -757,14 +863,24 @@ class InfoRefreshTests(unittest.TestCase):
             refresh_watch_counts, "MISSEVAN_INFO_PATH", Path(tmp) / "missevan.json"
         ):
             stats = refresh_watch_counts.publish_info_observations(
-                "missevan", {"100": {"needpay": True, "soundIds": ["2002", "2001"]}}, upstash=fake_upstash
+                "missevan",
+                {
+                    "100": {
+                        "needpay": True,
+                        "cover": "https://cover.test/missevan-remote.jpg",
+                        "soundIds": ["2002", "2001"],
+                    }
+                },
+                upstash=fake_upstash,
             )
             saved = json.loads((Path(tmp) / "missevan.json").read_text(encoding="utf-8"))
 
         self.assertEqual(stats["free_to_paid"], 1)
         self.assertEqual(stats["sound_ids_changed"], 1)
+        self.assertEqual(stats["cover_changed"], 1)
         self.assertEqual(saved["100"]["title"], "并发新标题")
         self.assertTrue(saved["100"]["needpay"])
+        self.assertEqual(saved["100"]["cover"], "https://cover.test/missevan-remote.jpg")
         self.assertEqual(saved["100"]["soundIds"], ["2002", "2001"])
         self.assertEqual([command[0] for command in commands[:4]], ["GET", "EVAL", "GET", "EVAL"])
         self.assertEqual(
@@ -772,7 +888,7 @@ class InfoRefreshTests(unittest.TestCase):
             ["missevan:info:v2", "missevan:info:meta:v2", "missevan:info:v1"],
         )
 
-    def test_remote_info_patch_updates_manbo_sound_ids(self) -> None:
+    def test_remote_info_patch_updates_manbo_cover_and_sound_ids(self) -> None:
         remote = json.dumps(
             {"records": [{"dramaId": "200", "name": "并发标题", "needpay": False, "soundIds": ["old"]}]},
             ensure_ascii=False,
@@ -798,7 +914,14 @@ class InfoRefreshTests(unittest.TestCase):
         ):
             stats = refresh_watch_counts.publish_info_observations(
                 "manbo",
-                {"200": {"needpay": True, "vipFree": 1, "soundIds": ["3002", "3001"]}},
+                {
+                    "200": {
+                        "needpay": True,
+                        "vipFree": 1,
+                        "cover": "https://cover.test/manbo-remote.jpg",
+                        "soundIds": ["3002", "3001"],
+                    }
+                },
                 upstash=fake_upstash,
             )
             saved = json.loads((Path(tmp) / "manbo.json").read_text(encoding="utf-8"))
@@ -806,7 +929,9 @@ class InfoRefreshTests(unittest.TestCase):
         self.assertEqual(stats["free_to_paid"], 1)
         self.assertEqual(stats["membership_changed"], 1)
         self.assertEqual(stats["sound_ids_changed"], 1)
+        self.assertEqual(stats["cover_changed"], 1)
         self.assertEqual(saved["records"][0]["name"], "并发标题")
+        self.assertEqual(saved["records"][0]["cover"], "https://cover.test/manbo-remote.jpg")
         self.assertEqual(saved["records"][0]["soundIds"], ["3002", "3001"])
         self.assertEqual([command[0] for command in commands[:2]], ["GET", "EVAL"])
         self.assertEqual(

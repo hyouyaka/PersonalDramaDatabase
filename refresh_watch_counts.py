@@ -19,6 +19,7 @@ from archive_manager import (
 from clean_manbo_pricing import MANBO_PRICING_EXCLUSIONS, classify_manbo_pricing
 from platform_sync import (
     MANBO_COUNTS_PATH,
+    MANBO_COVER_FIELDS,
     MANBO_INFO_PATH,
     MISSEVAN_COUNTS_PATH,
     MISSEVAN_INFO_PATH,
@@ -122,6 +123,7 @@ def _apply_info_observations(platform: str, store: dict, observations: dict[str,
         "paid_to_free": 0,
         "membership_changed": 0,
         "sound_ids_changed": 0,
+        "cover_changed": 0,
     }
     if platform == "missevan":
         records = {
@@ -155,6 +157,8 @@ def _apply_info_observations(platform: str, store: dict, observations: dict[str,
                 stats["membership_changed"] += 1
             elif field == "soundIds":
                 stats["sound_ids_changed"] += 1
+            elif field == "cover":
+                stats["cover_changed"] += 1
             record[field] = value
             record_changed = True
         if record_changed:
@@ -176,6 +180,7 @@ def publish_info_observations(
             "paid_to_free": 0,
             "membership_changed": 0,
             "sound_ids_changed": 0,
+            "cover_changed": 0,
         }
     key = MISSEVAN_INFO_KEY if platform == "missevan" else MANBO_INFO_KEY
     path = MISSEVAN_INFO_PATH if platform == "missevan" else MANBO_INFO_PATH
@@ -389,6 +394,9 @@ def refresh_missevan_watch_counts(*, target_ids: set[str] | None = None) -> dict
         drama = info.get("drama") or {}
         pricing_fields, pricing_complete = missevan_pricing_observation(drama)
         info_fields = dict(pricing_fields)
+        cover = normalize(drama.get("cover"))
+        if cover:
+            info_fields["cover"] = cover
         sound_ids = all_sound_ids(info)
         if sound_ids:
             info_fields["soundIds"] = sound_ids
@@ -493,6 +501,12 @@ def refresh_manbo_watch_counts(*, target_ids: set[str] | None = None) -> dict:
         data = payload.get("data") or {}
         pricing_fields, pricing_complete = manbo_pricing_observation(drama_id, payload)
         info_fields = dict(pricing_fields)
+        cover = next(
+            (normalize(data.get(field)) for field in MANBO_COVER_FIELDS if normalize(data.get(field))),
+            "",
+        )
+        if cover:
+            info_fields["cover"] = cover
         sound_ids = manbo_sound_ids(payload)
         if sound_ids:
             info_fields["soundIds"] = sound_ids
@@ -581,6 +595,7 @@ def print_info_publish_stats(platform: str, stats: dict) -> None:
     print(f"{platform} pricing paid->free:", stats.get("paid_to_free", 0))
     print(f"{platform} membership changed:", stats.get("membership_changed", 0))
     print(f"{platform} soundIds changed:", stats.get("sound_ids_changed", 0))
+    print(f"{platform} cover changed:", stats.get("cover_changed", 0))
 
 
 def publish_refresh_results(platforms: list[str] | tuple[str, ...], refresh_results: dict[str, dict]) -> None:

@@ -127,7 +127,7 @@ python append_manbo_ids.py 2067945724439429338 2118896513449984153
 用途：
 
 - 更新双平台 watchcount 缓存
-- 复用详情响应更新 info 中的付费、会员和 `soundIds`
+- 复用详情响应更新 info 中的封面、付费、会员和 `soundIds`
 - 对确认下架的剧目执行 info/watchcount 归档
 - 不更新 SQLite
 
