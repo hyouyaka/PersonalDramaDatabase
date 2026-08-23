@@ -11,6 +11,7 @@ from platform_sync import (
     MissevanRequester,
     iter_missevan_nodes,
     load_json,
+    manbo_has_unknown_main_cv,
     missevan_main_cv_entries,
     normalize,
     normalize_match,
@@ -438,6 +439,8 @@ def collect_observed_cvs(
         if missevan_drama_ids is not None and drama_id not in missevan_drama_ids:
             continue
         for entry in missevan_main_cv_entries(node):
+            if entry.get("unknown"):
+                continue
             cv_id = entry["cv_id"]
             raw_name = normalize(entry["display_name"])
             aliases = _nickname_variants(raw_name)
@@ -445,6 +448,8 @@ def collect_observed_cvs(
     for record in (manbo_store.get("records") or []):
         drama_id = str(record.get("dramaId") or "").strip()
         if manbo_drama_ids is not None and drama_id not in manbo_drama_ids:
+            continue
+        if manbo_has_unknown_main_cv(record):
             continue
         ids = record.get("mainCvIds") or []
         names = record.get("mainCvNicknames") or []

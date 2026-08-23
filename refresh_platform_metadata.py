@@ -29,6 +29,7 @@ from platform_sync import (
     MISSEVAN_COUNTS_PATH,
     MISSEVAN_INFO_PATH,
     SQLITE_PATH,
+    UNKNOWN_MAIN_CV_MARKER,
     all_sound_ids,
     build_manbo_cv_entries,
     build_missevan_main_cv_entries,
@@ -43,6 +44,8 @@ from platform_sync import (
     load_cache,
     load_json,
     missevan_main_cv_entries,
+    missevan_has_unknown_main_cv,
+    manbo_has_unknown_main_cv,
     normalize,
     normalize_match,
     pick_first_episode_month,
@@ -167,6 +170,23 @@ MISSEVAN_MAINCV_OVERRIDES = {
             1122: {"display_name": "倔强的小红", "role_name": "赵高"},
         },
     },  # 哑舍 第五册
+    "95220": {
+        "ids": [1159, 1070],  # 穿到包养文里搞事业：X杰 / 八千里路
+        "extras": {
+            1159: {"display_name": "X杰", "role_name": "岑越"},
+            1070: {"display_name": "八千里路", "role_name": "时鄞"},
+        },
+    },
+}
+MISSEVAN_RECORD_FIELD_OVERRIDES = {
+    "95512": {  # 守望青绿：平台没有主役信息
+        "author": "中共重庆市委宣传部",
+        "maincvs": [],
+        "cvroles": {},
+        "cvnames": {},
+        "fallbackCvNames": [UNKNOWN_MAIN_CV_MARKER],
+        "fallbackCvRoles": {},
+    },
 }
 
 
@@ -277,6 +297,11 @@ def extract_manbo_author(desc: object) -> str:
     for segment in segments or [text]:
         for pattern in MANBO_AUTHOR_PATTERNS:
             for match in pattern.finditer(segment):
+                # "原著中" describes the source story and is not an author credit.
+                # Without this guard, prose such as "这个人正是原著中的反派"
+                # is incorrectly parsed as author="这个人正是".
+                if segment[match.end() :].startswith("中"):
+                    continue
                 candidate = clean_manbo_author_candidate(match.group("author"))
                 if candidate:
                     return candidate
@@ -322,6 +347,16 @@ def _missevan_cv_maps(main_entries: list[dict], missevan_cv_name_map: dict[int, 
         if entry["role_name"]:
             cvroles[cv_id] = entry["role_name"]
     return cvroles, cvnames
+
+
+def apply_missevan_record_field_overrides(node: dict, drama_id: str) -> dict:
+    override = MISSEVAN_RECORD_FIELD_OVERRIDES.get(str(drama_id))
+    if not override:
+        return node
+    updated = dict(node)
+    for field, value in override.items():
+        updated[field] = deepcopy(value)
+    return updated
 
 
 def missevan_intro_text_lines(intro: object) -> list[str]:
@@ -1082,6 +1117,11 @@ def refresh_missevan(
             continue
         if all_age_only and int(node.get("type") or 0) != 3:
             continue
+        overridden_node = apply_missevan_record_field_overrides(node, drama_id)
+        if overridden_node is not node:
+            node.clear()
+            node.update(overridden_node)
+        manual_unknown_main_cv = missevan_has_unknown_main_cv(node)
         cached = (cache.get("counts") or {}).get(drama_id) or {}
         if (
             not force
@@ -1179,7 +1219,7 @@ def refresh_missevan(
         should_fill_two_maincvs = int(drama_type or 0) in (4, 6)
         episode_sound_info: dict = {}
         has_sound_maincvs = bool(preview_main_entries)
-        should_try_first_episode_maincvs = bool(first_episode_sound_id) and (
+        should_try_first_episode_maincvs = not manual_unknown_main_cv and bool(first_episode_sound_id) and (
             (should_fill_two_maincvs and len(preview_main_entries) < 2) or (not used_preview_sound or not has_sound_maincvs)
         )
         if should_try_first_episode_maincvs:
@@ -1194,14 +1234,20 @@ def refresh_missevan(
                         save_cache(MISSEVAN_COUNTS_PATH, cache)
                     raise
                 episode_sound_info = (episode_sound_payload or {}).get("info") or {}
-        if should_fill_two_maincvs:
+        if manual_unknown_main_cv:
+            updated_node["maincvs"] = []
+            updated_node["cvroles"] = {}
+            updated_node["cvnames"] = {}
+            updated_node["fallbackCvNames"] = [UNKNOWN_MAIN_CV_MARKER]
+            updated_node["fallbackCvRoles"] = {}
+        elif should_fill_two_maincvs:
             merged_main_entries = merge_missevan_min_two_main_cv_entries(maincv_preview_sound_infos, episode_sound_info, base_entries, drama_type)
             updated_node = apply_missevan_main_cv_entries(updated_node, drama_id, base_entries, merged_main_entries)
         else:
             updated_node = apply_missevan_merged_sound_maincvs(updated_node, drama_id, base_entries, maincv_preview_sound_infos) if used_preview_sound else updated_node
             updated_node = apply_missevan_sound_maincvs(updated_node, drama_id, base_entries, episode_sound_info)
         target_main_cv_count = missevan_target_main_cv_count(drama_type)
-        if len(missevan_main_cv_entries(updated_node)) < target_main_cv_count:
+        if not manual_unknown_main_cv and len(missevan_main_cv_entries(updated_node)) < target_main_cv_count:
             try:
                 intro_rows = fetch_missevan_episode_intro_rows(requester, drama_id)
                 existing_names = {
@@ -1251,6 +1297,7 @@ def refresh_missevan(
                 if update_counts:
                     save_cache(MISSEVAN_COUNTS_PATH, cache)
                 raise
+        updated_node = apply_missevan_record_field_overrides(updated_node, drama_id)
         updated_node["createTime"] = create_month
 
         catalog = updated_node.get("catalog")
@@ -1319,6 +1366,7 @@ def upsert_missevan_drama_ids(
 
 def build_manbo_record(record: dict, payload: dict, manbo_cv_name_map: dict[int, str] | None = None) -> dict:
     data = payload.get("data") or {}
+    manual_unknown_main_cv = manbo_has_unknown_main_cv(record)
     catalog = data.get("catelog")
     if catalog is None:
         catalog = data.get("category")
@@ -1372,6 +1420,11 @@ def build_manbo_record(record: dict, payload: dict, manbo_cv_name_map: dict[int,
         for idx, cv_id in enumerate(updated["mainCvIds"])
     ]
     updated["mainCvRoleNames"] = [entry["role_name"] for entry in main_entries]
+    if manual_unknown_main_cv:
+        updated["mainCvIds"] = []
+        updated["mainCvNicknames"] = [UNKNOWN_MAIN_CV_MARKER]
+        updated["mainCvNames"] = [UNKNOWN_MAIN_CV_MARKER]
+        updated["mainCvRoleNames"] = []
     updated["createTime"] = pick_first_episode_month(data.get("setRespList") or [], title_key="setTitle", time_key="createTime", milliseconds=True)
     updated["author"] = extract_manbo_author(data.get("desc"))
     drama_id = str(updated.get("dramaId") or record.get("dramaId") or "").strip()

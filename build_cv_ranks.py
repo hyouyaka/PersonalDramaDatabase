@@ -16,6 +16,8 @@ from platform_sync import (
     iter_missevan_nodes,
     load_cache,
     load_json,
+    manbo_has_unknown_main_cv,
+    manbo_main_cv_display_names,
     missevan_main_cv_entries,
     normalize,
     normalize_match,
@@ -24,10 +26,11 @@ from platform_sync import (
 from sync_new_drama_ids import ROOT, configure_stdio, load_env_file, sync_remote_watchcount_if_newer, upstash_request
 from sync_new_drama_ids import MANBO_INFO_KEY, MISSEVAN_INFO_KEY
 from sync_remote_libraries import fetch_cvid_map_payload, fetch_info_payload, write_payloads
-from rank_key_cleanup import cleanup_legacy_cv_rank_keys, run_cleanup_best_effort
+from upstash_editor import decode_hgetall
 from upstash_v2 import (
     CV_TREND_V2_KEY,
     publish_cv_trend_v2,
+    publish_hash_snapshot_atomic,
     publish_rank_string,
     publish_trend_v2_best_effort,
 )
@@ -36,19 +39,7 @@ from upstash_v2 import (
 HERE = Path(__file__).resolve().parent
 CV_RANKS_PATH = HERE / "ranks-cv.json"
 PLATFORMS = ("missevan", "manbo")
-CV_TREND_KEYS = {
-    "missevan": "ranks:trend:cv:missevan",
-    "manbo": "ranks:trend:cv:manbo",
-}
 CV_TREND_RETENTION_DATES = 50
-CV_TREND_COMPARE_AND_SET_SCRIPT = """
-local current = redis.call('GET', KEYS[1])
-if not current or redis.sha1hex(current) ~= ARGV[1] then
-  return 0
-end
-redis.call('SET', KEYS[1], ARGV[2])
-return 1
-"""
 
 
 def now_iso() -> str:
@@ -175,7 +166,7 @@ def missevan_main_cv_names(node: dict) -> list[str]:
 
 
 def manbo_main_cv_names(record: dict) -> list[str]:
-    return [normalize(name) for name in (record.get("mainCvNames") or record.get("mainCvNicknames") or []) if normalize(name)]
+    return manbo_main_cv_display_names(record)
 
 
 def add_work(buckets: dict[str, dict], cv_name: str, work: dict, *, avatar: str = "") -> None:
@@ -225,6 +216,8 @@ def collect_missevan_works(
             "isPaid": is_paid,
         }
         for cv_entry in missevan_main_cv_entries(node):
+            if cv_entry.get("unknown"):
+                continue
             cv_id = cv_entry["cv_id"]
             raw_name = cv_entry["display_name"]
             cv_name = resolve_cv_name(
@@ -273,6 +266,8 @@ def collect_manbo_works(
         }
         ids = record.get("mainCvIds") or []
         names = record.get("mainCvNames") or record.get("mainCvNicknames") or []
+        if manbo_has_unknown_main_cv(record):
+            continue
         for idx, raw_cv_id in enumerate(ids):
             cv_id = safe_int_or_none(raw_cv_id)
             raw_name = names[idx] if idx < len(names) else ""
@@ -428,7 +423,7 @@ def build_cv_trend_payload(
     generated_at: str,
     retention_dates: int = CV_TREND_RETENTION_DATES,
 ) -> dict:
-    if platform not in CV_TREND_KEYS:
+    if platform not in PLATFORMS:
         raise ValueError(f"Unsupported platform: {platform}")
 
     payload = current if isinstance(current, dict) else {}
@@ -520,21 +515,6 @@ def upload_cv_ranks(payload: dict, *, upstash=upstash_request) -> None:
     print(f"[ok] uploaded {key} ({len(encoded)} bytes)")
 
 
-def load_cv_trend_payload(platform: str, *, upstash=upstash_request) -> dict | None:
-    key = CV_TREND_KEYS[platform]
-    try:
-        raw = upstash(["GET", key])
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load {key}: {exc}") from exc
-    if raw in (None, ""):
-        return None
-    if isinstance(raw, str):
-        return json.loads(raw)
-    if isinstance(raw, dict):
-        return raw
-    raise RuntimeError(f"Unsupported payload type for {key}: {type(raw).__name__}")
-
-
 def upload_cv_trends(
     *,
     history_date: str,
@@ -555,46 +535,10 @@ def upload_cv_trends(
         for platform in PLATFORMS
     }
     publish_trend_v2_best_effort(
-        "ranks:trend:cv:v2",
+        CV_TREND_V2_KEY,
         lambda: publish_cv_trend_v2(v2_payloads, upstash=upstash),
     )
-    payloads: dict[str, dict] = {}
-    for platform in PLATFORMS:
-        key = CV_TREND_KEYS[platform]
-        legacy_exists = int(upstash(["EXISTS", key]) or 0) == 1
-        current = load_cv_trend_payload(platform, upstash=upstash) if legacy_exists else None
-        payload = build_cv_trend_payload(
-            current,
-            platform,
-            history_date,
-            full_rankings.get(platform) or [],
-            full_paid_rankings.get(platform) or [],
-            generated_at=generated_at,
-        )
-        encoded = json.dumps(payload, ensure_ascii=False)
-        if legacy_exists:
-            result = upstash(["SET", key, encoded])
-            if result != "OK":
-                raise RuntimeError(f"Failed to upload {key}: {result!r}")
-            print(f"[ok] uploaded legacy {key} ({len(encoded)} bytes, date={history_date})")
-        else:
-            print(f"[skip] legacy key is retired: {key}")
-        payloads[platform] = payload
-    return payloads
-
-
-def backfill_cv_trend_v2(*, upstash=upstash_request) -> None:
-    if int(upstash(["EXISTS", CV_TREND_V2_KEY]) or 0) == 1:
-        raise RuntimeError(
-            f"Refusing legacy backfill: authoritative v2 already exists: {CV_TREND_V2_KEY}"
-        )
-    payloads = {
-        platform: load_cv_trend_payload(platform, upstash=upstash)
-        for platform in PLATFORMS
-    }
-    if not all(isinstance(payload, dict) for payload in payloads.values()):
-        raise RuntimeError("Unable to backfill CV trend v2: one or more v1 payloads are missing")
-    publish_cv_trend_v2(payloads, upstash=upstash, force=True)
+    return v2_payloads
 
 
 def remove_cv_trend_samples_by_generated_at(payload: dict, generated_at: str) -> tuple[dict, dict[str, int]]:
@@ -647,47 +591,107 @@ def cleanup_remote_cv_trends_by_generated_at(
     target_dir = backup_dir or (ROOT / "recovery_backups")
     target_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    raw_snapshot = upstash(["HGETALL", CV_TREND_V2_KEY])
+    decoded = decode_hgetall(raw_snapshot)
+    meta_raw = decoded.pop("__meta__", None)
+    if not isinstance(meta_raw, str):
+        raise RuntimeError(f"Refusing to clean {CV_TREND_V2_KEY}: __meta__ is missing")
+    try:
+        meta = json.loads(meta_raw)
+        fields = {field: json.loads(value) for field, value in decoded.items()}
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Refusing to clean {CV_TREND_V2_KEY}: invalid JSON") from exc
+    if not isinstance(meta, dict) or int(meta.get("version") or 0) != 2 or meta.get("kind") != "cv":
+        raise RuntimeError(f"Refusing to clean {CV_TREND_V2_KEY}: invalid metadata")
+    backup_path = target_dir / f"{stamp}_{CV_TREND_V2_KEY.replace(':', '-')}.json"
+    backup_path.write_text(json.dumps(raw_snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
     results: dict[str, dict[str, object]] = {}
     for platform in PLATFORMS:
-        key = CV_TREND_KEYS[platform]
-        raw = upstash(["GET", key])
-        if not isinstance(raw, str) or not raw:
-            raise RuntimeError(f"Refusing to clean {key}: remote payload is empty or unsupported")
-        payload = json.loads(raw)
-        backup_path = target_dir / f"{stamp}_{key.replace(':', '-')}.json"
-        backup_path.write_text(raw, encoding="utf-8")
+        prefix = f"{platform}:"
+        payload = {
+            "cvs": {
+                field[len(prefix):]: record
+                for field, record in fields.items()
+                if field.startswith(prefix) and isinstance(record, dict)
+            }
+        }
         cleaned, stats = remove_cv_trend_samples_by_generated_at(payload, generated_at)
-        encoded = json.dumps(cleaned, ensure_ascii=False, separators=(",", ":"))
-        original_sha1 = hashlib.sha1(raw.encode("utf-8")).hexdigest()
-        result = upstash(["EVAL", CV_TREND_COMPARE_AND_SET_SCRIPT, 1, key, original_sha1, encoded])
-        if int(result or 0) != 1:
-            raise RuntimeError(f"Refusing to clean {key}: remote payload changed concurrently")
-        verified_raw = upstash(["GET", key])
-        if not isinstance(verified_raw, str) or hashlib.sha256(verified_raw.encode("utf-8")).hexdigest() != hashlib.sha256(
-            encoded.encode("utf-8")
-        ).hexdigest():
-            raise RuntimeError(f"Failed to verify cleaned {key}")
-        verified = json.loads(verified_raw)
-        residual = 0
-        for entry in (verified.get("cvs") or {}).values():
-            if not isinstance(entry, dict):
-                continue
-            samples = entry.get("samples")
-            if not isinstance(samples, dict):
-                continue
-            residual += sum(
-                1
-                for sample in samples.values()
-                if isinstance(sample, dict) and sample.get("generated_at") == generated_at
-            )
-        if residual:
-            raise RuntimeError(f"Failed to clean {key}: {residual} matching samples remain")
+        for field in [field for field in fields if field.startswith(prefix)]:
+            fields.pop(field, None)
+        for cv_name, record in (cleaned.get("cvs") or {}).items():
+            fields[f"{platform}:{cv_name}"] = record
+        platform_meta = (meta.setdefault("platforms", {}).setdefault(platform, {}))
+        platform_meta["dates"] = cleaned.get("dates") or []
+        platform_meta["updated_at"] = cleaned.get("updated_at")
+        platform_meta["entityCount"] = sum(
+            1 for field in fields if field.startswith(prefix)
+        )
         results[platform] = {
             **stats,
             "backup": str(backup_path),
-            "updated_at": verified.get("updated_at"),
-            "dates": verified.get("dates") or [],
+            "updated_at": cleaned.get("updated_at"),
+            "dates": cleaned.get("dates") or [],
         }
+    remaining_platform_updates = [
+        normalize((meta.get("platforms") or {}).get(platform, {}).get("updated_at"))
+        for platform in PLATFORMS
+    ]
+    meta["updated_at"] = max(
+        (value for value in remaining_platform_updates if value),
+        default="",
+    )
+    publish_hash_snapshot_atomic(
+        CV_TREND_V2_KEY,
+        meta,
+        fields,
+        upstash=upstash,
+        expected_meta_raw=meta_raw,
+    )
+    verified = decode_hgetall(upstash(["HGETALL", CV_TREND_V2_KEY]))
+    verified_meta_raw = verified.get("__meta__")
+    if not isinstance(verified_meta_raw, str):
+        raise RuntimeError(f"Failed to verify {CV_TREND_V2_KEY}: __meta__ is missing")
+    try:
+        verified_meta = json.loads(verified_meta_raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Failed to verify {CV_TREND_V2_KEY}: invalid __meta__") from exc
+    if not isinstance(verified_meta, dict):
+        raise RuntimeError(f"Failed to verify {CV_TREND_V2_KEY}: invalid __meta__ shape")
+    residual = 0
+    for field, raw in verified.items():
+        if field == "__meta__":
+            continue
+        try:
+            samples = (json.loads(raw).get("samples") or {})
+        except (TypeError, ValueError, AttributeError):
+            continue
+        residual += sum(
+            1 for sample in samples.values()
+            if isinstance(sample, dict) and sample.get("generated_at") == generated_at
+        )
+    if residual:
+        raise RuntimeError(f"Failed to clean {CV_TREND_V2_KEY}: {residual} matching samples remain")
+    for platform in PLATFORMS:
+        prefix = f"{platform}:"
+        platform_meta = ((verified_meta.get("platforms") or {}).get(platform) or {})
+        expected = results[platform]
+        actual_count = sum(
+            1 for field in verified if field != "__meta__" and field.startswith(prefix)
+        )
+        if (
+            int(platform_meta.get("entityCount") or 0) != actual_count
+            or platform_meta.get("dates") != expected["dates"]
+            or platform_meta.get("updated_at") != expected["updated_at"]
+        ):
+            raise RuntimeError(
+                f"Failed to verify {CV_TREND_V2_KEY}: inconsistent {platform} metadata"
+            )
+    expected_top_updated = max(
+        (normalize(results[platform]["updated_at"]) for platform in PLATFORMS if normalize(results[platform]["updated_at"])),
+        default="",
+    )
+    if expected_top_updated and verified_meta.get("updated_at") != expected_top_updated:
+        raise RuntimeError(f"Failed to verify {CV_TREND_V2_KEY}: inconsistent updated_at")
     return results
 
 
@@ -777,7 +781,6 @@ def build_and_publish_cv_ranks(
             full_paid_rankings=full_paid_rankings,
             upstash=upstash,
         )
-        run_cleanup_best_effort(lambda: cleanup_legacy_cv_rank_keys(upstash))
     return payload
 
 
@@ -790,11 +793,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--cleanup-trend-generated-at",
         help="Only remove CV trend samples whose generated_at exactly matches this value",
     )
-    parser.add_argument(
-        "--backfill-cv-trend-v2",
-        action="store_true",
-        help="Build the combined CV trend v2 hash from current Upstash v1 aggregates",
-    )
     return parser.parse_args(argv)
 
 
@@ -802,10 +800,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     configure_stdio()
     load_env_file(ROOT / ".env")
-    if args.backfill_cv_trend_v2:
-        backfill_cv_trend_v2()
-        print("[ok] backfilled ranks:trend:cv:v2")
-        return 0
     if args.cleanup_trend_generated_at:
         results = cleanup_remote_cv_trends_by_generated_at(args.cleanup_trend_generated_at)
         print("[ok] cleaned CV trends:", json.dumps(results, ensure_ascii=False))

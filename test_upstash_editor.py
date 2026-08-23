@@ -50,9 +50,9 @@ class FakeUpstash:
             return 1
         if operation == "EVAL":
             script = str(command[1])
-            if script in (upstash_editor.STRING_SAVE_SCRIPT, upstash_editor.INFO_STRING_SAVE_SCRIPT):
+            if script == upstash_editor.STRING_SAVE_SCRIPT:
                 source_key, meta_key = str(command[3]), str(command[4])
-                argument_offset = 1 if script == upstash_editor.INFO_STRING_SAVE_SCRIPT else 0
+                argument_offset = 0
                 current = self.strings.get(source_key, "")
                 if hashlib.sha1(current.encode("utf-8")).hexdigest() != str(command[5 + argument_offset]):
                     return 0
@@ -65,10 +65,6 @@ class FakeUpstash:
                     return 0
                 self.strings[source_key] = str(command[6 + argument_offset])
                 self.strings[meta_key] = str(command[7 + argument_offset])
-                if script == upstash_editor.INFO_STRING_SAVE_SCRIPT:
-                    legacy_key = str(command[5])
-                    if legacy_key in self.strings:
-                        self.strings[legacy_key] = str(command[7])
                 return 1
             if script == upstash_editor.HASH_SAVE_SCRIPT:
                 stable_key, staging_key, meta_key = map(str, command[3:6])
@@ -194,7 +190,7 @@ class UpstashEditorTests(unittest.TestCase):
 
         self.assertEqual(fake.commands, [["GET", "missevan:info:v2"]])
 
-    def test_info_save_updates_existing_v1_v2_and_meta(self) -> None:
+    def test_info_save_updates_v2_and_meta_without_touching_v1(self) -> None:
         fake = FakeUpstash()
         source = build_missevan_info()
         fake.strings["missevan:info:v2"] = upstash_editor.compact_json(source)
@@ -214,10 +210,10 @@ class UpstashEditorTests(unittest.TestCase):
                 now=lambda: "2026-07-20T12:00:00+00:00",
             )
         self.assertEqual(json.loads(fake.strings["missevan:info:v2"])["1"]["title"], "人工修正")
-        self.assertEqual(json.loads(fake.strings["missevan:info:v1"])["1"]["title"], "人工修正")
+        self.assertEqual(fake.strings["missevan:info:v1"], "legacy")
         meta = json.loads(fake.strings["missevan:info:meta:v2"])
         self.assertEqual(meta["contentSha1"], result.content_sha1)
-        self.assertTrue(any("missevan:info:v1" in command for command in fake.commands))
+        self.assertFalse(any("missevan:info:v1" in command for command in fake.commands))
 
     def test_info_save_does_not_recreate_retired_v1(self) -> None:
         fake = FakeUpstash()

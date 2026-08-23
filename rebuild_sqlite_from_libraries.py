@@ -17,6 +17,7 @@ from platform_sync import (
     iter_missevan_nodes,
     load_cache,
     load_json,
+    manbo_has_unknown_main_cv,
     missevan_main_cv_entries,
     normalize,
     normalize_match,
@@ -193,6 +194,8 @@ def build_rows() -> list[dict]:
         genre = GENRE_BY_TYPE.get(int(node.get("type") or 0), "")
         catalog_name = MISSEVAN_CATALOG_NAME_BY_ID.get(catalog, "") if catalog is not None else ""
         for cv_entry in missevan_main_cv_entries(node):
+            if cv_entry.get("unknown"):
+                continue
             cv_id = cv_entry["cv_id"]
             raw_name = normalize(cv_entry["display_name"])
             cv_name = resolve_cv_name(raw_name, cv_id, platform="猫耳", missevan_ids=missevan_ids, manbo_ids=manbo_ids, name_index=name_index)
@@ -223,6 +226,8 @@ def build_rows() -> list[dict]:
 
     for record in (manbo_store.get("records") or []):
         if record.get("needpay") is not True:
+            continue
+        if manbo_has_unknown_main_cv(record):
             continue
         catalog = None if record.get("catalog") in (None, "") else int(record["catalog"])
         title_value = normalize(record.get("seriesTitle") or record.get("name"))

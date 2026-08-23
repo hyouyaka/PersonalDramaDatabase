@@ -8,7 +8,6 @@ import os
 import re
 import subprocess
 import sys
-import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,7 +19,6 @@ from upstash_v2 import (
     CVID_MAP_KEY,
     CVID_MAP_META_KEY,
     NORMAL_TREND_V2_KEYS,
-    backfill_info_v2,
     publish_cvid_map,
     publish_hash_snapshot_atomic,
     publish_info_v2,
@@ -37,7 +35,9 @@ from platform_sync import (
     is_numeric_drama_id,
     is_target_catalog,
     load_json,
+    manbo_has_unknown_main_cv,
     missevan_main_cv_entries,
+    missevan_has_unknown_main_cv,
     normalize,
 )
 
@@ -46,20 +46,48 @@ ROOT = Path(__file__).resolve().parent
 QUEUE_KEY = "new:dramaIDs"
 MANBO_INFO_KEY = "manbo:info:v2"
 MISSEVAN_INFO_KEY = "missevan:info:v2"
-MANBO_INFO_V1_KEY = "manbo:info:v1"
-MISSEVAN_INFO_V1_KEY = "missevan:info:v1"
 SERIES_INFO_KEY = "drama:series-info:v1"
 WATCHCOUNT_KEY_PREFIXES = {
     "missevan": "missevan:watchcount",
     "manbo": "manbo:watchcount",
 }
-WATCHCOUNT_INDEX_VERSION = 1
 WATCHCOUNT_MAX_DATES = 32
 WATCHCOUNT_HISTORY_MAX_POINTS = WATCHCOUNT_MAX_DATES
-WATCHCOUNT_SCAN_CACHE_TTL_SECONDS = 300
-WATCHCOUNT_SCAN_COUNT = 1000
 WATCHCOUNT_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_WATCHCOUNT_SCAN_CACHE: dict[str, tuple[float, list[str]]] = {}
+WATCHCOUNT_PUBLISH_SCRIPT = """
+local current_latest = redis.call('GET', KEYS[1])
+if not current_latest or redis.sha1hex(current_latest) ~= ARGV[1] then
+  return 0
+end
+local upsert_count = tonumber(ARGV[3])
+local offset = 4
+for index = 0, upsert_count - 1 do
+  local field = ARGV[offset + index * 3]
+  local expected = ARGV[offset + index * 3 + 1]
+  local current = redis.call('HGET', KEYS[2], field)
+  if expected == '__missing__' then
+    if current and current ~= false then return 0 end
+  elseif not current or current ~= expected then
+    return 0
+  end
+end
+local delete_offset = offset + upsert_count * 3
+local delete_count = tonumber(ARGV[delete_offset])
+for index = 0, delete_count - 1 do
+  local field = ARGV[delete_offset + 1 + index * 2]
+  local expected = ARGV[delete_offset + 2 + index * 2]
+  local current = redis.call('HGET', KEYS[2], field)
+  if not current or current ~= expected then return 0 end
+end
+redis.call('SET', KEYS[1], ARGV[2])
+for index = 0, upsert_count - 1 do
+  redis.call('HSET', KEYS[2], ARGV[offset + index * 3], ARGV[offset + index * 3 + 2])
+end
+for index = 0, delete_count - 1 do
+  redis.call('HDEL', KEYS[2], ARGV[delete_offset + 1 + index * 2])
+end
+return 1
+"""
 INFO_UPLOAD_MIN_COUNTS = {
     MISSEVAN_INFO_KEY: 100,
     MANBO_INFO_KEY: 50,
@@ -87,22 +115,6 @@ elseif not current_meta or redis.sha1hex(current_meta) ~= ARGV[4] then
   return -2
 end
 redis.call('SET', KEYS[1], ARGV[2])
-redis.call('SET', KEYS[2], ARGV[3])
-return 1
-"""
-INFO_V1_FROM_V2_SYNC_SCRIPT = """
-local current_v2 = redis.call('GET', KEYS[1])
-if not current_v2 or redis.sha1hex(current_v2) ~= ARGV[1] then
-  return -1
-end
-local current_v1 = redis.call('GET', KEYS[2])
-if ARGV[2] == '__missing__' then
-  if current_v1 and current_v1 ~= false then
-    return -2
-  end
-elseif not current_v1 or redis.sha1hex(current_v1) ~= ARGV[2] then
-  return -2
-end
 redis.call('SET', KEYS[2], ARGV[3])
 return 1
 """
@@ -134,8 +146,6 @@ PURGE_MANBO_PODCAST_IDS = {
 }
 CV_REMOTE_KEYS = (
     "ranks:cv:latest",
-    "ranks:trend:cv:missevan",
-    "ranks:trend:cv:manbo",
     "ranks:trend:cv:v2",
 )
 
@@ -486,47 +496,6 @@ def normalize_watchcount_snapshot_date(value: object, *, key: str = "watchcount"
     return date_text
 
 
-def normalize_watchcount_snapshot_dates(values: object, *, key: str = "watchcount") -> list[str]:
-    if not isinstance(values, list):
-        raise RuntimeError(f"Refusing to use {key}: dates must be a JSON array.")
-    return sorted({normalize_watchcount_snapshot_date(value, key=key) for value in values})
-
-
-def assert_watchcount_index_is_safe(key: str, payload: object) -> None:
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"Refusing to use {key}: expected a JSON object.")
-    if payload.get("version") != WATCHCOUNT_INDEX_VERSION:
-        raise RuntimeError(f"Refusing to use {key}: unsupported version {payload.get('version')!r}.")
-    expected_platform = key.split(":", 1)[0]
-    if payload.get("platform") != expected_platform:
-        raise RuntimeError(f"Refusing to use {key}: platform does not match index key.")
-    if parse_remote_iso_datetime(payload.get("updated_at")) is None:
-        raise RuntimeError(f"Refusing to use {key}: updated_at must be a valid ISO timestamp.")
-    dates = payload.get("dates")
-    normalized_dates = normalize_watchcount_snapshot_dates(dates, key=key)
-    if dates != normalized_dates:
-        raise RuntimeError(f"Refusing to use {key}: dates must be sorted and deduplicated.")
-    if len(normalized_dates) > WATCHCOUNT_MAX_DATES:
-        raise RuntimeError(
-            f"Refusing to use {key}: at most {WATCHCOUNT_MAX_DATES} snapshot dates are allowed."
-        )
-
-
-def decode_remote_watchcount_index(platform: str, raw: object) -> dict:
-    key = watchcount_key(platform, "index")
-    payload = decode_remote_json_payload(key, raw)
-    assert_watchcount_index_is_safe(key, payload)
-    return payload
-
-
-def read_watchcount_index(platform: str, *, upstash=upstash_request) -> dict | None:
-    key = watchcount_key(platform, "index")
-    raw = upstash(["GET", key])
-    if raw in (None, ""):
-        return None
-    return decode_remote_watchcount_index(platform, raw)
-
-
 def _watchcount_number(value: object) -> int | float | None:
     if isinstance(value, bool) or value is None:
         return None
@@ -616,41 +585,6 @@ def _history_entry_from_points(
     }
 
 
-def build_watchcount_history(
-    platform: str,
-    snapshots: dict[str, dict],
-    *,
-    max_points: int | None = WATCHCOUNT_HISTORY_MAX_POINTS,
-) -> dict[str, dict]:
-    entries: dict[str, dict[str, object]] = {}
-    for date_text in sorted(snapshots):
-        payload = snapshots[date_text]
-        assert_watchcount_payload_is_safe(watchcount_key(platform, date_text), payload)
-        for drama_id, item in payload["counts"].items():
-            if not isinstance(item, dict):
-                continue
-            number = _watchcount_number(item.get("view_count"))
-            if number is None:
-                continue
-            field = str(drama_id).strip()
-            if not is_numeric_drama_id(field):
-                continue
-            entry = entries.setdefault(field, {"name": "", "points": {}})
-            name = item.get("name")
-            if isinstance(name, str) and name.strip():
-                entry["name"] = name
-            entry["points"][date_text] = number
-    return {
-        field: _history_entry_from_points(
-            str(entry["name"]),
-            entry["points"],
-            max_points=max_points,
-        )
-        for field, entry in sorted(entries.items())
-        if entry["points"]
-    }
-
-
 def merge_watchcount_history(
     existing: dict[str, dict],
     payload: dict,
@@ -695,154 +629,6 @@ def merge_watchcount_history(
             max_points=max_points,
         )
     return dict(sorted(merged.items()))
-
-
-def filter_watchcount_history(
-    history: dict[str, dict],
-    retained_dates: list[str],
-) -> dict[str, dict]:
-    retained = set(retained_dates)
-    filtered: dict[str, dict] = {}
-    for field, entry in history.items():
-        points = {
-            point[0]: point[1]
-            for point in entry["points"]
-            if point[0] in retained
-        }
-        if points:
-            filtered[field] = _history_entry_from_points(entry["name"], points)
-    return dict(sorted(filtered.items()))
-
-
-def encode_watchcount_history(history: dict[str, dict]) -> list[object]:
-    fields: list[object] = []
-    for field in sorted(history):
-        fields.extend(
-            [
-                field,
-                json.dumps(history[field], ensure_ascii=False, separators=(",", ":")),
-            ]
-        )
-    return fields
-
-
-def _assert_hash_write_succeeded(operation: str, key: str, result: object) -> None:
-    if result == "OK":
-        return
-    if isinstance(result, int) and not isinstance(result, bool) and result >= 0:
-        return
-    if isinstance(result, str) and result.isdigit():
-        return
-    raise RuntimeError(f"Failed to {operation} {key}: {result!r}")
-
-
-def _assert_delete_succeeded(operation: str, keys: list[str], result: object) -> None:
-    if isinstance(result, int) and not isinstance(result, bool) and result >= 0:
-        return
-    if isinstance(result, str) and result.isdigit():
-        return
-    raise RuntimeError(f"Failed to {operation}: {keys!r}; result={result!r}")
-
-
-def _load_watchcount_snapshots_by_dates(
-    platform: str,
-    dates: list[str],
-    *,
-    upstash=upstash_request,
-) -> dict[str, dict]:
-    if not dates:
-        return {}
-    keys = [watchcount_key(platform, date_text) for date_text in dates]
-    raw = upstash(["MGET", *keys])
-    if not isinstance(raw, (list, tuple)) or len(raw) != len(keys):
-        raise RuntimeError(f"Unsupported MGET response for {platform} watchcount snapshots: {raw!r}")
-    snapshots: dict[str, dict] = {}
-    for date_text, key, value in zip(dates, keys, raw):
-        if value in (None, ""):
-            raise RuntimeError(f"Refusing to rebuild {platform} history: {key} is missing.")
-        snapshots[date_text] = decode_remote_watchcount_payload(key, value)
-    return snapshots
-
-
-def _watchcount_snapshot_date_from_key(platform: str, key: object) -> str | None:
-    if not isinstance(key, str):
-        return None
-    prefix = watchcount_key(platform, "")
-    if not key.startswith(prefix):
-        return None
-    suffix = key[len(prefix) :]
-    if suffix == "latest" or not WATCHCOUNT_DATE_PATTERN.fullmatch(suffix):
-        return None
-    try:
-        return normalize_watchcount_snapshot_date(suffix, key=key)
-    except RuntimeError:
-        return None
-
-
-def _scan_watchcount_snapshot_dates(platform: str, *, upstash=upstash_request) -> list[str]:
-    pattern = f"{watchcount_key(platform, '')}????-??-??"
-    cursor = "0"
-    seen_cursors: set[str] = set()
-    dates: set[str] = set()
-    while True:
-        if cursor in seen_cursors:
-            raise RuntimeError(f"SCAN for {pattern} returned a repeated cursor {cursor!r}.")
-        seen_cursors.add(cursor)
-        raw = upstash(["SCAN", cursor, "MATCH", pattern, "COUNT", str(WATCHCOUNT_SCAN_COUNT)])
-        if not isinstance(raw, (list, tuple)) or len(raw) != 2:
-            raise RuntimeError(f"Unsupported SCAN response for {pattern}: {raw!r}")
-        next_cursor, keys = raw
-        if not isinstance(keys, list):
-            raise RuntimeError(f"Unsupported SCAN keys response for {pattern}: {keys!r}")
-        for remote_key in keys:
-            date_text = _watchcount_snapshot_date_from_key(platform, remote_key)
-            if date_text is not None:
-                dates.add(date_text)
-        cursor = str(next_cursor)
-        if cursor == "0":
-            return sorted(dates)
-
-
-def clear_watchcount_scan_cache() -> None:
-    _WATCHCOUNT_SCAN_CACHE.clear()
-
-
-def scan_watchcount_snapshot_dates(
-    platform: str,
-    *,
-    upstash=upstash_request,
-    cache_ttl_seconds: float = WATCHCOUNT_SCAN_CACHE_TTL_SECONDS,
-    use_cache: bool = True,
-) -> list[str]:
-    now = time.monotonic()
-    cached = _WATCHCOUNT_SCAN_CACHE.get(platform)
-    if use_cache and cached is not None and now - cached[0] < cache_ttl_seconds:
-        return list(cached[1])
-    dates = _scan_watchcount_snapshot_dates(platform, upstash=upstash)
-    _WATCHCOUNT_SCAN_CACHE[platform] = (now, dates)
-    return list(dates)
-
-
-def load_watchcount_snapshot_dates(
-    platform: str,
-    *,
-    upstash=upstash_request,
-    cache_ttl_seconds: float = WATCHCOUNT_SCAN_CACHE_TTL_SECONDS,
-) -> list[str]:
-    """Read the snapshot date list, preferring the index during rollout."""
-    index_key = watchcount_key(platform, "index")
-    try:
-        index = read_watchcount_index(platform, upstash=upstash)
-        if index is not None:
-            return list(index["dates"])
-    except Exception as exc:
-        print(f"[warn] {index_key}: index unavailable, using cached SCAN fallback: {exc}")
-    return scan_watchcount_snapshot_dates(
-        platform,
-        upstash=upstash,
-        cache_ttl_seconds=cache_ttl_seconds,
-        use_cache=True,
-    )
 
 
 def load_watchcount_payload(path: Path) -> dict:
@@ -902,106 +688,135 @@ def upload_watchcount_file(
     payload = load_watchcount_payload(path)
     latest_key = watchcount_key(platform, "latest")
     assert_watchcount_payload_is_safe(latest_key, payload)
+    excluded = {str(drama_id) for drama_id in (excluded_drama_ids or set())}
+    if excluded:
+        payload["counts"] = {
+            str(drama_id): entry
+            for drama_id, entry in payload["counts"].items()
+            if str(drama_id) not in excluded
+        }
     updated_at = watchcount_updated_at(payload) or datetime.now(timezone.utc)
     current_date = updated_at.astimezone(timezone.utc).date().isoformat()
-    date_key = watchcount_key(platform, current_date)
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    for key in (date_key, latest_key):
-        result = upstash(["SET", key, encoded])
-        if result != "OK":
-            raise RuntimeError(f"Failed to upload {path.name} to {key}: {result!r}")
-        print(f"[ok] uploaded {path.name} -> {key} ({len(encoded)} bytes)")
-
     history_key = watchcount_key(platform, "history")
-    raw_history = upstash(["HGETALL", history_key])
-    history_fields = _watchcount_history_fields(raw_history, key=history_key)
-    history_invalid = False
-    try:
+    for attempt in range(3):
+        raw_latest = upstash(["GET", latest_key])
+        if not isinstance(raw_latest, str) or not raw_latest:
+            raise RuntimeError(f"Refusing to publish {path.name}: {latest_key} is missing")
+        current_latest = decode_remote_watchcount_payload(latest_key, raw_latest)
+        assert_watchcount_payload_is_safe(latest_key, current_latest)
+
+        raw_history = upstash(["HGETALL", history_key])
+        raw_pairs = _watchcount_history_pairs(raw_history, key=history_key)
+        if not raw_pairs:
+            raise RuntimeError(f"Refusing to publish {path.name}: {history_key} is empty or missing")
+        raw_history_by_id = dict(raw_pairs)
         existing_history = decode_watchcount_history(platform, raw_history)
-    except RuntimeError as exc:
-        print(f"[warn] {history_key}: history unavailable, rebuilding from dated snapshots: {exc}")
-        existing_history = {}
-        history_invalid = True
-
-    existing_index = read_watchcount_index(platform, upstash=upstash)
-    if existing_index is None:
-        existing_dates = scan_watchcount_snapshot_dates(platform, upstash=upstash, use_cache=False)
-    else:
-        existing_dates = list(existing_index["dates"])
-    retained_dates = sorted(set(existing_dates) | {current_date})[-WATCHCOUNT_MAX_DATES:]
-    staging_dates = (
-        sorted(set(existing_dates) | {current_date})
-        if existing_index is not None
-        else retained_dates
-    )
-
-    needs_rebuild = existing_index is None or history_invalid or not existing_history
-    if needs_rebuild:
-        snapshots = _load_watchcount_snapshots_by_dates(platform, staging_dates, upstash=upstash)
-        staged_history = build_watchcount_history(platform, snapshots, max_points=None)
-    else:
-        staged_history = merge_watchcount_history(
+        allowed_dates = sorted({
+            current_date,
+            *(point[0] for entry in existing_history.values() for point in entry["points"]),
+        })
+        desired_history = merge_watchcount_history(
             existing_history,
             payload,
             current_date,
-            staging_dates,
-            max_points=None,
+            allowed_dates,
+            max_points=WATCHCOUNT_HISTORY_MAX_POINTS,
         )
-    for drama_id in excluded_drama_ids or set():
-        staged_history.pop(str(drama_id), None)
-    desired_history = filter_watchcount_history(staged_history, retained_dates)
+        for drama_id in excluded:
+            desired_history.pop(drama_id, None)
 
-    staged_history_args = encode_watchcount_history(staged_history)
-    if staged_history_args:
-        result = upstash(["HSET", history_key, *staged_history_args])
-        _assert_hash_write_succeeded("write history hash", history_key, result)
-        print(f"[ok] staged watchcount history -> {history_key} ({len(staged_history)} dramas)")
-
-    index_payload = {
-        "version": WATCHCOUNT_INDEX_VERSION,
-        "platform": platform,
-        "updated_at": (
-            updated_at.astimezone(timezone.utc)
-            .replace(microsecond=0)
-            .isoformat()
-            .replace("+00:00", "Z")
-        ),
-        "dates": retained_dates,
-    }
-    index_key = watchcount_key(platform, "index")
-    index_encoded = json.dumps(index_payload, ensure_ascii=False, separators=(",", ":"))
-    result = upstash(["SET", index_key, index_encoded])
-    if result != "OK":
-        raise RuntimeError(f"Failed to upload {path.name} index to {index_key}: {result!r}")
-    print(f"[ok] uploaded watchcount index -> {index_key} ({len(index_encoded)} bytes)")
-
-    if staged_history != desired_history:
-        desired_history_args = encode_watchcount_history(desired_history)
-        if desired_history_args:
-            result = upstash(["HSET", history_key, *desired_history_args])
-            _assert_hash_write_succeeded("trim history hash", history_key, result)
-            print(f"[ok] trimmed watchcount history -> {history_key} ({len(desired_history)} dramas)")
-
-    stale_history_fields = sorted((history_fields | set(staged_history)) - set(desired_history))
-    if stale_history_fields:
-        result = upstash(["HDEL", history_key, *stale_history_fields])
-        _assert_hash_write_succeeded("clean history hash", history_key, result)
-        print(f"[ok] deleted stale history fields from {history_key}: {len(stale_history_fields)}")
-
-    evicted_dates = set(existing_dates) - set(retained_dates)
-    if len(retained_dates) == WATCHCOUNT_MAX_DATES and existing_index is not None:
-        # The previous run may have committed the new index but failed during DEL.
-        # Re-scan only the mature 32-period set so a later retry can discover those orphans.
-        evicted_dates.update(
-            set(scan_watchcount_snapshot_dates(platform, upstash=upstash, use_cache=False))
-            - set(retained_dates)
+        desired_raw = {
+            field: json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+            for field, entry in desired_history.items()
+        }
+        upsert_fields = sorted(
+            field for field, value in desired_raw.items()
+            if raw_history_by_id.get(field) != value
         )
-    evicted_dates = sorted(evicted_dates)
-    if evicted_dates:
-        evicted_keys = [watchcount_key(platform, date_text) for date_text in evicted_dates]
-        result = upstash(["DEL", *evicted_keys])
-        _assert_delete_succeeded("delete evicted watchcount snapshots", evicted_keys, result)
-        print(f"[ok] deleted evicted watchcount snapshots: {', '.join(evicted_keys)}")
+        delete_fields = sorted(set(raw_history_by_id) - set(desired_raw))
+        args: list[object] = [
+            hashlib.sha1(raw_latest.encode("utf-8")).hexdigest(),
+            encoded,
+            len(upsert_fields),
+        ]
+        for field in upsert_fields:
+            args.extend([field, raw_history_by_id.get(field, "__missing__"), desired_raw[field]])
+        args.append(len(delete_fields))
+        for field in delete_fields:
+            args.extend([field, raw_history_by_id[field]])
+        result = upstash([
+            "EVAL",
+            WATCHCOUNT_PUBLISH_SCRIPT,
+            2,
+            latest_key,
+            history_key,
+            *args,
+        ])
+        if int(result or 0) == 1:
+            verified_latest = upstash(["GET", latest_key])
+            verified_history = decode_watchcount_history(
+                platform,
+                upstash(["HGETALL", history_key]),
+            )
+            if verified_latest != encoded or verified_history != desired_history:
+                raise RuntimeError(f"Remote verification failed for {latest_key} and {history_key}")
+            print(
+                f"[ok] atomically uploaded {path.name} -> {latest_key} + {history_key} "
+                f"({len(desired_history)} dramas)"
+            )
+            return
+        print(f"[warn] concurrent watchcount update detected for {platform}; retrying ({attempt + 1}/3)")
+    raise RuntimeError(f"Concurrent updates prevented publishing {latest_key} and {history_key}")
+
+
+def remove_watchcount_ids_atomic(
+    platform: str,
+    drama_ids: set[str],
+    *,
+    upstash=upstash_request,
+) -> dict:
+    latest_key = watchcount_key(platform, "latest")
+    history_key = watchcount_key(platform, "history")
+    normalized_ids = {str(value) for value in drama_ids}
+    for _attempt in range(3):
+        raw_latest = upstash(["GET", latest_key])
+        raw_history = upstash(["HGETALL", history_key])
+        if not isinstance(raw_latest, str) or not raw_latest:
+            raise RuntimeError(f"Refusing cleanup: {latest_key} is missing")
+        raw_pairs = _watchcount_history_pairs(raw_history, key=history_key)
+        if not raw_pairs:
+            raise RuntimeError(f"Refusing cleanup: {history_key} is empty or missing")
+        raw_history_by_id = dict(raw_pairs)
+        decode_watchcount_history(platform, raw_history)
+        latest = decode_remote_watchcount_payload(latest_key, raw_latest)
+        assert_watchcount_payload_is_safe(latest_key, latest)
+        latest["counts"] = {
+            drama_id: entry
+            for drama_id, entry in latest["counts"].items()
+            if str(drama_id) not in normalized_ids
+        }
+        encoded = json.dumps(latest, ensure_ascii=False, separators=(",", ":"))
+        delete_fields = sorted(normalized_ids & set(raw_history_by_id))
+        args: list[object] = [
+            hashlib.sha1(raw_latest.encode("utf-8")).hexdigest(),
+            encoded,
+            0,
+            len(delete_fields),
+        ]
+        for field in delete_fields:
+            args.extend([field, raw_history_by_id[field]])
+        result = upstash([
+            "EVAL",
+            WATCHCOUNT_PUBLISH_SCRIPT,
+            2,
+            latest_key,
+            history_key,
+            *args,
+        ])
+        if int(result or 0) == 1:
+            return latest
+    raise RuntimeError(f"Concurrent updates prevented cleaning {latest_key} and {history_key}")
 
 
 def write_json_work_copy(path: Path, payload: object) -> Path | None:
@@ -1174,7 +989,7 @@ def is_missevan_ready(record: dict | None) -> bool:
         return False
     if "is_member" not in record:
         return False
-    return len(missevan_main_cv_entries(record)) >= 2
+    return missevan_has_unknown_main_cv(record) or len(missevan_main_cv_entries(record)) >= 2
 
 
 def is_manbo_ready(record: dict | None) -> bool:
@@ -1192,7 +1007,7 @@ def is_manbo_ready(record: dict | None) -> bool:
         return False
     if "vipFree" not in record:
         return False
-    return len(record.get("mainCvNicknames") or []) >= 2
+    return manbo_has_unknown_main_cv(record) or len(record.get("mainCvNicknames") or []) >= 2
 
 
 def prune_queue(queue: dict[str, list[str]]) -> dict[str, list[str]]:
@@ -1273,10 +1088,15 @@ def backfill_rank_metadata(platforms: tuple[str, ...]) -> None:
     store["manbo"].setdefault("ranks", {})
     store["manbo"].setdefault("dramas", {})
     ranks.sanitize_rank_store(store)
+    archived_by_platform = ranks.filter_archived_dramas(store)
     ranks.lookup_cvs(store)
     store["_meta"]["updated_at"] = ranks.now_iso()
     ranks.save_json(ranks.RANKS_PATH, store)
-    ranks.upload_rank_outputs(store, platforms)
+    ranks.upload_rank_outputs(
+        store,
+        platforms,
+        archived_by_platform=archived_by_platform,
+    )
     print("[ok] backfilled rank metadata")
 
 
@@ -1458,25 +1278,22 @@ def _add_verification_hits(output: dict[str, list[str]], key: str, values: set[s
 
 
 def verify_purged_non_cv_remote_references(
-    dates: dict[str, list[str]],
     *,
     upstash=upstash_request,
 ) -> dict[str, list[str]]:
     """Return target drama-ID references that remain in any non-CV remote layer."""
     hits: dict[str, list[str]] = {}
 
-    for platform, info_key, legacy_key in (
-        ("missevan", MISSEVAN_INFO_KEY, MISSEVAN_INFO_V1_KEY),
-        ("manbo", MANBO_INFO_KEY, MANBO_INFO_V1_KEY),
+    for platform, info_key in (
+        ("missevan", MISSEVAN_INFO_KEY),
+        ("manbo", MANBO_INFO_KEY),
     ):
         target_ids = PURGE_TARGETS[platform]
-        for key in (info_key, legacy_key):
-            raw = upstash(["GET", key])
-            if not isinstance(raw, str):
-                continue
-            payload = decode_remote_info_payload(key, raw)
+        raw = upstash(["GET", info_key])
+        if isinstance(raw, str):
+            payload = decode_remote_info_payload(info_key, raw)
             indexed = build_missevan_index(payload) if platform == "missevan" else build_manbo_index(payload)
-            _add_verification_hits(hits, key, set(indexed) & target_ids)
+            _add_verification_hits(hits, info_key, set(indexed) & target_ids)
 
     raw_queue = upstash(["GET", QUEUE_KEY])
     if isinstance(raw_queue, str):
@@ -1489,25 +1306,15 @@ def verify_purged_non_cv_remote_references(
             )
 
     for platform, target_ids in PURGE_TARGETS.items():
-        for suffix in [*dates[platform], "latest"]:
-            key = watchcount_key(platform, suffix)
-            raw = upstash(["GET", key])
-            if not isinstance(raw, str):
-                continue
+        key = watchcount_key(platform, "latest")
+        raw = upstash(["GET", key])
+        if isinstance(raw, str):
             payload = decode_remote_watchcount_payload(key, raw)
             _add_verification_hits(hits, key, set(payload.get("counts") or {}) & target_ids)
 
         history_key = watchcount_key(platform, "history")
         history_fields = _watchcount_history_fields(upstash(["HGETALL", history_key]), key=history_key)
         _add_verification_hits(hits, history_key, history_fields & target_ids)
-
-        legacy_trend_key = f"ranks:trend:{platform}"
-        legacy_raw = upstash(["GET", legacy_trend_key])
-        if isinstance(legacy_raw, str):
-            legacy = decode_remote_json_payload(legacy_trend_key, legacy_raw)
-            dramas = legacy.get("dramas") if isinstance(legacy, dict) else None
-            if isinstance(dramas, dict):
-                _add_verification_hits(hits, legacy_trend_key, set(dramas) & target_ids)
 
         v2_key = NORMAL_TREND_V2_KEYS[platform]
         _meta, fields, _meta_raw = _decode_hash_snapshot(v2_key, upstash(["HGETALL", v2_key]))
@@ -1572,112 +1379,6 @@ def create_purge_backup_dir(*, root: Path | None = None) -> Path:
     path = backup_root / f"{stamp}_{uuid.uuid4().hex}_purge_non_target_records"
     path.mkdir(parents=True, exist_ok=False)
     return path
-
-
-def create_info_v1_sync_backup_dir(*, root: Path | None = None) -> Path:
-    backup_root = (root or ROOT) / "recovery_backups"
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    path = backup_root / f"{stamp}_{uuid.uuid4().hex}_sync_info_v1_from_v2"
-    path.mkdir(parents=True, exist_ok=False)
-    return path
-
-
-def sync_info_v1_from_v2(
-    *,
-    apply: bool,
-    upstash=upstash_request,
-    backup_root: Path | None = None,
-) -> dict[str, object]:
-    resources: list[dict[str, object]] = []
-    snapshots: list[tuple[str, str, str, str | None]] = []
-    for platform, v2_key, v1_key in (
-        ("missevan", MISSEVAN_INFO_KEY, MISSEVAN_INFO_V1_KEY),
-        ("manbo", MANBO_INFO_KEY, MANBO_INFO_V1_KEY),
-    ):
-        raw_v2 = upstash(["GET", v2_key])
-        raw_v1 = upstash(["GET", v1_key])
-        if not isinstance(raw_v2, str) or not raw_v2:
-            raise RuntimeError(f"Refusing v1 sync: authoritative {v2_key} is missing")
-        v2_payload = decode_remote_info_payload(v2_key, raw_v2)
-        assert_info_download_is_safe(v2_key, v2_payload)
-        v1_valid: bool | None
-        if raw_v1 not in (None, ""):
-            if not isinstance(raw_v1, str):
-                raise RuntimeError(f"Refusing v1 sync: unsupported {v1_key} value")
-            try:
-                decode_remote_info_payload(v1_key, raw_v1)
-                v1_valid = True
-            except RuntimeError:
-                # v1 is only a compatibility mirror. Keep its exact raw body
-                # for backup/CAS so an authoritative v2 can repair corruption.
-                v1_valid = False
-        else:
-            raw_v1 = None
-            v1_valid = None
-        different = raw_v1 != raw_v2
-        resources.append(
-            {
-                "platform": platform,
-                "v2Key": v2_key,
-                "v1Key": v1_key,
-                "v1Exists": raw_v1 is not None,
-                "v1Valid": v1_valid,
-                "different": different,
-                "v2Sha1": hashlib.sha1(raw_v2.encode("utf-8")).hexdigest(),
-                "v1Sha1": (
-                    hashlib.sha1(raw_v1.encode("utf-8")).hexdigest()
-                    if isinstance(raw_v1, str)
-                    else None
-                ),
-            }
-        )
-        snapshots.append((v2_key, v1_key, raw_v2, raw_v1))
-
-    summary: dict[str, object] = {
-        "mode": "apply" if apply else "dry-run",
-        "resources": resources,
-        "changed": sum(1 for item in resources if item["different"]),
-    }
-    if not apply or not summary["changed"]:
-        return summary
-
-    backup_dir = create_info_v1_sync_backup_dir(root=backup_root)
-    for v2_key, v1_key, raw_v2, raw_v1 in snapshots:
-        _backup_remote_value(backup_dir, v2_key, raw_v2)
-        if raw_v1 is not None:
-            _backup_remote_value(backup_dir, v1_key, raw_v1)
-
-    for v2_key, v1_key, raw_v2, raw_v1 in snapshots:
-        if raw_v1 == raw_v2:
-            continue
-        result = upstash(
-            [
-                "EVAL",
-                INFO_V1_FROM_V2_SYNC_SCRIPT,
-                2,
-                v2_key,
-                v1_key,
-                hashlib.sha1(raw_v2.encode("utf-8")).hexdigest(),
-                (
-                    hashlib.sha1(raw_v1.encode("utf-8")).hexdigest()
-                    if isinstance(raw_v1, str)
-                    else "__missing__"
-                ),
-                raw_v2,
-            ]
-        )
-        if int(result or 0) == -1:
-            raise RuntimeError(f"Refusing v1 sync: {v2_key} changed concurrently")
-        if int(result or 0) != 1:
-            raise RuntimeError(f"Refusing v1 sync: {v1_key} changed concurrently")
-
-    for v2_key, v1_key, _raw_v2, _raw_v1 in snapshots:
-        verified_v2 = upstash(["GET", v2_key])
-        verified_v1 = upstash(["GET", v1_key])
-        if not isinstance(verified_v2, str) or verified_v1 != verified_v2:
-            raise RuntimeError(f"Failed to verify synchronized compatibility key {v1_key}")
-    summary["backupDir"] = str(backup_dir)
-    return summary
 
 
 def _cas_set_json(key: str, raw: str, payload: object, *, upstash=upstash_request) -> None:
@@ -1781,13 +1482,11 @@ def purge_non_target_records(*, apply: bool, upstash=upstash_request) -> dict[st
     missevan = decode_remote_info_payload(MISSEVAN_INFO_KEY, raw_missevan)
     manbo = decode_remote_info_payload(MANBO_INFO_KEY, raw_manbo)
     targets, missing_targets = _validate_purge_targets(missevan, manbo)
-    dates = {platform: load_watchcount_snapshot_dates(platform, upstash=upstash) for platform in PURGE_TARGETS}
     summary: dict[str, object] = {
         "mode": "apply" if apply else "dry-run",
         "targets": targets,
         "missingTargets": missing_targets,
         "alreadyPurged": not targets,
-        "snapshotDates": dates,
     }
     if not apply:
         return summary
@@ -1798,19 +1497,14 @@ def purge_non_target_records(*, apply: bool, upstash=upstash_request) -> dict[st
         QUEUE_KEY,
         MISSEVAN_INFO_KEY,
         MANBO_INFO_KEY,
-        MISSEVAN_INFO_V1_KEY,
-        MANBO_INFO_V1_KEY,
         "missevan:info:meta:v2",
         "manbo:info:meta:v2",
         CVID_MAP_META_KEY,
         RANK_META_KEY,
         "ranks:latest",
-        "ranks:trend:missevan",
-        "ranks:trend:manbo",
     }
-    for platform, platform_dates in dates.items():
+    for platform in PURGE_TARGETS:
         string_keys.add(watchcount_key(platform, "latest"))
-        string_keys.update(watchcount_key(platform, date) for date in platform_dates)
     for key in sorted(string_keys):
         raw = upstash(["GET", key])
         if raw is not None:
@@ -1844,22 +1538,11 @@ def purge_non_target_records(*, apply: bool, upstash=upstash_request) -> dict[st
 
     cleaned_latest: dict[str, dict] = {}
     for platform, target_ids in PURGE_TARGETS.items():
-        for suffix in [*dates[platform], "latest"]:
-            key = watchcount_key(platform, suffix)
-            raw = upstash(["GET", key])
-            if not isinstance(raw, str):
-                raise RuntimeError(f"Refusing purge: missing {key}")
-            payload = decode_remote_watchcount_payload(key, raw)
-            original_count = len(payload["counts"])
-            payload["counts"] = {drama_id: entry for drama_id, entry in payload["counts"].items() if drama_id not in target_ids}
-            if len(payload["counts"]) != original_count:
-                _cas_set_json(key, raw, payload, upstash=upstash)
-            if suffix == "latest":
-                cleaned_latest[platform] = payload
-        history_key = watchcount_key(platform, "history")
-        result = upstash(["HDEL", history_key, *sorted(target_ids)])
-        if not isinstance(result, int):
-            raise RuntimeError(f"Failed to clean {history_key}")
+        cleaned_latest[platform] = remove_watchcount_ids_atomic(
+            platform,
+            target_ids,
+            upstash=upstash,
+        )
 
     raw_ranks = upstash(["GET", "ranks:latest"])
     if not isinstance(raw_ranks, str):
@@ -1869,16 +1552,6 @@ def purge_non_target_records(*, apply: bool, upstash=upstash_request) -> dict[st
     _publish_rank_latest_cas(raw_ranks, ranks_payload, upstash=upstash)
 
     for platform, target_ids in PURGE_TARGETS.items():
-        legacy_key = f"ranks:trend:{platform}"
-        raw = upstash(["GET", legacy_key])
-        if isinstance(raw, str):
-            payload = decode_remote_json_payload(legacy_key, raw)
-            dramas = payload.get("dramas") if isinstance(payload, dict) else None
-            if isinstance(dramas, dict):
-                for drama_id in target_ids:
-                    dramas.pop(drama_id, None)
-            _cas_set_json(legacy_key, raw, payload, upstash=upstash)
-
         v2_key = NORMAL_TREND_V2_KEYS[platform]
         meta, fields, meta_raw = _decode_hash_snapshot(v2_key, upstash(["HGETALL", v2_key]))
         for drama_id in target_ids:
@@ -1895,7 +1568,7 @@ def purge_non_target_records(*, apply: bool, upstash=upstash_request) -> dict[st
         purge_rank_store(local_ranks, PURGE_TARGETS)
         write_json_work_copy(ranks_path, local_ranks)
 
-    verification_hits = verify_purged_non_cv_remote_references(dates, upstash=upstash)
+    verification_hits = verify_purged_non_cv_remote_references(upstash=upstash)
     if verification_hits:
         raise RuntimeError(f"Purge verification failed; non-CV references remain: {verification_hits}")
     verified_missevan = decode_remote_info_payload(MISSEVAN_INFO_KEY, upstash(["GET", MISSEVAN_INFO_KEY]))
@@ -1937,19 +1610,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Preview or purge the exact approved non-target drama records from non-CV stores",
     )
     parser.add_argument(
-        "--sync-info-v1-from-v2",
-        action="store_true",
-        help="Preview or synchronize compatibility info v1 keys from authoritative v2",
-    )
-    parser.add_argument(
         "--apply",
         action="store_true",
-        help="Apply a purge or v2-to-v1 compatibility synchronization; otherwise dry-run",
-    )
-    parser.add_argument(
-        "--backfill-info-v2",
-        action="store_true",
-        help="Build info v2 and meta keys from the current remote v1 libraries without platform API calls",
+        help="Apply a purge; otherwise dry-run",
     )
     return parser.parse_args(argv)
 
@@ -1958,20 +1621,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     configure_stdio()
     load_env_file(ROOT / ".env")
-    if args.purge_non_target_records and args.sync_info_v1_from_v2:
-        raise RuntimeError("Choose only one of --purge-non-target-records or --sync-info-v1-from-v2")
-    if args.apply and not (args.purge_non_target_records or args.sync_info_v1_from_v2):
-        raise RuntimeError(
-            "--apply is only valid with --purge-non-target-records or --sync-info-v1-from-v2"
-        )
-    if args.sync_info_v1_from_v2:
-        result = sync_info_v1_from_v2(apply=args.apply)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0
-    if args.backfill_info_v2:
-        for key in (MANBO_INFO_V1_KEY, MISSEVAN_INFO_V1_KEY):
-            backfill_info_v2(key, upstash=upstash_request)
-        return 0
+    if args.apply and not args.purge_non_target_records:
+        raise RuntimeError("--apply is only valid with --purge-non-target-records")
     if args.cleanup_invalid_manbo_ids:
         stats = cleanup_invalid_manbo_ids()
         print("[ok] cleaned invalid 漫播 dramaIds:", json.dumps(stats, ensure_ascii=False))

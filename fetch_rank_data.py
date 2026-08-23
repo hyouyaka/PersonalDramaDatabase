@@ -14,6 +14,7 @@ from pathlib import Path
 
 import requests
 
+from archive_manager import decode_archive_payload
 from platform_sync import (
     MANBO_CATALOG_NAME_ALIASES,
     MANBO_CATALOG_NAME_BY_ID,
@@ -21,6 +22,7 @@ from platform_sync import (
     MISSEVAN_CATALOG_NAME_BY_ID,
     MissevanRequester,
     load_json,
+    manbo_main_cv_display_names,
     is_numeric_drama_id,
     is_target_catalog,
     missevan_main_cv_entries,
@@ -28,7 +30,6 @@ from platform_sync import (
     request_manbo_json,
     save_json as _save_json,
 )
-from rank_key_cleanup import cleanup_legacy_normal_rank_keys, run_cleanup_best_effort
 from upstash_v2 import (
     NORMAL_TREND_V2_KEYS,
     PEAK_TREND_V2_KEY,
@@ -70,13 +71,8 @@ LOCAL_TIMEZONE = datetime.now().astimezone().tzinfo or timezone.utc
 load_env_file(HERE / ".env")
 
 QUEUE_KEY = "new:dramaIDs"
-PEAK_TREND_KEY = "ranks:trend:peak:missevan"
 SERIES_INFO_KEY = "drama:series-info:v1"
 PLATFORMS = ("missevan", "manbo")
-TREND_KEYS = {
-    "missevan": "ranks:trend:missevan",
-    "manbo": "ranks:trend:manbo",
-}
 ONGOING_KEYS = {
     "missevan": "ongoing:missevan",
     "manbo": "ongoing:manbo",
@@ -399,7 +395,13 @@ def load_series_info() -> dict:
     return load_json(SERIES_INFO_PATH, {})
 
 
-def upload_rank_outputs(store: dict, platforms: tuple[str, ...] | list[str]) -> dict:
+def upload_rank_outputs(
+    store: dict,
+    platforms: tuple[str, ...] | list[str],
+    *,
+    archived_by_platform: dict[str, set[str]] | None = None,
+) -> dict:
+    filter_archived_dramas(store, archived_by_platform=archived_by_platform)
     generated_at = now_iso()
     history_date = generated_at[:10]
     payloads = build_rank_snapshot_payloads(
@@ -424,7 +426,6 @@ def upload_rank_outputs(store: dict, platforms: tuple[str, ...] | list[str]) -> 
             generated_at=generated_at,
         )
     upload_full_ranks(store)
-    run_cleanup_best_effort(lambda: cleanup_legacy_normal_rank_keys(upstash_request))
     return store
 
 
@@ -658,7 +659,7 @@ def build_rank_trend_payload(
     generated_at: str,
     pruned_dates: list[str] | tuple[str, ...] | set[str] = (),
 ) -> dict:
-    if platform not in TREND_KEYS:
+    if platform not in PLATFORMS:
         raise ValueError(f"Unsupported platform: {platform}")
 
     payload = current if isinstance(current, dict) else {}
@@ -754,7 +755,6 @@ def upload_rank_trend_snapshot(
     generated_at: str,
     pruned_dates: list[str] | tuple[str, ...] | set[str] = (),
 ) -> dict:
-    key = TREND_KEYS[platform]
     v2_payload = build_rank_trend_payload(
         None,
         platform,
@@ -765,29 +765,10 @@ def upload_rank_trend_snapshot(
         pruned_dates=pruned_dates,
     )
     publish_trend_v2_best_effort(
-        f"{key}:v2",
+        NORMAL_TREND_V2_KEYS[platform],
         lambda: publish_normal_trend_v2(platform, v2_payload, upstash=upstash_request),
     )
-    legacy_exists = int(upstash_request(["EXISTS", key]) or 0) == 1
-    current = _load_upstash_json_strict(key) if legacy_exists else None
-    payload = build_rank_trend_payload(
-        current if isinstance(current, dict) else None,
-        platform,
-        history_date,
-        metrics_payload if isinstance(metrics_payload, dict) else None,
-        list_payload if isinstance(list_payload, dict) else None,
-        generated_at=generated_at,
-        pruned_dates=pruned_dates,
-    )
-    if legacy_exists:
-        encoded = json.dumps(payload, ensure_ascii=False)
-        result = upstash_request(["SET", key, encoded])
-        if result != "OK":
-            raise RuntimeError(f"Failed to upload {key}: {result!r}")
-        print(f"[ok] uploaded legacy {key} ({len(encoded)} bytes, date={history_date})")
-    else:
-        print(f"[skip] legacy key is retired: {key}")
-    return payload
+    return v2_payload
 
 
 def build_missevan_peak_trend_payload(
@@ -879,47 +860,10 @@ def upload_missevan_peak_trend(
         pruned_dates=pruned_dates,
     )
     publish_trend_v2_best_effort(
-        f"{PEAK_TREND_KEY}:v2",
+        PEAK_TREND_V2_KEY,
         lambda: publish_peak_trend_v2(v2_payload, upstash=upstash_request),
     )
-    legacy_exists = int(upstash_request(["EXISTS", PEAK_TREND_KEY]) or 0) == 1
-    current = _load_upstash_json(PEAK_TREND_KEY) if legacy_exists else None
-    payload = build_missevan_peak_trend_payload(
-        current if isinstance(current, dict) else None,
-        store,
-        history_date,
-        generated_at,
-        pruned_dates=pruned_dates,
-    )
-    if legacy_exists:
-        encoded = json.dumps(payload, ensure_ascii=False)
-        result = upstash_request(["SET", PEAK_TREND_KEY, encoded])
-        if result != "OK":
-            raise RuntimeError(f"Failed to upload {PEAK_TREND_KEY}: {result!r}")
-        print(f"[ok] uploaded legacy {PEAK_TREND_KEY} ({len(encoded)} bytes, date={history_date})")
-    else:
-        print(f"[skip] legacy key is retired: {PEAK_TREND_KEY}")
-    return payload
-
-
-def backfill_rank_trend_v2() -> None:
-    target_keys = [*NORMAL_TREND_V2_KEYS.values(), PEAK_TREND_V2_KEY]
-    existing = [key for key in target_keys if int(upstash_request(["EXISTS", key]) or 0) == 1]
-    if existing:
-        raise RuntimeError(
-            "Refusing legacy backfill because authoritative v2 already exists: "
-            + ", ".join(existing)
-        )
-    for platform in PLATFORMS:
-        key = TREND_KEYS[platform]
-        payload = _load_upstash_json_strict(key)
-        if not isinstance(payload, dict):
-            raise RuntimeError(f"Unable to backfill {key}: invalid payload")
-        publish_normal_trend_v2(platform, payload, upstash=upstash_request, force=True)
-    peak_payload = _load_upstash_json(PEAK_TREND_KEY)
-    if not isinstance(peak_payload, dict):
-        raise RuntimeError(f"Unable to backfill {PEAK_TREND_KEY}: invalid payload")
-    publish_peak_trend_v2(peak_payload, upstash=upstash_request, force=True)
+    return v2_payload
 
 
 def _history_date_from_store_meta(store: dict) -> tuple[str, str]:
@@ -937,6 +881,7 @@ def backfill_missevan_peak_trend_from_latest() -> str:
     latest = _load_upstash_json("ranks:latest")
     if not isinstance(latest, dict):
         raise RuntimeError("Unable to load ranks:latest for peak trend backfill.")
+    filter_archived_dramas(latest)
     history_date, generated_at = _history_date_from_store_meta(latest)
     upload_missevan_peak_trend(
         latest,
@@ -2095,19 +2040,44 @@ def update_metadata_fields(entry: dict, *, catalog_name: str | None, pay_status:
 
 
 def manbo_main_cv_names(record: dict) -> list[str] | None:
-    names = record.get("mainCvNames") or []
-    nicknames = record.get("mainCvNicknames") or []
-    count = max(len(names), len(nicknames))
-    if count <= 0:
-        return None
+    return manbo_main_cv_display_names(record) or None
 
-    resolved: list[str] = []
-    for idx in range(count):
-        name = normalize(names[idx]) if idx < len(names) else ""
-        if not name and idx < len(nicknames):
-            name = normalize(nicknames[idx])
-        resolved.append(name)
-    return resolved or None
+
+def archived_drama_ids(payload: object, *, platform: str, key: str) -> set[str]:
+    if payload in (None, ""):
+        raise RuntimeError(f"Failed to load {key}: archive payload is missing")
+    archive = decode_archive_payload(payload, platform, key=key)
+    records = archive["records"]
+    return {str(drama_id) for drama_id in records if is_numeric_drama_id(drama_id)}
+
+
+def load_archived_drama_ids() -> dict[str, set[str]]:
+    print("  [upstash] loading archived drama IDs ...")
+    archived_by_platform: dict[str, set[str]] = {}
+    for platform in ("missevan", "manbo"):
+        key = f"{platform}:info:archive:v1"
+        payload = _load_upstash_json_strict(key)
+        archived_by_platform[platform] = archived_drama_ids(payload, platform=platform, key=key)
+    return archived_by_platform
+
+
+def filter_archived_dramas(
+    store: dict,
+    *,
+    archived_by_platform: dict[str, set[str]] | None = None,
+) -> dict[str, set[str]]:
+    """Remove archived dramas before rank outputs are allowed to publish."""
+    if archived_by_platform is None:
+        archived_by_platform = load_archived_drama_ids()
+    for platform, archived_ids in archived_by_platform.items():
+        if not archived_ids:
+            continue
+        platform_dramas = (store.get(platform) or {}).get("dramas")
+        if isinstance(platform_dramas, dict):
+            for drama_id in archived_ids:
+                platform_dramas.pop(drama_id, None)
+        remove_drama_ids_from_rank_items(store, platform, archived_ids)
+    return archived_by_platform
 
 
 def lookup_cvs(store: dict) -> None:
@@ -2396,6 +2366,14 @@ def collect_null_danmaku_ids_from_layers(
         "latest": _load_upstash_json_strict("ranks:latest"),
         "trend": _load_normal_trend_v2_strict(platform),
     }
+    archived_by_platform = load_archived_drama_ids()
+    payloads["archived"] = archived_by_platform
+    latest_payload = payloads.get("latest")
+    if isinstance(latest_payload, dict):
+        filter_archived_dramas(
+            latest_payload,
+            archived_by_platform=archived_by_platform,
+        )
     if platform == "manbo":
         payloads["ongoing"] = _load_upstash_json(ONGOING_KEYS[platform])
     targets: set[str] = set()
@@ -2413,6 +2391,8 @@ def collect_null_danmaku_ids_from_layers(
     trend_dramas = trend.get("dramas") if isinstance(trend, dict) else None
     if isinstance(trend_dramas, dict):
         for drama_id, entry in trend_dramas.items():
+            if str(drama_id) in archived_by_platform.get(platform, set()):
+                continue
             if not isinstance(entry, dict):
                 continue
             samples = entry.get("samples")
@@ -2515,6 +2495,12 @@ def write_repaired_danmaku_layers(
 
     generated_at = now_iso()
     latest_payload = _ensure_repair_latest_payload(loaded_payloads.get("latest"), generated_at)
+    raw_archived = loaded_payloads.get("archived")
+    archived_by_platform = raw_archived if isinstance(raw_archived, dict) else load_archived_drama_ids()
+    filter_archived_dramas(
+        latest_payload,
+        archived_by_platform=archived_by_platform,
+    )
     trend_payload = _ensure_repair_trend_payload(
         loaded_payloads.get("trend"),
         platform,
@@ -2570,15 +2556,6 @@ def write_repaired_danmaku_layers(
         NORMAL_TREND_V2_KEYS[platform],
         lambda: publish_normal_trend_v2(platform, trend_payload, upstash=upstash_request),
     )
-    legacy_key = TREND_KEYS[platform]
-    if int(upstash_request(["EXISTS", legacy_key]) or 0) == 1:
-        encoded = json.dumps(trend_payload, ensure_ascii=False)
-        result = upstash_request(["SET", legacy_key, encoded])
-        if result != "OK":
-            raise RuntimeError(f"Failed to upload compatibility key {legacy_key}: {result!r}")
-        print(f"[ok] repaired existing compatibility key {legacy_key} ({len(encoded)} bytes)")
-    else:
-        print(f"[skip] legacy key is retired: {legacy_key}")
 
 
 def fetch_one_missevan_danmaku_count(drama_id: str, requester: MissevanRequester | None = None) -> tuple[str, int]:
@@ -2778,7 +2755,6 @@ def main() -> None:
     parser.add_argument("--benchmark-page-concurrency", type=int, default=MANBO_DANMAKU_PAGE_CONCURRENCY, help="Global page concurrency for Manbo benchmark")
     parser.add_argument("--benchmark-page-size", type=int, default=MANBO_DANMAKU_PAGE_SIZE, help="Page size for Manbo benchmark")
     parser.add_argument("--backfill-missevan-peak-trend-from-latest", action="store_true", help="Backfill Missevan peak view-count trend from ranks:latest")
-    parser.add_argument("--backfill-rank-trend-v2", action="store_true", help="Build v2 normal and peak trend hashes from current Upstash v1 aggregates")
     parser.add_argument("--repair-null-danmaku", action="store_true", help="Repair empty danmaku UID counts across Upstash rank layers")
     parser.add_argument("--repair-attempts", type=int, default=DANMAKU_DRAMA_RETRY_ATTEMPTS, help="Retry rounds for failed danmaku repairs")
     parser.add_argument("--dry-run", action="store_true", help="List repair targets without fetching or writing")
@@ -2800,12 +2776,6 @@ def main() -> None:
         for platform, enabled in (("missevan", do_missevan), ("manbo", do_manbo))
         if enabled
     )
-
-    if args.backfill_rank_trend_v2:
-        print("=== Backfilling rank trend v2 hashes ===")
-        backfill_rank_trend_v2()
-        print("=== Done (backfill-rank-trend-v2) ===")
-        return
 
     if args.repair_null_danmaku:
         print("=== Repairing null danmaku UID counts ===")
@@ -2830,7 +2800,7 @@ def main() -> None:
     if args.backfill_missevan_peak_trend_from_latest:
         print("=== Backfilling Missevan peak trend from ranks:latest ===")
         history_date = backfill_missevan_peak_trend_from_latest()
-        print(f"[ok] backfilled {PEAK_TREND_KEY} for {history_date}")
+        print(f"[ok] backfilled {PEAK_TREND_V2_KEY} for {history_date}")
         return
 
     if args.benchmark_manbo_danmaku:
@@ -2872,6 +2842,9 @@ def main() -> None:
     store["manbo"].setdefault("ranks", {})
     store["manbo"].setdefault("dramas", {})
     sanitize_rank_store(store)
+    archived_by_platform = filter_archived_dramas(store)
+    archived_missevan_ids = set(archived_by_platform.get("missevan") or set())
+    archived_manbo_ids = set(archived_by_platform.get("manbo") or set())
 
     # --only-danmaku mode: skip everything else
     if args.only_danmaku:
@@ -2879,7 +2852,11 @@ def main() -> None:
         only_danmaku_mode(store, force=args.force, do_missevan=do_missevan, do_manbo=do_manbo)
         store["_meta"]["updated_at"] = now_iso()
         save_json(RANKS_PATH, store)
-        upload_rank_outputs(store, active_platforms)
+        upload_rank_outputs(
+            store,
+            active_platforms,
+            archived_by_platform=archived_by_platform,
+        )
         clear_418_checkpoint_after_publish(RANK_FETCH_418_CHECKPOINT_PATH)
         print("=== Done (only-danmaku) ===")
         return
@@ -2905,6 +2882,16 @@ def main() -> None:
         manbo_danmaku_ids = set(manbo_progress["danmaku_ids"])
         missevan_to_update = set(missevan_pending)
         manbo_to_update = set(manbo_pending)
+        for ids in (
+            missevan_targets,
+            missevan_pending,
+            missevan_danmaku_ids,
+            missevan_deferred_danmaku_ids,
+            missevan_to_update,
+        ):
+            ids.difference_update(archived_missevan_ids)
+        for ids in (manbo_targets, manbo_pending, manbo_danmaku_ids, manbo_to_update):
+            ids.difference_update(archived_manbo_ids)
         print(
             f"  checkpoint pending: missevan={len(missevan_pending)}/{len(missevan_targets)}, "
             f"manbo={len(manbo_pending)}/{len(manbo_targets)}"
@@ -2958,6 +2945,15 @@ def main() -> None:
                 f"  [manbo] drama IDs: rank={rank_count}, "
                 f"ongoing={len(ongoing_manbo_ids)}, combined={len(manbo_ids)}"
             )
+
+        for ids in (missevan_ids, missevan_danmaku_ids, missevan_deferred_danmaku_ids):
+            ids.difference_update(archived_missevan_ids)
+        for ids in (manbo_ids, manbo_danmaku_ids):
+            ids.difference_update(archived_manbo_ids)
+        filter_archived_dramas(
+            store,
+            archived_by_platform=archived_by_platform,
+        )
 
         save_json(RANKS_PATH, store)
 
@@ -3091,6 +3087,7 @@ def main() -> None:
 
     # Phase 6: Upstash CV lookup
     print("=== Phase 6: Upstash CV lookup ===")
+    filter_archived_dramas(store, archived_by_platform=archived_by_platform)
     try:
         lookup_cvs(store)
     except Exception as exc:
@@ -3102,7 +3099,11 @@ def main() -> None:
 
     # Upload to Upstash
     print("=== Uploading ranks to Upstash ===")
-    upload_rank_outputs(store, active_platforms)
+    upload_rank_outputs(
+        store,
+        active_platforms,
+        archived_by_platform=archived_by_platform,
+    )
     clear_418_checkpoint_after_publish(RANK_FETCH_418_CHECKPOINT_PATH)
 
     print("=== Done ===")

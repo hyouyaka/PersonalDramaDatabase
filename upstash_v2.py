@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import uuid
 from datetime import datetime, timezone
@@ -15,17 +14,11 @@ from upstash_editor import (
     hash_content_stats,
 )
 
-INFO_V2_KEYS = {
-    "missevan:info:v1": "missevan:info:v2",
-    "manbo:info:v1": "manbo:info:v2",
-}
+INFO_V2_KEYS = {"missevan:info:v2", "manbo:info:v2"}
 INFO_V2_META_KEYS = {
-    "missevan:info:v1": "missevan:info:meta:v2",
-    "manbo:info:v1": "manbo:info:meta:v2",
     "missevan:info:v2": "missevan:info:meta:v2",
     "manbo:info:v2": "manbo:info:meta:v2",
 }
-INFO_V1_KEYS = {v2_key: v1_key for v1_key, v2_key in INFO_V2_KEYS.items()}
 CVID_MAP_KEY = "cvid-map:v1"
 CVID_MAP_META_KEY = "cvid-map:meta:v1"
 NORMAL_TREND_V2_KEYS = {
@@ -60,9 +53,6 @@ elseif not current or redis.sha1hex(current) ~= ARGV[1] then
 end
 redis.call('SET', KEYS[1], ARGV[2])
 redis.call('SET', KEYS[2], ARGV[3])
-if redis.call('EXISTS', KEYS[3]) == 1 then
-  redis.call('SET', KEYS[3], ARGV[2])
-end
 return 1
 """
 
@@ -130,10 +120,6 @@ def compact_json(payload: object) -> str:
 
 def string_cas_token(raw: object) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest() if isinstance(raw, str) else "__missing__"
-
-
-def v2_publish_enabled() -> bool:
-    return os.environ.get("UPSTASH_V2_PUBLISH_MODE", "best-effort").strip().lower() != "off"
 
 
 def _verify_rank_resource(
@@ -219,15 +205,9 @@ def publish_rank_string(
 
 
 def info_v2_key(key: str) -> str:
-    if key in INFO_V1_KEYS:
-        return key
     if key in INFO_V2_KEYS:
-        return INFO_V2_KEYS[key]
+        return key
     raise ValueError(f"Unsupported info key: {key}")
-
-
-def info_v1_key(key: str) -> str:
-    return INFO_V1_KEYS[info_v2_key(key)]
 
 
 def _record_count(key: str, payload: object) -> int:
@@ -345,8 +325,6 @@ def publish_info_v2(
     source_encoded: str | None = None,
 ) -> dict | None:
     v2_key = info_v2_key(key)
-    if key in INFO_V2_KEYS and not force and not v2_publish_enabled():
-        return None
     normalized = json.loads(json.dumps(payload, ensure_ascii=False))
     if v2_key == "manbo:info:v2":
         if not isinstance(normalized, dict):
@@ -354,7 +332,6 @@ def publish_info_v2(
         normalized["updatedAt"] = datetime.now(timezone.utc).isoformat()
     encoded = compact_json(normalized)
     meta_key = INFO_V2_META_KEYS[v2_key]
-    legacy_key = info_v1_key(v2_key)
     if source_encoded is None:
         current = upstash(["GET", v2_key])
         expected = (
@@ -369,10 +346,9 @@ def publish_info_v2(
         [
             "EVAL",
             INFO_SOURCE_COMPARE_AND_PUBLISH_SCRIPT,
-            3,
+            2,
             v2_key,
             meta_key,
-            legacy_key,
             expected,
             encoded,
             compact_json(meta),
@@ -392,24 +368,6 @@ def publish_info_v2(
     ):
         raise RuntimeError(f"Remote meta verification failed for {v2_key}")
     print(f"[ok] published authoritative {v2_key} and {meta_key} ({meta['bytes']} bytes)")
-    return meta
-
-
-def backfill_info_v2(v1_key: str, *, upstash: Callable[[list[object]], object]) -> dict:
-    v2_key = info_v2_key(v1_key)
-    if int(upstash(["EXISTS", v2_key]) or 0) == 1:
-        raise RuntimeError(f"Refusing to backfill {v2_key}: authoritative v2 already exists")
-    raw = upstash(["GET", v1_key])
-    if not isinstance(raw, str) or not raw:
-        raise RuntimeError(f"Unable to backfill {v1_key}: remote value is empty")
-    payload = json.loads(raw)
-    meta = publish_info_v2(
-        v1_key,
-        payload,
-        upstash=upstash,
-        force=True,
-    )
-    assert meta is not None
     return meta
 
 
@@ -703,6 +661,12 @@ def merge_cv_v2_authoritative(
             incoming_dates=incoming_dates,
             kept_dates=kept_dates,
         )
+        for field, record in platform_merged.items():
+            candidate = platform_candidate.get(field)
+            if isinstance(candidate, dict) and "works" in candidate:
+                record["works"] = json.loads(json.dumps(candidate["works"], ensure_ascii=False))
+            else:
+                record.pop("works", None)
         for field in [field for field in fields if field.startswith(prefix)]:
             fields.pop(field)
         fields.update(platform_merged)

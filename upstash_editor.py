@@ -49,27 +49,6 @@ redis.call('SET', KEYS[2], ARGV[3])
 return 1
 """
 
-INFO_STRING_SAVE_SCRIPT = """
-local current = redis.call('GET', KEYS[1])
-if not current or redis.sha1hex(current) ~= ARGV[1] then
-  return 0
-end
-local current_meta = redis.call('GET', KEYS[2])
-if ARGV[4] == '__missing__' then
-  if current_meta and current_meta ~= false then
-    return 0
-  end
-elseif not current_meta or redis.sha1hex(current_meta) ~= ARGV[4] then
-  return 0
-end
-redis.call('SET', KEYS[1], ARGV[2])
-redis.call('SET', KEYS[2], ARGV[3])
-if redis.call('EXISTS', KEYS[3]) == 1 then
-  redis.call('SET', KEYS[3], ARGV[2])
-end
-return 1
-"""
-
 HASH_SAVE_SCRIPT = """
 local current_meta = redis.call('HGET', KEYS[1], '__meta__')
 if not current_meta or current_meta ~= ARGV[1] then
@@ -920,32 +899,17 @@ def save_resource(
                     byte_count=byte_count,
                     updated_at=timestamp,
                 )
-            if spec.key in INFO_META_KEYS:
-                legacy_key = spec.key.replace(":v2", ":v1")
-                command: list[object] = [
-                    "EVAL",
-                    INFO_STRING_SAVE_SCRIPT,
-                    3,
-                    spec.key,
-                    meta_key,
-                    legacy_key,
-                    sha1_text(loaded.raw_string),
-                    encoded,
-                    compact_json(meta),
-                    string_cas_token(current_meta),
-                ]
-            else:
-                command = [
-                    "EVAL",
-                    STRING_SAVE_SCRIPT,
-                    2,
-                    spec.key,
-                    meta_key,
-                    sha1_text(loaded.raw_string),
-                    encoded,
-                    compact_json(meta),
-                    string_cas_token(current_meta),
-                ]
+            command: list[object] = [
+                "EVAL",
+                STRING_SAVE_SCRIPT,
+                2,
+                spec.key,
+                meta_key,
+                sha1_text(loaded.raw_string),
+                encoded,
+                compact_json(meta),
+                string_cas_token(current_meta),
+            ]
             result = upstash(command)
             if int(result or 0) == 1:
                 saved = True

@@ -846,16 +846,16 @@ class InfoRefreshTests(unittest.TestCase):
             commands.append(command)
             if command[0] == "GET":
                 return remote_values.get(command[1])
-            if command[0] == "EVAL" and command[2] == 3:
+            if command[0] == "EVAL" and command[2] == 2:
                 compare_attempts += 1
                 if compare_attempts == 1:
                     remote_values["missevan:info:v2"] = second
                     return 0
                 current = remote_values.get(command[3])
-                if hashlib.sha1(current.encode("utf-8")).hexdigest() != command[6]:
+                if hashlib.sha1(current.encode("utf-8")).hexdigest() != command[5]:
                     return 0
-                remote_values[command[3]] = command[7]
-                remote_values[command[4]] = command[8]
+                remote_values[command[3]] = command[6]
+                remote_values[command[4]] = command[7]
                 return 1
             raise AssertionError(command)
 
@@ -884,8 +884,8 @@ class InfoRefreshTests(unittest.TestCase):
         self.assertEqual(saved["100"]["soundIds"], ["2002", "2001"])
         self.assertEqual([command[0] for command in commands[:4]], ["GET", "EVAL", "GET", "EVAL"])
         self.assertEqual(
-            commands[3][3:6],
-            ["missevan:info:v2", "missevan:info:meta:v2", "missevan:info:v1"],
+            commands[3][3:5],
+            ["missevan:info:v2", "missevan:info:meta:v2"],
         )
 
     def test_remote_info_patch_updates_manbo_cover_and_sound_ids(self) -> None:
@@ -900,9 +900,9 @@ class InfoRefreshTests(unittest.TestCase):
             commands.append(command)
             if command[0] == "GET":
                 return remote_values.get(command[1])
-            if command[0] == "EVAL" and command[2] == 3:
-                remote_values[command[3]] = command[7]
-                remote_values[command[4]] = command[8]
+            if command[0] == "EVAL" and command[2] == 2:
+                remote_values[command[3]] = command[6]
+                remote_values[command[4]] = command[7]
                 return 1
             if command[0] == "EVAL":
                 remote_values[command[3]] = command[5]
@@ -935,8 +935,8 @@ class InfoRefreshTests(unittest.TestCase):
         self.assertEqual(saved["records"][0]["soundIds"], ["3002", "3001"])
         self.assertEqual([command[0] for command in commands[:2]], ["GET", "EVAL"])
         self.assertEqual(
-            commands[1][3:6],
-            ["manbo:info:v2", "manbo:info:meta:v2", "manbo:info:v1"],
+            commands[1][3:5],
+            ["manbo:info:v2", "manbo:info:meta:v2"],
         )
 
 

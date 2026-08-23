@@ -39,6 +39,8 @@ MISSEVAN_CATALOG_NAME_BY_ID = {89: "广播剧", 90: "广播剧", 93: "有声剧"
 MANBO_CATALOG_NAME_BY_ID = {1: "广播剧", 5: "有声剧"}
 MANBO_CATALOG_NAME_ALIASES = {"有声书": "有声剧"}
 MANBO_COVER_FIELDS = ("coverPic", "largePic", "cover", "sharePicUrl")
+UNKNOWN_MAIN_CV_MARKER = "主役未知"
+UNKNOWN_MAIN_CV_DISPLAY = "暂无"
 MANBO_CATALOG_OVERRIDES = {
     "奇洛李维斯回信": {"catalog": 5, "catalogName": "有声剧"},
 }
@@ -283,6 +285,52 @@ def normalize_match(value: object) -> str:
     return re.sub(r"\s+", "", normalize(value)).casefold()
 
 
+def is_unknown_main_cv(value: object) -> bool:
+    return normalize_match(value) == normalize_match(UNKNOWN_MAIN_CV_MARKER)
+
+
+def main_cv_display_name(value: object) -> str:
+    return UNKNOWN_MAIN_CV_DISPLAY if is_unknown_main_cv(value) else normalize(value)
+
+
+def missevan_has_unknown_main_cv(node: dict | None) -> bool:
+    if not isinstance(node, dict):
+        return False
+    candidates = list(node.get("fallbackCvNames") or [])
+    cvnames = node.get("cvnames")
+    if isinstance(cvnames, dict):
+        candidates.extend(cvnames.values())
+    return any(is_unknown_main_cv(value) for value in candidates)
+
+
+def manbo_has_unknown_main_cv(record: dict | None) -> bool:
+    if not isinstance(record, dict):
+        return False
+    candidates = [
+        *(record.get("mainCvNames") or []),
+        *(record.get("mainCvNicknames") or []),
+    ]
+    return any(is_unknown_main_cv(value) for value in candidates)
+
+
+def manbo_main_cv_display_names(record: dict | None) -> list[str]:
+    if not isinstance(record, dict):
+        return []
+    if manbo_has_unknown_main_cv(record):
+        return [UNKNOWN_MAIN_CV_DISPLAY]
+    names = record.get("mainCvNames") or []
+    nicknames = record.get("mainCvNicknames") or []
+    count = max(len(names), len(nicknames))
+    resolved: list[str] = []
+    for index in range(count):
+        name = normalize(names[index]) if index < len(names) else ""
+        if not name and index < len(nicknames):
+            name = normalize(nicknames[index])
+        if name:
+            resolved.append(name)
+    return resolved
+
+
 def normalize_text_for_match(value: object) -> str:
     text = unicodedata.normalize("NFKC", normalize(value))
     return re.sub(r"\s+", " ", text).strip()
@@ -309,6 +357,16 @@ def safe_int(value: object, default: int = 0) -> int:
 
 def missevan_main_cv_entries(node: dict) -> list[dict]:
     """Return numeric and name-only Missevan main CVs in display order."""
+    if missevan_has_unknown_main_cv(node):
+        return [
+            {
+                "cv_id": None,
+                "display_name": UNKNOWN_MAIN_CV_DISPLAY,
+                "role_name": "",
+                "name_only": True,
+                "unknown": True,
+            }
+        ]
     cvnames = node.get("cvnames") or {}
     cvroles = node.get("cvroles") or {}
     entries: list[dict] = []
@@ -324,21 +382,26 @@ def missevan_main_cv_entries(node: dict) -> list[dict]:
             continue
         seen_ids.add(cv_id)
         display_name = normalize(cvnames.get(str(raw_cv_id)) or cvnames.get(str(cv_id)))
+        unknown = is_unknown_main_cv(display_name)
+        if unknown:
+            display_name = UNKNOWN_MAIN_CV_DISPLAY
         name_key = normalize_match(display_name)
         if name_key:
             seen_names.add(name_key)
         entries.append(
             {
-                "cv_id": cv_id,
+                "cv_id": None if unknown else cv_id,
                 "display_name": display_name,
                 "role_name": normalize(cvroles.get(str(raw_cv_id)) or cvroles.get(str(cv_id))),
-                "name_only": False,
+                "name_only": unknown,
+                "unknown": unknown,
             }
         )
 
     fallback_roles = node.get("fallbackCvRoles") or {}
     for raw_name in node.get("fallbackCvNames") or []:
-        display_name = normalize(raw_name)
+        unknown = is_unknown_main_cv(raw_name)
+        display_name = main_cv_display_name(raw_name)
         name_key = normalize_match(display_name)
         if not display_name or name_key in seen_names:
             continue
@@ -349,6 +412,7 @@ def missevan_main_cv_entries(node: dict) -> list[dict]:
                 "display_name": display_name,
                 "role_name": normalize(fallback_roles.get(raw_name) or fallback_roles.get(display_name)),
                 "name_only": True,
+                "unknown": unknown,
             }
         )
     return entries

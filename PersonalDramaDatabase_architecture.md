@@ -55,7 +55,7 @@ flowchart LR
         S[new:dramaIDs] --> T[sync_new_drama_ids.py]
         T --> B
         T --> D
-        T --> U[missevan:info:v1 / manbo:info:v1]
+        T --> U[missevan:info:v2 / manbo:info:v2 + meta]
         V[fetch_ongoing.py] --> W[ongoing:missevan / ongoing:manbo]
         X[fetch_rank_data.py] --> Y[ranks:latest]
         X --> Z[ranks:trend:*]
@@ -99,12 +99,9 @@ flowchart LR
 
 远端 Upstash 还维护每个平台的播放量快照索引：
 
-- `missevan:watchcount:index`、`manbo:watchcount:index` 的结构为 `version`、`platform`、`updated_at`、`dates`
-- `dates` 只包含升序去重的 `YYYY-MM-DD` 快照日期，不包含 `latest`，最多保留 32 期
 - `missevan:watchcount:history`、`manbo:watchcount:history` 为 Redis Hash；field 为 dramaId，value 为包含 `name` 和升序 `points` 的 JSON 字符串
-- 发布顺序固定为 dated snapshot、latest、HSET 暂存 history、index、清理过期 points/field、淘汰快照；history 或 index 写失败时任务失败，重试保持幂等
-- 首次建立 index 会通过 SCAN 回填现有快照日期；消费端优先读 index，部署过渡期保留带缓存的 SCAN fallback
-- 共享读取函数为 `load_watchcount_snapshot_dates`；发布路径按该日期列表读取需要的快照
+- 发布路径严格读取现有 latest/history，并通过一次 Lua/CAS 原子更新两者；每条 history 最多保留最近 32 点
+- history 缺失或损坏时发布失败，不读取 index、日期快照或执行 SCAN 重建
 
 播放量刷新时，猫耳 `getdrama` 和漫播 `dramaDetail` 响应还会同步更新各自源库中的付费信息、
 会员状态和非空的 `soundIds`；这些字段与播放量共用同一次平台请求。
@@ -244,7 +241,7 @@ flowchart LR
 - 猫耳 HTTP 403、漫播 HTTP 200 响应体中的 `code=400` 且 `msg=作品已下架` 使用 30/60/120 秒延迟重试，共最多 4 次请求
 - 重试使用延迟队列，等待期间继续抓取其他作品；连续 4 次命中后才生成归档候选
 - info、latest、history 与 archive key 通过单次 Upstash CAS/Lua 原子迁移；旧日期快照不重写
-- watchcount history 重建时会排除全部 archive ID，避免旧日期快照令已归档剧目复活
+- watchcount 发布会同时从 latest 与 history 排除全部 archive ID，避免本地缓存残留令已归档剧目复活
 
 注意：
 
@@ -321,9 +318,8 @@ flowchart LR
 - `missevan:info:v2` / `manbo:info:v2`
 - `missevan:info:meta:v2` / `manbo:info:meta:v2`
 - `cvid-map:v1` / `cvid-map:meta:v1`
-- 兼容期镜像：`missevan:info:v1` / `manbo:info:v1`
 
-`upstash_v2.py` 集中处理资料库发布。v2 是权威正文；helper 以原始 v2 正文的 SHA-1 做 CAS，并在同一 Lua 操作内更新 v2、对应 meta 和仍存在的 v1 兼容镜像。正文、meta 或兼容镜像发布失败都会中止任务。`sync_new_drama_ids.py`、`refresh_watch_counts.py`、GUI 编辑器和封面回填入口均沿用该策略。兼容期可用 `--sync-info-v1-from-v2` 先 dry-run、再配合 `--apply` 将已有 v1 校准为 v2；v1 退役删除后，常规发布不会重新创建它。
+`upstash_v2.py` 集中处理资料库发布。helper 以原始 v2 正文的 SHA-1 做 CAS，并在同一 Lua 操作内更新 v2 与对应 meta；所有资料库写入入口均不再读取或更新 info v1。
 
 `cvid-map:v1` 也通过同一类 CAS 原子发布同步更新 `cvid-map:meta:v1`。其 meta 字段与平台 info meta 一致，包含 `schemaVersion`、`dataKey`、`contentSha1`、`updatedAt`、`recordCount` 和 `bytes`。
 
@@ -371,10 +367,10 @@ flowchart LR
 当前 remote 输出分层如下：
 
 - `ranks:latest`：合并后的完整最新 store
-- `ranks:trend:{platform}`：普通榜单趋势聚合，内部保留最近 90 个日期样本
-- `ranks:trend:peak:missevan`：猫耳巅峰榜趋势聚合，内部保留最近 90 个日期样本
+- `ranks:trend:missevan:v2` / `ranks:trend:manbo:v2`：普通榜单趋势 Hash
+- `ranks:trend:peak:missevan:v2`：猫耳巅峰榜趋势 Hash
 - `ranks:cv:latest`：最新 CV 榜单
-- `ranks:trend:cv:{platform}`：CV 趋势聚合，内部保留最近 50 个日期样本
+- `ranks:trend:cv:v2`：按平台和规范化 CV 名分 field 的趋势 Hash，保留最近 50 个日期样本
 - `ranks:meta`：普通榜单与 CV 榜单的发布完成时间
 
 v2 趋势层由 `upstash_v2.py` 生成并以 staging Hash + `RENAME` 原子替换：
@@ -384,13 +380,7 @@ v2 趋势层由 `upstash_v2.py` 生成并以 staging Hash + `RENAME` 原子替�
 - `ranks:trend:cv:v2`：field 为 `missevan:{规范化CV名}` 或 `manbo:{规范化CV名}`，保留 50 个周采样日期
 - 每个 Hash 均含 `__meta__`；staging 设置 24 小时 TTL，按最多 100 个 field 分批 `HSET`，通过 `HLEN` 和抽样 JSON 校验后，以同一 Lua 操作执行 `RENAME` 与 `PERSIST`，避免稳定 key 继承 staging TTL
 
-三个只读 Upstash 的 v2 回填入口：
-
-```powershell
-python sync_new_drama_ids.py --backfill-info-v2
-python fetch_rank_data.py --backfill-rank-trend-v2
-python build_cv_ranks.py --backfill-cv-trend-v2
-```
+旧聚合 String 的回填入口已从 v2-only 版本移除；任何恢复操作必须使用部署前备份和兼容标签。
 
 不再创建 `ranks:partial:*`、`ranks:index`、`ranks:list:{date}:*`、
 `ranks:metrics:{date}:*` 和 `ranks:cv:{date}`。普通与 CV 发布成功后分别扫描并删除
@@ -443,7 +433,7 @@ GUI 现在不是一个简单 launcher，而是一个桌面工作台：
 
 1. 外部流程把待补剧目的 `dramaId` 写入 `new:dramaIDs`
 2. `sync_new_drama_ids.py` 调用 append 脚本补齐源库
-3. 脚本以 CAS 上传权威 `missevan:info:v2` / `manbo:info:v2`、对应 meta，并同步仍存在的 v1 兼容镜像
+3. 脚本以 CAS 上传权威 `missevan:info:v2` / `manbo:info:v2` 及对应 meta；运行时不读写 info v1
 4. 只有“最小可用字段齐全”的 ID 才会从队列删除
 
 ### 3. Ongoing + Rank 发布流程
@@ -501,7 +491,7 @@ GUI 现在不是一个简单 launcher，而是一个桌面工作台：
 
 - `UPSTASH_REDIS_REST_URL`
 - `UPSTASH_REDIS_REST_TOKEN`
-- `UPSTASH_V2_PUBLISH_MODE`：仅供旧版非强制 v1→v2 兼容调用使用；当前权威 v2 发布流程不会被 `off` 关闭，不能作为回滚开关
+- Info 和趋势发布固定写入 v2；不再提供环境变量关闭权威 v2 发布，也不能通过旧发布模式回滚。
 
 #### 猫耳 timeline 抓取
 

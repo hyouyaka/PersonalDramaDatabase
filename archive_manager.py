@@ -91,7 +91,7 @@ for index = 1, 4 do
 end
 local id_count = tonumber(ARGV[9])
 for index = 1, id_count do
-  local current = redis.call('HGET', KEYS[7], ARGV[9 + index])
+  local current = redis.call('HGET', KEYS[6], ARGV[9 + index])
   local expected = ARGV[9 + id_count + index]
   if expected == '__missing__' then
     if current and current ~= false then return 0 end
@@ -101,14 +101,11 @@ for index = 1, id_count do
 end
 redis.call('SET', KEYS[1], ARGV[5])
 redis.call('SET', KEYS[5], ARGV[6])
-if redis.call('EXISTS', KEYS[6]) == 1 then
-  redis.call('SET', KEYS[6], ARGV[5])
-end
 redis.call('SET', KEYS[2], ARGV[7])
 redis.call('SET', KEYS[3], ARGV[8])
 redis.call('SET', KEYS[4], ARGV[9 + id_count * 2 + 1])
 for index = 1, id_count do
-  redis.call('HDEL', KEYS[7], ARGV[9 + index])
+  redis.call('HDEL', KEYS[6], ARGV[9 + index])
 end
 return 1
 """
@@ -391,7 +388,6 @@ def publish_archive_candidates(
     latest_key = watchcount_key(platform, "latest")
     watch_archive_key = ARCHIVE_WATCHCOUNT_KEYS[platform]
     meta_key = f"{platform}:info:meta:v2"
-    legacy_key = f"{platform}:info:v1"
     history_key = watchcount_key(platform, "history")
 
     for _attempt in range(max_attempts):
@@ -465,13 +461,12 @@ def publish_archive_candidates(
             [
                 "EVAL",
                 ARCHIVE_MOVE_SCRIPT,
-                7,
+                6,
                 active_key,
                 info_archive_key,
                 latest_key,
                 watch_archive_key,
                 meta_key,
-                legacy_key,
                 history_key,
                 *args,
             ]

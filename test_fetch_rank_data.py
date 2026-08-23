@@ -220,6 +220,7 @@ class RankFetch418CheckpointTests(unittest.TestCase):
                 patch.object(fetch_rank_data, "load_initial_rank_store", side_effect=AssertionError("remote must not load")),
                 patch.object(fetch_rank_data, "fetch_missevan_ranks", side_effect=AssertionError("ranks must not refetch")),
                 patch.object(fetch_rank_data, "fetch_missevan_drama_details", side_effect=fake_details),
+                patch.object(fetch_rank_data, "filter_archived_dramas"),
                 patch.object(fetch_rank_data, "lookup_cvs"),
                 patch.object(fetch_rank_data, "save_json"),
                 patch.object(fetch_rank_data, "upload_rank_outputs") as upload,
@@ -251,6 +252,7 @@ class RankFetch418CheckpointTests(unittest.TestCase):
                 patch.object(fetch_rank_data, "load_initial_rank_store", return_value=store),
                 patch.object(fetch_rank_data, "fetch_missevan_ranks", return_value=(set(), set(), set())),
                 patch.object(fetch_rank_data, "load_ongoing_drama_ids", return_value=set()),
+                patch.object(fetch_rank_data, "filter_archived_dramas"),
                 patch.object(fetch_rank_data, "lookup_cvs"),
                 patch.object(fetch_rank_data, "save_json"),
                 patch.object(fetch_rank_data, "upload_rank_outputs") as upload,
@@ -260,6 +262,72 @@ class RankFetch418CheckpointTests(unittest.TestCase):
 
             upload.assert_called_once()
             self.assertFalse(checkpoint_path.exists())
+
+    def test_archive_filter_failure_aborts_before_rank_publish(self) -> None:
+        store = self._store()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "checkpoint.json"
+            with (
+                patch.object(sys, "argv", ["fetch_rank_data.py", "--force", "--missevan-only"]),
+                patch.object(fetch_rank_data, "RANK_FETCH_418_CHECKPOINT_PATH", checkpoint_path),
+                patch.object(fetch_rank_data, "load_initial_rank_store", return_value=store),
+                patch.object(
+                    fetch_rank_data,
+                    "fetch_missevan_ranks",
+                    return_value=(set(), set(), set()),
+                ) as fetch_ranks,
+                patch.object(fetch_rank_data, "load_ongoing_drama_ids", return_value=set()),
+                patch.object(
+                    fetch_rank_data,
+                    "filter_archived_dramas",
+                    side_effect=RuntimeError("archive unavailable"),
+                ),
+                patch.object(fetch_rank_data, "lookup_cvs") as lookup,
+                patch.object(fetch_rank_data, "save_json"),
+                patch.object(fetch_rank_data, "upload_rank_outputs") as upload,
+                patch("builtins.print"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "archive unavailable"):
+                    fetch_rank_data.main()
+
+            lookup.assert_not_called()
+            fetch_ranks.assert_not_called()
+            upload.assert_not_called()
+
+    def test_normal_refresh_excludes_archived_ids_before_detail_fetch(self) -> None:
+        store = self._store()
+        captured_detail_ids: list[set[str]] = []
+
+        def fake_details(_requester, ids, _store, **kwargs):
+            captured_detail_ids.append(set(ids))
+            kwargs["pending_ids"].clear()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "checkpoint.json"
+            with (
+                patch.object(sys, "argv", ["fetch_rank_data.py", "--force", "--missevan-only"]),
+                patch.object(fetch_rank_data, "RANK_FETCH_418_CHECKPOINT_PATH", checkpoint_path),
+                patch.object(fetch_rank_data, "load_initial_rank_store", return_value=store),
+                patch.object(
+                    fetch_rank_data,
+                    "load_archived_drama_ids",
+                    return_value={"missevan": {"2"}, "manbo": set()},
+                ),
+                patch.object(
+                    fetch_rank_data,
+                    "fetch_missevan_ranks",
+                    return_value=({"1", "2"}, {"1", "2"}, set()),
+                ),
+                patch.object(fetch_rank_data, "load_ongoing_drama_ids", return_value=set()),
+                patch.object(fetch_rank_data, "fetch_missevan_drama_details", side_effect=fake_details),
+                patch.object(fetch_rank_data, "lookup_cvs"),
+                patch.object(fetch_rank_data, "save_json"),
+                patch.object(fetch_rank_data, "upload_rank_outputs"),
+                patch("builtins.print"),
+            ):
+                fetch_rank_data.main()
+
+        self.assertEqual(captured_detail_ids, [{"1"}])
 
     def test_successful_only_danmaku_run_discards_checkpoint(self) -> None:
         store = self._store()
@@ -358,6 +426,7 @@ class RankFetch418CheckpointTests(unittest.TestCase):
                 patch.object(sys, "argv", ["fetch_rank_data.py", "--force", "--missevan-only", "--resume-418-hours", "3"]),
                 patch.object(fetch_rank_data, "RANK_FETCH_418_CHECKPOINT_PATH", checkpoint_path),
                 patch.object(fetch_rank_data, "fetch_missevan_drama_details", side_effect=fake_details),
+                patch.object(fetch_rank_data, "filter_archived_dramas"),
                 patch.object(fetch_rank_data, "lookup_cvs"),
                 patch.object(fetch_rank_data, "save_json"),
                 patch.object(fetch_rank_data, "upload_rank_outputs", side_effect=RuntimeError("publish failed")),
@@ -371,6 +440,40 @@ class RankFetch418CheckpointTests(unittest.TestCase):
 
 
 class RankFullStoreKeyTests(unittest.TestCase):
+    def test_upload_rank_outputs_applies_final_archive_filter(self) -> None:
+        store = {
+            "_meta": {},
+            "missevan": {
+                "dramas": {"100": {"name": "已归档"}, "101": {"name": "保留"}},
+                "ranks": {
+                    "hot": {
+                        "items": [
+                            {"dramaId": "100"},
+                            {"dramaId": "101"},
+                        ]
+                    }
+                },
+            },
+            "manbo": {"dramas": {}, "ranks": {}},
+        }
+        with (
+            patch.object(fetch_rank_data, "upload_missevan_peak_trend"),
+            patch.object(fetch_rank_data, "upload_rank_trend_snapshot"),
+            patch.object(fetch_rank_data, "upload_full_ranks") as upload_latest,
+        ):
+            fetch_rank_data.upload_rank_outputs(
+                store,
+                ("missevan",),
+                archived_by_platform={"missevan": {"100"}, "manbo": set()},
+            )
+
+        self.assertNotIn("100", store["missevan"]["dramas"])
+        self.assertEqual(
+            store["missevan"]["ranks"]["hot"]["items"],
+            [{"dramaId": "101"}],
+        )
+        upload_latest.assert_called_once_with(store)
+
     def test_upload_full_ranks_writes_latest_key_only(self) -> None:
         store = {"_meta": {"updated_at": "2026-05-08T00:33:19+00:00"}}
         remote: dict[str, str] = {"ranks:meta": "{}"}
@@ -439,15 +542,17 @@ class RankFullStoreKeyTests(unittest.TestCase):
             patch.object(fetch_rank_data, "upload_missevan_peak_trend") as peak,
             patch.object(fetch_rank_data, "upload_rank_trend_snapshot") as trend,
             patch.object(fetch_rank_data, "upload_full_ranks") as latest,
-            patch.object(fetch_rank_data, "run_cleanup_best_effort") as cleanup,
             patch("builtins.print"),
         ):
-            result = fetch_rank_data.upload_rank_outputs(store, ("missevan",))
+            result = fetch_rank_data.upload_rank_outputs(
+                store,
+                ("missevan",),
+                archived_by_platform={"missevan": set(), "manbo": set()},
+            )
 
         peak.assert_called_once()
         trend.assert_called_once()
         latest.assert_called_once_with(store)
-        cleanup.assert_called_once()
         self.assertEqual(result, store)
 
 
@@ -728,48 +833,18 @@ class RankTrendPayloadTests(unittest.TestCase):
 
 
 class RankTrendBackfillTests(unittest.TestCase):
-    def test_upload_rank_trend_snapshot_does_not_overwrite_when_current_read_fails(self) -> None:
-        commands: list[list[object]] = []
+    def test_upload_rank_trend_snapshot_publishes_only_v2(self) -> None:
+        with patch.object(fetch_rank_data, "publish_trend_v2_best_effort") as publish:
+            payload = fetch_rank_data.upload_rank_trend_snapshot(
+                "missevan",
+                "2026-05-16",
+                {"dramas": {"93038": {"name": "一屋暗灯", "view_count": 123}}},
+                {"ranks": {}},
+                generated_at="2026-05-16T00:00:00+00:00",
+            )
 
-        def fake_request(command: list[object]) -> object:
-            commands.append(command)
-            if command[:2] == ["EXISTS", "ranks:trend:missevan"]:
-                return 1
-            if command[:2] == ["GET", "ranks:trend:missevan"]:
-                raise RuntimeError("temporary read failure")
-            if command[0] == "SET":
-                raise AssertionError("trend should not be overwritten after read failure")
-            raise AssertionError(command)
-
-        with (
-            patch.object(fetch_rank_data, "upstash_request", side_effect=fake_request),
-            patch.object(fetch_rank_data, "publish_trend_v2_best_effort"),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "Failed to load ranks:trend:missevan"):
-                fetch_rank_data.upload_rank_trend_snapshot(
-                    "missevan",
-                    "2026-05-16",
-                    {
-                        "version": 1,
-                        "date": "2026-05-16",
-                        "platform": "missevan",
-                        "generated_at": "2026-05-16T00:00:00+00:00",
-                        "dramas": {"93038": {"name": "一屋暗灯 全一季", "view_count": 123}},
-                    },
-                    {
-                        "version": 1,
-                        "date": "2026-05-16",
-                        "platform": "missevan",
-                        "generated_at": "2026-05-16T00:00:00+00:00",
-                        "ranks": {"new_daily": {"name": "新品日榜", "items": [{"drama_id": "93038"}]}},
-                    },
-                    generated_at="2026-05-16T00:00:00+00:00",
-                )
-
-        self.assertEqual(
-            commands,
-            [["EXISTS", "ranks:trend:missevan"], ["GET", "ranks:trend:missevan"]],
-        )
+        publish.assert_called_once()
+        self.assertEqual(payload["platform"], "missevan")
 
     def test_upload_rank_outputs_fails_when_trend_read_fails(self) -> None:
         store = {
@@ -780,36 +855,20 @@ class RankTrendBackfillTests(unittest.TestCase):
                 "dramas": {"93038": {"name": "一屋暗灯 全一季", "view_count": 123}},
             },
         }
-        commands: list[list[object]] = []
-        written: dict[str, str] = {}
-
-        def fake_request(command: list[object]) -> object:
-            commands.append(command)
-            if command[0] == "EVAL":
-                return "[]"
-            if command[:2] == ["EXISTS", "ranks:trend:manbo"]:
-                return 1
-            if command[:2] == ["GET", "ranks:trend:manbo"]:
-                raise RuntimeError("temporary trend read failure")
-            if command[0] == "GET":
-                return written.get(str(command[1]))
-            if command[0] == "SET":
-                written[str(command[1])] = str(command[2])
-                return "OK"
-            if command[0] == "DEL":
-                return 1
-            raise AssertionError(command)
-
         with (
             patch.object(fetch_rank_data, "now_iso", return_value="2026-05-16T00:00:00+00:00"),
-            patch.object(fetch_rank_data, "upstash_request", side_effect=fake_request),
-            patch.object(fetch_rank_data, "publish_trend_v2_best_effort"),
+            patch.object(fetch_rank_data, "upload_rank_trend_snapshot", side_effect=RuntimeError("v2 trend unavailable")),
+            patch.object(fetch_rank_data, "upload_full_ranks") as upload_latest,
             patch("builtins.print"),
         ):
-            with self.assertRaisesRegex(RuntimeError, "temporary trend read failure"):
-                fetch_rank_data.upload_rank_outputs(store, ("manbo",))
+            with self.assertRaisesRegex(RuntimeError, "v2 trend unavailable"):
+                fetch_rank_data.upload_rank_outputs(
+                    store,
+                    ("manbo",),
+                    archived_by_platform={"missevan": set(), "manbo": set()},
+                )
 
-        self.assertNotIn("ranks:latest", written)
+        upload_latest.assert_not_called()
 
 
 class MissevanRankLimitTests(unittest.TestCase):
@@ -949,6 +1008,11 @@ class MissevanRankLimitTests(unittest.TestCase):
             patch.object(fetch_rank_data, "fetch_missevan_ranks", return_value=({"bottom"}, set(), {"bottom"})),
             patch.object(fetch_rank_data, "load_ongoing_drama_ids", return_value=set()),
             patch.object(fetch_rank_data, "fetch_missevan_drama_details", side_effect=fake_details),
+            patch.object(
+                fetch_rank_data,
+                "filter_archived_dramas",
+                return_value={"missevan": set(), "manbo": set()},
+            ),
             patch.object(fetch_rank_data, "lookup_cvs"),
             patch.object(fetch_rank_data, "save_json"),
             patch.object(fetch_rank_data, "upload_rank_outputs") as upload,
@@ -957,7 +1021,11 @@ class MissevanRankLimitTests(unittest.TestCase):
             fetch_rank_data.main()
 
         self.assertEqual(store["missevan"]["dramas"]["bottom"]["danmaku_uid_count"], marker)
-        upload.assert_called_once_with(store, ("missevan",))
+        upload.assert_called_once_with(
+            store,
+            ("missevan",),
+            archived_by_platform={"missevan": set(), "manbo": set()},
+        )
 
     def test_null_repair_ignores_marker_in_latest_and_trend(self) -> None:
         marker = fetch_rank_data.MISSEVAN_DANMAKU_NOT_REQUIRED
@@ -988,6 +1056,11 @@ class MissevanRankLimitTests(unittest.TestCase):
                 fetch_rank_data,
                 "_load_normal_trend_v2_strict",
                 return_value=responses["ranks:trend:missevan"],
+            ),
+            patch.object(
+                fetch_rank_data,
+                "load_archived_drama_ids",
+                return_value={"missevan": set(), "manbo": set()},
             ),
         ):
             targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers(
@@ -1023,6 +1096,7 @@ class RankTrendCliTests(unittest.TestCase):
             patch.object(fetch_rank_data, "MissevanRequester"),
             patch.object(fetch_rank_data, "fetch_missevan_ranks", return_value=(set(), set(), set())),
             patch.object(fetch_rank_data, "load_ongoing_drama_ids", return_value=set()),
+            patch.object(fetch_rank_data, "filter_archived_dramas"),
             patch.object(fetch_rank_data, "lookup_cvs"),
             patch.object(fetch_rank_data, "save_json"),
             patch.object(fetch_rank_data, "upload_rank_outputs", side_effect=RuntimeError("publish failed")),
@@ -1051,6 +1125,15 @@ class RankTrendCliTests(unittest.TestCase):
 
 
 class NullDanmakuRepairTests(unittest.TestCase):
+    def setUp(self) -> None:
+        archive_patcher = patch.object(
+            fetch_rank_data,
+            "load_archived_drama_ids",
+            return_value={"missevan": set(), "manbo": set()},
+        )
+        self.archive_loader = archive_patcher.start()
+        self.addCleanup(archive_patcher.stop)
+
     def test_resolve_repair_history_date_prefers_latest_trend_date(self) -> None:
         with (
             patch.object(
@@ -1064,6 +1147,41 @@ class NullDanmakuRepairTests(unittest.TestCase):
 
         self.assertEqual(result, "2026-05-28")
         load.assert_called_once_with("missevan")
+
+    def test_collect_repair_ids_excludes_archived_dramas(self) -> None:
+        self.archive_loader.return_value = {"missevan": {"100"}, "manbo": set()}
+        latest = {
+            "missevan": {
+                "ranks": {"hot": {"items": [{"dramaId": "100"}, {"dramaId": "101"}]}},
+                "dramas": {
+                    "100": {"danmaku_uid_count": None},
+                    "101": {"danmaku_uid_count": None},
+                },
+            },
+            "manbo": {"ranks": {}, "dramas": {}},
+        }
+        trend = {
+            "dates": ["2026-05-28"],
+            "dramas": {
+                drama_id: {
+                    "samples": {
+                        "2026-05-28": {"metrics": {"danmaku_uid_count": None}}
+                    }
+                }
+                for drama_id in ("100", "101")
+            },
+        }
+        with (
+            patch.object(fetch_rank_data, "_load_upstash_json_strict", return_value=latest),
+            patch.object(fetch_rank_data, "_load_normal_trend_v2_strict", return_value=trend),
+        ):
+            targets, _sources, payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers(
+                "missevan",
+                "2026-05-28",
+            )
+
+        self.assertEqual(targets, {"101"})
+        self.assertNotIn("100", payloads["latest"]["missevan"]["dramas"])
 
     def test_resolve_repair_history_date_falls_back_to_latest_timestamp(self) -> None:
         latest = {"_meta": {"updated_at": "2026-05-28T23:30:00+00:00"}}
@@ -1662,6 +1780,32 @@ class RankRejectionFilteringTests(unittest.TestCase):
 
 
 class ManboCvLookupTests(unittest.TestCase):
+    def test_lookup_cvs_displays_unknown_marker_as_unavailable(self) -> None:
+        store = {
+            "missevan": {"dramas": {}},
+            "manbo": {"dramas": {"201": {"name": "测试剧"}}},
+        }
+
+        def load_remote(key: str):
+            if key == "missevan:info:v2":
+                return {}
+            if key == "manbo:info:v2":
+                return {
+                    "records": [
+                        {
+                            "dramaId": "201",
+                            "mainCvIds": [],
+                            "mainCvNames": ["主役未知"],
+                        }
+                    ]
+                }
+            raise AssertionError(key)
+
+        with patch.object(fetch_rank_data, "_load_upstash_json", side_effect=load_remote), patch("builtins.print"):
+            fetch_rank_data.lookup_cvs(store)
+
+        self.assertEqual(store["manbo"]["dramas"]["201"]["maincvs"], ["暂无"])
+
     def test_lookup_cvs_falls_back_to_nicknames_when_main_cv_names_are_blank(self) -> None:
         store = {
             "missevan": {"dramas": {}},
@@ -1697,6 +1841,24 @@ class ManboCvLookupTests(unittest.TestCase):
 
 
 class MissevanCvLookupTests(unittest.TestCase):
+    def test_lookup_cvs_displays_unknown_marker_as_unavailable(self) -> None:
+        store = {
+            "missevan": {"dramas": {"94602": {"name": "测试剧"}}},
+            "manbo": {"dramas": {}},
+        }
+
+        def load_remote(key: str):
+            if key == "missevan:info:v2":
+                return {"94602": {"fallbackCvNames": ["主役未知"]}}
+            if key == "manbo:info:v2":
+                return {"records": []}
+            raise AssertionError(key)
+
+        with patch.object(fetch_rank_data, "_load_upstash_json", side_effect=load_remote), patch("builtins.print"):
+            fetch_rank_data.lookup_cvs(store)
+
+        self.assertEqual(store["missevan"]["dramas"]["94602"]["maincvs"], ["暂无"])
+
     def test_lookup_cvs_includes_name_only_main_cv(self) -> None:
         store = {
             "missevan": {"dramas": {"94602": {"name": "测试剧"}}},
@@ -1756,6 +1918,91 @@ class MissevanCvLookupTests(unittest.TestCase):
             fetch_rank_data.lookup_cvs(store)
 
         append_queue.assert_called_once_with([], ["200"])
+
+    def test_filter_archived_dramas_removes_cache_and_rank_items(self) -> None:
+        store = {
+            "missevan": {"dramas": {}, "ranks": {}},
+            "manbo": {
+                "dramas": {
+                    "200": {"name": "已归档"},
+                    "201": {"name": "有效剧"},
+                },
+                "ranks": {
+                    "hot": {
+                        "items": [
+                            {"dramaId": "200"},
+                            {"dramaId": "201"},
+                        ]
+                    }
+                },
+            },
+        }
+
+        def load_archive(key: str):
+            if key == "missevan:info:archive:v1":
+                return {"version": 1, "platform": "missevan", "records": {}}
+            if key == "manbo:info:archive:v1":
+                return {
+                    "version": 1,
+                    "platform": "manbo",
+                    "records": {"200": {"record": {"dramaId": "200"}}},
+                }
+            raise AssertionError(key)
+
+        with (
+            patch.object(fetch_rank_data, "_load_upstash_json_strict", side_effect=load_archive),
+            patch("builtins.print"),
+        ):
+            fetch_rank_data.filter_archived_dramas(store)
+
+        self.assertEqual(set(store["manbo"]["dramas"]), {"201"})
+        self.assertEqual(store["manbo"]["ranks"]["hot"]["items"], [{"dramaId": "201"}])
+
+    def test_archived_drama_ids_rejects_version_and_platform_mismatch(self) -> None:
+        invalid_payloads = (
+            ({"version": 2, "platform": "manbo", "records": {}}, "unsupported version"),
+            ({"version": 1, "platform": "missevan", "records": {}}, "platform mismatch"),
+        )
+
+        for payload, error in invalid_payloads:
+            with self.subTest(error=error):
+                with self.assertRaisesRegex(RuntimeError, error):
+                    fetch_rank_data.archived_drama_ids(
+                        payload,
+                        platform="manbo",
+                        key="manbo:info:archive:v1",
+                    )
+
+    def test_filter_archived_dramas_fails_closed_without_mutating_store(self) -> None:
+        store = {
+            "missevan": {"dramas": {"100": {"name": "猫耳剧"}}, "ranks": {}},
+            "manbo": {"dramas": {"200": {"name": "漫播剧"}}, "ranks": {}},
+        }
+        original = json.loads(json.dumps(store, ensure_ascii=False))
+
+        def load_archive(key: str):
+            if key == "missevan:info:archive:v1":
+                return {
+                    "version": 1,
+                    "platform": "missevan",
+                    "records": {"100": {"record": {"dramaId": "100"}}},
+                }
+            if key == "manbo:info:archive:v1":
+                return {"version": 1, "platform": "missevan", "records": {}}
+            raise AssertionError(key)
+
+        with (
+            patch.object(
+                fetch_rank_data,
+                "_load_upstash_json_strict",
+                side_effect=load_archive,
+            ),
+            patch("builtins.print"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "platform mismatch"):
+                fetch_rank_data.filter_archived_dramas(store)
+
+        self.assertEqual(store, original)
 
 
 class QueueDramaIdValidationTests(unittest.TestCase):

@@ -26,6 +26,56 @@ class BaseSeriesTitleTests(unittest.TestCase):
 
 
 class NameOnlyCvAggregationTests(unittest.TestCase):
+    def test_unknown_cv_marker_is_excluded_from_sqlite_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = {
+                "MISSEVAN_INFO_PATH": root / "missevan.json",
+                "MANBO_INFO_PATH": root / "manbo.json",
+                "MISSEVAN_COUNTS_PATH": root / "missevan-counts.json",
+                "MANBO_COUNTS_PATH": root / "manbo-counts.json",
+                "COMBINED_CVID_MAP_PATH": root / "map.json",
+            }
+            payloads = {
+                "MISSEVAN_INFO_PATH": {
+                    "100": {
+                        "dramaId": 100,
+                        "title": "猫耳无主役剧",
+                        "type": 4,
+                        "catalog": 89,
+                        "needpay": True,
+                        "fallbackCvNames": ["主役未知"],
+                    }
+                },
+                "MANBO_INFO_PATH": {
+                    "records": [
+                        {
+                            "dramaId": "200",
+                            "name": "漫播无主役剧",
+                            "catalog": 1,
+                            "needpay": True,
+                            "mainCvIds": [22],
+                            "mainCvNames": ["主役未知"],
+                        }
+                    ]
+                },
+                "MISSEVAN_COUNTS_PATH": {"_meta": {}, "counts": {"100": {"view_count": 10}}},
+                "MANBO_COUNTS_PATH": {"_meta": {}, "counts": {"200": {"view_count": 20}}},
+                "COMBINED_CVID_MAP_PATH": {},
+            }
+            for name, path in paths.items():
+                path.write_text(json.dumps(payloads[name], ensure_ascii=False), encoding="utf-8")
+            with (
+                patch.object(rebuild, "MISSEVAN_INFO_PATH", paths["MISSEVAN_INFO_PATH"]),
+                patch.object(rebuild, "MANBO_INFO_PATH", paths["MANBO_INFO_PATH"]),
+                patch.object(rebuild, "MISSEVAN_COUNTS_PATH", paths["MISSEVAN_COUNTS_PATH"]),
+                patch.object(rebuild, "MANBO_COUNTS_PATH", paths["MANBO_COUNTS_PATH"]),
+                patch.object(rebuild, "COMBINED_CVID_MAP_PATH", paths["COMBINED_CVID_MAP_PATH"]),
+            ):
+                rows = rebuild.build_rows()
+
+        self.assertEqual(rows, [])
+
     def test_name_only_cv_is_included_in_sqlite_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

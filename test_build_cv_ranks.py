@@ -8,6 +8,47 @@ import build_cv_ranks
 
 
 class BuildCvRanksTests(unittest.TestCase):
+    def test_unknown_cv_marker_is_excluded_from_cv_rankings(self) -> None:
+        indexes = build_cv_ranks.build_map_indexes({})
+        missevan_buckets: dict[str, dict] = {}
+        manbo_buckets: dict[str, dict] = {}
+        kwargs = {
+            "missevan_ids": indexes[0],
+            "manbo_ids": indexes[1],
+            "name_index": indexes[2],
+            "avatar_index": indexes[3],
+        }
+        build_cv_ranks.collect_missevan_works(
+            missevan_buckets,
+            store={
+                "100": {
+                    "dramaId": 100,
+                    "title": "猫耳无主役剧",
+                    "fallbackCvNames": ["主役未知"],
+                }
+            },
+            counts={"100": {"view_count": 10}},
+            **kwargs,
+        )
+        build_cv_ranks.collect_manbo_works(
+            manbo_buckets,
+            store={
+                "records": [
+                    {
+                        "dramaId": "200",
+                        "name": "漫播无主役剧",
+                        "mainCvIds": [22],
+                        "mainCvNames": ["主役未知"],
+                    }
+                ]
+            },
+            counts={"200": {"view_count": 20}},
+            **kwargs,
+        )
+
+        self.assertEqual(missevan_buckets, {})
+        self.assertEqual(manbo_buckets, {})
+
     def test_name_only_cv_gets_own_ranking_bucket(self) -> None:
         buckets: dict[str, dict] = {}
         paid_buckets: dict[str, dict] = {}
@@ -140,7 +181,6 @@ class BuildCvRanksTests(unittest.TestCase):
                 patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value=remote_map),
                 patch.object(build_cv_ranks, "sync_remote_watchcount_inputs"),
                 patch.object(build_cv_ranks, "publish_trend_v2_best_effort"),
-                patch.object(build_cv_ranks, "run_cleanup_best_effort") as cleanup,
             ):
                 payload = build_cv_ranks.build_and_publish_cv_ranks(
                     missevan_info_path=missevan_info,
@@ -189,7 +229,6 @@ class BuildCvRanksTests(unittest.TestCase):
                 if call.args[0][0] == "EVAL" and call.args[0][3:5] == ["ranks:cv:latest", "ranks:meta"]
             ]
             self.assertEqual(len(atomic_rank_writes), 1)
-            cleanup.assert_called_once()
 
     def test_builds_paid_rankings_from_platform_paid_flags(self) -> None:
         missevan_store = {
@@ -430,7 +469,6 @@ class BuildCvRanksTests(unittest.TestCase):
                 patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value={}),
                 patch.object(build_cv_ranks, "sync_remote_watchcount_inputs"),
                 patch.object(build_cv_ranks, "publish_trend_v2_best_effort") as publish_v2,
-                patch.object(build_cv_ranks, "run_cleanup_best_effort") as cleanup,
                 patch("builtins.print"),
             ):
                 build_cv_ranks.build_and_publish_cv_ranks(
@@ -445,50 +483,21 @@ class BuildCvRanksTests(unittest.TestCase):
                     upload=True,
                 )
 
-            legacy_sets = [command for command in commands if command[:1] == ["SET"]]
-            self.assertEqual(
-                [command[1] for command in legacy_sets],
-                ["ranks:trend:cv:missevan", "ranks:trend:cv:manbo"],
-            )
-            missevan_trend = json.loads(legacy_sets[0][2])
-            self.assertEqual(missevan_trend["cvs"]["猫耳名"]["samples"]["2026-06-10"]["metrics"]["paidViewCount"], 100)
-            manbo_trend = json.loads(legacy_sets[1][2])
-            self.assertEqual(manbo_trend["cvs"]["漫播名"]["samples"]["2026-06-10"]["metrics"]["paidViewCount"], 0)
+            self.assertFalse(any(command[:1] == ["SET"] for command in commands))
             publish_v2.assert_called_once()
-            cleanup.assert_called_once()
 
-    def test_upload_cv_trends_does_not_overwrite_when_current_read_fails(self) -> None:
-        commands: list[list[object]] = []
-
-        def fake_upstash(command: list[object]) -> object:
-            commands.append(command)
-            if command[:2] == ["EXISTS", "ranks:trend:cv:missevan"]:
-                return 1
-            if command[:2] == ["GET", "ranks:trend:cv:missevan"]:
-                raise RuntimeError("temporary read failure")
-            if command[0] == "SET":
-                raise AssertionError("trend should not be overwritten after read failure")
-            raise AssertionError(command)
-
+    def test_upload_cv_trends_propagates_v2_publish_failure(self) -> None:
         with (
-            patch.object(build_cv_ranks, "publish_trend_v2_best_effort"),
-            self.assertRaisesRegex(RuntimeError, "Failed to load ranks:trend:cv:missevan"),
+            patch.object(build_cv_ranks, "publish_trend_v2_best_effort", side_effect=RuntimeError("v2 unavailable")),
+            self.assertRaisesRegex(RuntimeError, "v2 unavailable"),
         ):
             build_cv_ranks.upload_cv_trends(
                 history_date="2026-06-10",
                 generated_at="2026-06-10T12:00:00+00:00",
                 full_rankings={"missevan": [], "manbo": []},
                 full_paid_rankings={"missevan": [], "manbo": []},
-                upstash=fake_upstash,
+                upstash=Mock(),
             )
-
-        self.assertEqual(
-            commands,
-            [
-                ["EXISTS", "ranks:trend:cv:missevan"],
-                ["GET", "ranks:trend:cv:missevan"],
-            ],
-        )
 
     def test_no_upload_still_syncs_remote_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -848,6 +857,55 @@ class BuildCvRanksTests(unittest.TestCase):
         self.assertEqual(cleaned_twice, cleaned)
         self.assertEqual(second_stats, {"removed_samples": 0, "removed_cvs": 0})
 
+    def test_remote_cleanup_updates_only_the_v2_hash(self) -> None:
+        incident = "2026-07-11T22:18:05+00:00"
+        state = {
+            "__meta__": json.dumps({
+                "version": 2,
+                "kind": "cv",
+                "platforms": {
+                    "missevan": {"dates": ["2026-07-10", "2026-07-11"], "updated_at": incident},
+                    "manbo": {"dates": ["2026-07-11"], "updated_at": incident},
+                },
+            }),
+            "missevan:甲": json.dumps({
+                "samples": {
+                    "2026-07-10": {"generated_at": "2026-07-10T22:18:05+00:00"},
+                    "2026-07-11": {"generated_at": incident},
+                }
+            }),
+            "manbo:乙": json.dumps({"samples": {"2026-07-11": {"generated_at": incident}}}),
+        }
+        commands = []
+
+        def fake_upstash(command):
+            commands.append(command)
+            if command[:2] == ["HGETALL", build_cv_ranks.CV_TREND_V2_KEY]:
+                return [value for pair in state.items() for value in pair]
+            raise AssertionError(command)
+
+        def publish(_key, meta, fields, **_kwargs):
+            state.clear()
+            state["__meta__"] = json.dumps(meta)
+            state.update({field: json.dumps(value) for field, value in fields.items()})
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            build_cv_ranks, "publish_hash_snapshot_atomic", side_effect=publish
+        ) as publish_mock:
+            results = build_cv_ranks.cleanup_remote_cv_trends_by_generated_at(
+                incident, upstash=fake_upstash, backup_dir=Path(tmp)
+            )
+
+        self.assertEqual(results["missevan"]["removed_samples"], 1)
+        self.assertEqual(results["manbo"]["removed_samples"], 1)
+        publish_mock.assert_called_once()
+        self.assertTrue(all(command[0] == "HGETALL" for command in commands))
+        verified_meta = json.loads(state["__meta__"])
+        self.assertEqual(verified_meta["platforms"]["missevan"]["entityCount"], 1)
+        self.assertEqual(verified_meta["platforms"]["manbo"]["entityCount"], 0)
+        self.assertEqual(verified_meta["updated_at"], "2026-07-10T22:18:05+00:00")
+
+    @unittest.skip("replaced by v2 hash cleanup coverage")
     def test_remote_cleanup_aborts_when_payload_changes_before_atomic_write(self) -> None:
         incident = "2026-07-11T22:18:05+00:00"
         original = json.dumps(
@@ -870,6 +928,7 @@ class BuildCvRanksTests(unittest.TestCase):
         command = upstash.call_args_list[1].args[0]
         self.assertEqual(command[:4], ["EVAL", build_cv_ranks.CV_TREND_COMPARE_AND_SET_SCRIPT, 1, "ranks:trend:cv:missevan"])
 
+    @unittest.skip("retired v1 aggregate cleanup")
     def test_remote_cleanup_verification_tolerates_non_dict_cv_entries(self) -> None:
         incident = "2026-07-11T22:18:05+00:00"
         original = json.dumps(

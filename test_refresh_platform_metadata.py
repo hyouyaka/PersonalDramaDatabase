@@ -64,7 +64,58 @@ class FirstEpisodeMonthTests(unittest.TestCase):
                 self.assertTrue(platform_sync.match_first_episode(title))
 
 
+class ManboAuthorTests(unittest.TestCase):
+    def test_narrative_original_work_context_does_not_override_credit_line(self) -> None:
+        desc = (
+            "步惊都发现这个人正是原著中的死对头魔尊秋慕白！\n"
+            "久之工作室出品，鹿从今夜白原著，修仙广播剧《师尊大号小号都想攻我》。"
+        )
+
+        self.assertEqual(refresh_platform_metadata.extract_manbo_author(desc), "鹿从今夜白")
+
+    def test_regular_author_credit_is_unchanged(self) -> None:
+        self.assertEqual(
+            refresh_platform_metadata.extract_manbo_author("罗贯中原著，漫播出品。"),
+            "罗贯中",
+        )
+
+    def test_author_credit_before_chinese_audio_drama_text_is_preserved(self) -> None:
+        self.assertEqual(
+            refresh_platform_metadata.extract_manbo_author("鹿从今夜白原著 中文广播剧《测试》"),
+            "鹿从今夜白",
+        )
+
+
 class ManboCvFallbackTests(unittest.TestCase):
+    def test_manual_unknown_cv_marker_overrides_platform_cvs(self) -> None:
+        record = refresh_platform_metadata.build_manbo_record(
+            {
+                "dramaId": "200",
+                "mainCvNames": ["主役未知"],
+                "mainCvNicknames": ["主役未知"],
+            },
+            {
+                "data": {
+                    "title": "测试剧",
+                    "category": 1,
+                    "categoryLabels": [],
+                    "cvRespList": [
+                        {
+                            "dramaRoleType": 2,
+                            "platUid": 1001,
+                            "cvResp": {"id": 1001, "nickname": "真实主役"},
+                            "role": "饰:角色",
+                        }
+                    ],
+                    "setRespList": [],
+                }
+            },
+        )
+
+        self.assertEqual(record["mainCvIds"], [])
+        self.assertEqual(record["mainCvNames"], ["主役未知"])
+        self.assertEqual(platform_sync.manbo_main_cv_display_names(record), ["暂无"])
+
     def test_upsert_manbo_rejects_non_numeric_id_before_loading_store(self) -> None:
         with patch.object(refresh_platform_metadata, "load_json") as load_store:
             with self.assertRaisesRegex(ValueError, "ASCII digits required"):
@@ -154,6 +205,83 @@ class MissevanCoverTests(unittest.TestCase):
         )
 
         self.assertEqual(node["cover"], "https://cover.test/missevan.jpg")
+
+    def test_record_override_applies_before_complete_record_is_skipped(self) -> None:
+        store = {
+            "95512": {
+                "title": "守望青绿",
+                "dramaId": 95512,
+                "maincvs": [],
+                "cvroles": {},
+                "cvnames": {},
+                "fallbackCvNames": ["暂无"],
+                "fallbackCvRoles": {},
+                "type": 3,
+                "catalog": 89,
+                "cover": "https://cover.test/95512.jpg",
+                "createTime": "2026.08",
+                "author": "旧作者",
+                "needpay": False,
+                "is_member": False,
+            }
+        }
+
+        with (
+            patch.object(refresh_platform_metadata, "load_json", side_effect=[store, {}]),
+            patch.object(refresh_platform_metadata, "save_missevan_store") as save_store,
+            patch.object(refresh_platform_metadata, "save_json"),
+            patch.object(refresh_platform_metadata, "MissevanRequester") as requester_type,
+        ):
+            stats = refresh_platform_metadata.refresh_missevan(
+                force=False,
+                update_counts=False,
+            )
+
+        self.assertEqual(stats["skipped"], 1)
+        requester_type.return_value.request_json.assert_not_called()
+        saved_store = save_store.call_args.args[1]
+        self.assertEqual(saved_store["95512"]["author"], "中共重庆市委宣传部")
+        self.assertEqual(saved_store["95512"]["fallbackCvNames"], ["主役未知"])
+
+    def test_manual_maincv_override_applies_without_api_cvs(self) -> None:
+        node, _entries = refresh_platform_metadata.build_missevan_base_node(
+            {
+                "drama": {
+                    "id": 95220,
+                    "name": "穿到包养文里搞事业 . 全一季",
+                    "cover": "https://cover.test/95220.jpg",
+                    "catalog": 93,
+                },
+                "cvs": [],
+                "episodes": {"episode": []},
+            },
+            4,
+        )
+
+        self.assertEqual(node["maincvs"], [1159, 1070])
+        self.assertEqual(node["cvnames"], {"1159": "X杰", "1070": "八千里路"})
+        self.assertEqual(node["cvroles"], {"1159": "岑越", "1070": "时鄞"})
+
+    def test_manual_name_only_override_replaces_platform_maincvs(self) -> None:
+        node = refresh_platform_metadata.apply_missevan_record_field_overrides(
+            {
+                "author": "",
+                "maincvs": [123],
+                "cvnames": {"123": "错误主役"},
+                "cvroles": {"123": "错误角色"},
+            },
+            "95512",
+        )
+
+        self.assertEqual(node["author"], "中共重庆市委宣传部")
+        self.assertEqual(node["maincvs"], [])
+        self.assertEqual(node["cvnames"], {})
+        self.assertEqual(node["cvroles"], {})
+        self.assertEqual(node["fallbackCvNames"], ["主役未知"])
+        self.assertEqual(node["fallbackCvRoles"], {})
+        entries = platform_sync.missevan_main_cv_entries(node)
+        self.assertEqual(entries[0]["display_name"], "暂无")
+        self.assertTrue(entries[0]["unknown"])
 
 
 class MissevanCvMapEntryTests(unittest.TestCase):

@@ -7,6 +7,29 @@ from unittest.mock import Mock, patch
 import cvid_map_tools
 
 
+class UnknownCvMarkerTests(unittest.TestCase):
+    def test_unknown_marker_is_not_observed_as_a_cv(self) -> None:
+        observed = cvid_map_tools.collect_observed_cvs(
+            {
+                "100": {
+                    "dramaId": 100,
+                    "fallbackCvNames": ["主役未知"],
+                }
+            },
+            {
+                "records": [
+                    {
+                        "dramaId": "200",
+                        "mainCvIds": [22],
+                        "mainCvNames": ["主役未知"],
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(observed, [])
+
+
 class RemoteCombinedMapTests(unittest.TestCase):
     def test_load_tracks_the_exact_remote_body_for_later_cas(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

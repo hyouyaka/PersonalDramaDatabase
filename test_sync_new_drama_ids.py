@@ -7,6 +7,74 @@ from unittest.mock import Mock, call
 import sync_new_drama_ids
 
 
+class WatchcountFakeUpstash:
+    def __init__(self, platform: str = "missevan", *, conflict_once: bool = False) -> None:
+        self.platform = platform
+        self.latest_key = f"{platform}:watchcount:latest"
+        self.history_key = f"{platform}:watchcount:history"
+        self.strings = {
+            self.latest_key: json.dumps({
+                "_meta": {"updated_at": "2026-07-03T04:06:41+00:00"},
+                "counts": {"100": {"name": "旧名称", "view_count": 12}},
+            }, ensure_ascii=False, separators=(",", ":")),
+        }
+        self.hashes = {
+            self.history_key: {
+                "100": json.dumps({
+                    "name": "旧名称",
+                    "points": [[f"2026-06-{day:02d}", day] for day in range(1, 31)]
+                    + [["2026-07-03", 12]],
+                }, ensure_ascii=False, separators=(",", ":")),
+                "200": json.dumps({"name": "归档剧", "points": [["2026-07-03", 9]]}),
+            },
+        }
+        self.commands: list[list[object]] = []
+        self.conflict_once = conflict_once
+
+    def __call__(self, command: list[object]) -> object:
+        self.commands.append(command)
+        operation = str(command[0]).upper()
+        key = str(command[1]) if len(command) > 1 else ""
+        if operation == "GET":
+            return self.strings.get(key)
+        if operation == "HGETALL":
+            result: list[str] = []
+            for field, value in self.hashes.get(key, {}).items():
+                result.extend([field, value])
+            return result
+        if operation != "EVAL" or command[1] != sync_new_drama_ids.WATCHCOUNT_PUBLISH_SCRIPT:
+            raise AssertionError(command)
+        if self.conflict_once:
+            self.conflict_once = False
+            return 0
+        latest_key = str(command[3])
+        history_key = str(command[4])
+        expected_latest = str(command[5])
+        current_latest = self.strings.get(latest_key, "")
+        if sync_new_drama_ids.hashlib.sha1(current_latest.encode("utf-8")).hexdigest() != expected_latest:
+            return 0
+        upsert_count = int(command[7])
+        offset = 8
+        history = self.hashes.setdefault(history_key, {})
+        for index in range(upsert_count):
+            field, expected = str(command[offset + index * 3]), str(command[offset + index * 3 + 1])
+            if history.get(field, "__missing__") != expected:
+                return 0
+        delete_offset = offset + upsert_count * 3
+        delete_count = int(command[delete_offset])
+        for index in range(delete_count):
+            field, expected = str(command[delete_offset + 1 + index * 2]), str(command[delete_offset + 2 + index * 2])
+            if history.get(field) != expected:
+                return 0
+        self.strings[latest_key] = str(command[6])
+        for index in range(upsert_count):
+            field = str(command[offset + index * 3])
+            history[field] = str(command[offset + index * 3 + 2])
+        for index in range(delete_count):
+            history.pop(str(command[delete_offset + 1 + index * 2]), None)
+        return 1
+
+
 class RemoteJsonBackupTests(unittest.TestCase):
     def test_local_backup_reuses_identical_content_and_keeps_changed_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -250,6 +318,7 @@ class WatchcountSyncTests(unittest.TestCase):
             self.assertTrue(downloaded)
             self.assertEqual(saved, remote)
 
+    @unittest.skip("retired dated snapshot publisher")
     def test_upload_watchcount_file_writes_date_and_latest_keys(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = self.write_cache(
@@ -273,6 +342,7 @@ class WatchcountSyncTests(unittest.TestCase):
         index = json.loads(upstash.call_args_list[7].args[0][2])
         self.assertEqual(index["dates"], ["2026-06-12"])
 
+    @unittest.skip("retired index backfill publisher")
     def test_upload_watchcount_file_backfills_existing_dates_on_first_index_publish(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = self.write_cache(
@@ -330,6 +400,7 @@ class WatchcountSyncTests(unittest.TestCase):
             "dates": ["2026-06-19", "2026-06-26", "2026-07-03", "2026-07-10"],
         })
 
+    @unittest.skip("retired dated snapshot rebuild")
     def test_history_rebuild_does_not_restore_excluded_archived_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = self.write_cache(
@@ -366,6 +437,7 @@ class WatchcountSyncTests(unittest.TestCase):
         self.assertFalse(any(command[:2] == ["HSET", "missevan:watchcount:history"] for command in commands))
         self.assertEqual(commands[-1][:2], ["SET", "missevan:watchcount:index"])
 
+    @unittest.skip("retired index publisher")
     def test_upload_watchcount_file_prunes_old_dates_only_after_index_write(self) -> None:
         dates = [f"2026-05-{day:02d}" for day in range(1, 32)] + ["2026-06-01"]
         current_index = json.dumps({
@@ -402,6 +474,7 @@ class WatchcountSyncTests(unittest.TestCase):
         index = json.loads(upstash.call_args_list[5].args[0][2])
         self.assertEqual(index["dates"], dates[1:] + ["2026-07-10"])
 
+    @unittest.skip("retired index publisher")
     def test_index_write_failure_stops_before_snapshot_deletion(self) -> None:
         dates = [f"2026-05-{day:02d}" for day in range(1, 32)] + ["2026-06-01"]
         current_index = json.dumps({
@@ -430,6 +503,7 @@ class WatchcountSyncTests(unittest.TestCase):
         self.assertEqual(staged_history["points"][-1], ["2026-07-10", 99])
         self.assertNotIn("DEL", [call.args[0][0] for call in upstash.call_args_list])
 
+    @unittest.skip("retired index publisher")
     def test_history_trim_failure_happens_after_index_commit_and_before_delete(self) -> None:
         dates = [f"2026-05-{day:02d}" for day in range(1, 32)] + ["2026-06-01"]
         current_index = json.dumps({
@@ -456,6 +530,7 @@ class WatchcountSyncTests(unittest.TestCase):
         self.assertEqual(upstash.call_args_list[6].args[0][:2], ["HSET", "missevan:watchcount:history"])
         self.assertNotIn("DEL", [call.args[0][0] for call in upstash.call_args_list])
 
+    @unittest.skip("replaced by atomic history-only publisher coverage")
     def test_history_update_is_idempotent_and_keeps_zero(self) -> None:
         current_index = json.dumps({
             "version": 1,
@@ -483,6 +558,7 @@ class WatchcountSyncTests(unittest.TestCase):
         history = json.loads(history_command[3])
         self.assertEqual(history, {"name": "旧名称", "points": [["2026-07-03", 12], ["2026-07-10", 0]]})
 
+    @unittest.skip("retired multi-step publisher")
     def test_history_write_failure_stops_before_index_and_snapshot_deletion(self) -> None:
         current_index = json.dumps({
             "version": 1,
@@ -503,6 +579,7 @@ class WatchcountSyncTests(unittest.TestCase):
         self.assertNotIn("SET", [call.args[0][0] for call in upstash.call_args_list[4:]])
         self.assertNotIn("DEL", [call.args[0][0] for call in upstash.call_args_list])
 
+    @unittest.skip("retired watchcount index reader")
     def test_load_watchcount_snapshot_dates_prefers_index_without_scan(self) -> None:
         index = json.dumps({
             "version": 1,
@@ -518,6 +595,7 @@ class WatchcountSyncTests(unittest.TestCase):
         self.assertEqual(dates, ["2026-06-19", "2026-06-26"])
         upstash.assert_called_once_with(["GET", "missevan:watchcount:index"])
 
+    @unittest.skip("retired watchcount SCAN reader")
     def test_load_watchcount_snapshot_dates_uses_cached_scan_when_index_missing(self) -> None:
         sync_new_drama_ids.clear_watchcount_scan_cache()
         upstash = Mock(side_effect=[None, ["0", [
@@ -535,6 +613,65 @@ class WatchcountSyncTests(unittest.TestCase):
             ["GET", "SCAN", "GET"],
         )
 
+    def test_history_only_publish_is_atomic_trims_points_and_keeps_zero(self) -> None:
+        fake = WatchcountFakeUpstash()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_cache(tmp, {
+                "_meta": {"updated_at": "2026-07-10T04:06:41+00:00"},
+                "counts": {"100": {"name": "", "view_count": 0}},
+            })
+            sync_new_drama_ids.upload_watchcount_file("missevan", path, upstash=fake)
+
+        history = json.loads(fake.hashes[fake.history_key]["100"])
+        self.assertEqual(len(history["points"]), 32)
+        self.assertEqual(history["points"][-1], ["2026-07-10", 0])
+        self.assertEqual(history["name"], "旧名称")
+        self.assertEqual([command[0] for command in fake.commands], ["GET", "HGETALL", "EVAL", "GET", "HGETALL"])
+        forbidden = {"SET", "MGET", "SCAN", "DEL"}
+        self.assertFalse(any(command[0] in forbidden for command in fake.commands))
+
+    def test_history_only_publish_removes_excluded_ids_in_same_transaction(self) -> None:
+        fake = WatchcountFakeUpstash()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_cache(tmp, {
+                "_meta": {"updated_at": "2026-07-10T04:06:41+00:00"},
+                "counts": {
+                    "100": {"name": "剧", "view_count": 20},
+                    "200": {"name": "归档剧", "view_count": 99},
+                },
+            })
+            sync_new_drama_ids.upload_watchcount_file(
+                "missevan", path, upstash=fake, excluded_drama_ids={"200"}
+            )
+
+        self.assertNotIn("200", fake.hashes[fake.history_key])
+        self.assertNotIn("200", json.loads(fake.strings[fake.latest_key])["counts"])
+        self.assertEqual(sum(command[0] == "EVAL" for command in fake.commands), 1)
+
+    def test_history_only_publish_retries_cas_conflict(self) -> None:
+        fake = WatchcountFakeUpstash(conflict_once=True)
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch("builtins.print"):
+            path = self.write_cache(tmp, {
+                "_meta": {"updated_at": "2026-07-10T04:06:41+00:00"},
+                "counts": {"100": {"name": "剧", "view_count": 20}},
+            })
+            sync_new_drama_ids.upload_watchcount_file("missevan", path, upstash=fake)
+
+        self.assertEqual(sum(command[0] == "EVAL" for command in fake.commands), 2)
+
+    def test_history_only_publish_fails_before_write_when_history_is_missing(self) -> None:
+        fake = WatchcountFakeUpstash()
+        fake.hashes[fake.history_key] = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_cache(tmp, {
+                "_meta": {"updated_at": "2026-07-10T04:06:41+00:00"},
+                "counts": {"100": {"view_count": 20}},
+            })
+            with self.assertRaisesRegex(RuntimeError, "history.*empty or missing"):
+                sync_new_drama_ids.upload_watchcount_file("missevan", path, upstash=fake)
+
+        self.assertFalse(any(command[0] == "EVAL" for command in fake.commands))
+
     def test_remote_watchcount_missing_counts_is_rejected_before_overwriting_local_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             local = {"_meta": {"updated_at": "2026-06-10T00:00:00+00:00"}, "counts": {"100": {"view_count": 1}}}
@@ -549,6 +686,36 @@ class WatchcountSyncTests(unittest.TestCase):
 
 
 class QueueReadyTests(unittest.TestCase):
+    def test_unknown_cv_marker_completes_both_platforms(self) -> None:
+        missevan = {
+            "title": "猫耳剧",
+            "type": 4,
+            "catalog": 89,
+            "author": "作者",
+            "createTime": "",
+            "cover": "https://example.test/m.jpg",
+            "is_member": False,
+            "fallbackCvNames": ["主役未知"],
+        }
+        manbo = {
+            "name": "漫播剧",
+            "catalog": 1,
+            "createTime": "2026-08",
+            "genre": "广播剧",
+            "cover": "https://example.test/b.jpg",
+            "vipFree": 0,
+            "mainCvNames": ["主役未知"],
+            "mainCvIds": [],
+        }
+
+        self.assertTrue(sync_new_drama_ids.is_missevan_ready(missevan))
+        self.assertTrue(sync_new_drama_ids.is_manbo_ready(manbo))
+
+        missevan["cover"] = ""
+        manbo["genre"] = ""
+        self.assertFalse(sync_new_drama_ids.is_missevan_ready(missevan))
+        self.assertFalse(sync_new_drama_ids.is_manbo_ready(manbo))
+
     def test_prune_queue_consumes_ids_rejected_by_detail_lookup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -668,9 +835,9 @@ class InvalidManboIdCleanupTests(unittest.TestCase):
             if command[0] == "GET":
                 return remote[command[1]]
             if command[0] == "EVAL":
-                if command[2] == 3:
-                    remote[command[3]] = command[7]
-                    remote[command[4]] = command[8]
+                if command[1] == sync_new_drama_ids.publish_info_v2.__globals__["INFO_SOURCE_COMPARE_AND_PUBLISH_SCRIPT"]:
+                    remote[command[3]] = command[6]
+                    remote[command[4]] = command[7]
                     return 1
                 key = command[3]
                 remote[key] = command[5]
@@ -704,6 +871,7 @@ class InvalidManboIdCleanupTests(unittest.TestCase):
         self.assertEqual(upstash.call_args_list[1].args[0][0], "EVAL")
 
 
+@unittest.skip("info v1 compatibility commands are retired")
 class InfoV1CompatibilitySyncTests(unittest.TestCase):
     def test_sync_copies_v2_to_v1_with_backups_and_cas(self) -> None:
         strings = {
@@ -936,6 +1104,7 @@ class NonTargetPurgeTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertIn("purge_non_target_records", first.name)
 
+    @unittest.skip("retired v1/date snapshot verifier")
     def test_remote_purge_verifier_checks_every_non_cv_layer_without_matching_metrics(self) -> None:
         target = "94774"
         dates = {"missevan": ["2026-07-01"], "manbo": []}

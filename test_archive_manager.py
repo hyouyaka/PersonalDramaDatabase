@@ -40,8 +40,8 @@ class FakeUpstash:
         if script != archive_manager.ARCHIVE_MOVE_SCRIPT:
             raise AssertionError(command)
         self.move_attempts += 1
-        keys = command[3:10]
-        args = command[10:]
+        keys = command[3:9]
+        args = command[9:]
         if self.conflict_once and self.move_attempts == 1:
             active = json.loads(self.strings[keys[0]])
             active["101"]["title"] = "并发更新标题"
@@ -54,19 +54,17 @@ class FakeUpstash:
         drama_ids = [str(value) for value in args[9 : 9 + count]]
         history_expected = args[9 + count : 9 + count * 2]
         for drama_id, expected in zip(drama_ids, history_expected):
-            current = self.hashes.get(keys[6], {}).get(drama_id)
+            current = self.hashes.get(keys[5], {}).get(drama_id)
             if (current if isinstance(current, str) else "__missing__") != expected:
                 return 0
         encoded_watch_archive = args[9 + count * 2]
         self.strings[keys[0]] = args[4]
         self.strings[keys[4]] = args[5]
-        if keys[5] in self.strings:
-            self.strings[keys[5]] = args[4]
         self.strings[keys[1]] = args[6]
         self.strings[keys[2]] = args[7]
         self.strings[keys[3]] = encoded_watch_archive
         for drama_id in drama_ids:
-            self.hashes.get(keys[6], {}).pop(drama_id, None)
+            self.hashes.get(keys[5], {}).pop(drama_id, None)
         return 1
 
 
@@ -230,7 +228,7 @@ class RemoteArchivePublishTests(unittest.TestCase):
         self.assertEqual(len(watch_archive["records"]["100"]["history"]["points"]), 2)
         self.assertNotIn("100", fake.hashes["missevan:watchcount:history"])
         self.assertIn("100", json.loads(fake.strings["missevan:watchcount:2026-07-29"])["counts"])
-        self.assertEqual(json.loads(fake.strings["missevan:info:v1"]), active)
+        self.assertEqual(set(json.loads(fake.strings["missevan:info:v1"])), {"100", "101"})
 
     def test_concurrent_active_info_change_is_preserved_on_retry(self):
         fake = self.build_remote(conflict_once=True)

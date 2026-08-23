@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 import upstash_v2
 
@@ -71,18 +69,15 @@ class FakeUpstash:
             if command[1] == upstash_v2.INFO_SOURCE_COMPARE_AND_PUBLISH_SCRIPT:
                 v2_key = str(command[3])
                 meta_key = str(command[4])
-                legacy_key = str(command[5])
-                expected = str(command[6])
+                expected = str(command[5])
                 current = self.strings.get(v2_key)
                 if expected == "__missing__":
                     if current is not None:
                         return 0
                 elif current is None or hashlib.sha1(current.encode("utf-8")).hexdigest() != expected:
                     return 0
-                self.strings[v2_key] = str(command[7])
-                self.strings[meta_key] = str(command[8])
-                if legacy_key in self.strings:
-                    self.strings[legacy_key] = str(command[7])
+                self.strings[v2_key] = str(command[6])
+                self.strings[meta_key] = str(command[7])
                 return 1
             if command[1] == upstash_v2.RANK_STRING_PUBLISH_SCRIPT:
                 current_meta = self.strings.get(str(command[4]))
@@ -204,17 +199,16 @@ class UpstashV2Tests(unittest.TestCase):
         self.assertIn("ranks:latest", meta["normal"]["resources"])
         self.assertIn("ranks:cv:latest", meta["cv"]["resources"])
 
-    def test_publish_mode_off_skips_best_effort_v2_writes(self) -> None:
+    def test_legacy_publish_mode_cannot_disable_v2_writes(self) -> None:
         fake = FakeUpstash()
-        with patch.dict(os.environ, {"UPSTASH_V2_PUBLISH_MODE": "off"}):
-            result = upstash_v2.publish_info_v2(
-                "missevan:info:v1",
-                {"100": {"title": "测试剧"}},
-                upstash=fake,
-            )
+        result = upstash_v2.publish_info_v2(
+            "missevan:info:v2",
+            {"100": {"title": "测试剧"}},
+            upstash=fake,
+        )
 
-        self.assertIsNone(result)
-        self.assertEqual(fake.commands, [])
+        self.assertIsNotNone(result)
+        self.assertTrue(any(command[0] == "EVAL" for command in fake.commands))
 
     def test_every_info_writer_imports_the_shared_v2_publisher(self) -> None:
         root = Path(__file__).resolve().parent
@@ -260,7 +254,7 @@ class UpstashV2Tests(unittest.TestCase):
         self.assertEqual(json.loads(fake.strings["missevan:info:v2"]), {"new": {"title": "更新内容"}})
         self.assertNotIn("missevan:info:meta:v2", fake.strings)
 
-    def test_info_publish_updates_existing_v1_but_does_not_recreate_missing_v1(self) -> None:
+    def test_info_publish_never_updates_existing_v1(self) -> None:
         fake = FakeUpstash()
         old_source = json.dumps({"old": {"title": "旧内容"}}, ensure_ascii=False)
         fake.strings["missevan:info:v2"] = old_source
@@ -272,17 +266,10 @@ class UpstashV2Tests(unittest.TestCase):
             force=True,
             source_encoded=old_source,
         )
-        self.assertEqual(json.loads(fake.strings["missevan:info:v1"]), {"new": {"title": "更新内容"}})
-        fake.strings.pop("missevan:info:v1")
-        current = fake.strings["missevan:info:v2"]
-        upstash_v2.publish_info_v2(
-            "missevan:info:v2",
-            {"final": {"title": "最终内容"}},
-            upstash=fake,
-            force=True,
-            source_encoded=current,
-        )
-        self.assertNotIn("missevan:info:v1", fake.strings)
+        self.assertEqual(fake.strings["missevan:info:v1"], "legacy")
+        eval_command = next(command for command in fake.commands if command[0] == "EVAL")
+        self.assertEqual(eval_command[2], 2)
+        self.assertNotIn("missevan:info:v1", eval_command)
 
     def test_normal_v2_retains_hot_dates_and_last_rank_summary(self) -> None:
         payload = {
@@ -471,6 +458,53 @@ class UpstashV2Tests(unittest.TestCase):
         self.assertEqual(meta["platforms"]["missevan"]["entityCount"], 1)
         self.assertEqual(set(fields["missevan:CV A"]["samples"]), {"2026-07-03", "2026-07-10"})
 
+    def test_cv_v2_clears_stale_works_when_cv_is_absent_from_current_rankings(self) -> None:
+        current_meta = {
+            "platforms": {
+                "missevan": {
+                    "dates": ["2026-07-10"],
+                    "updated_at": "2026-07-10T00:00:00+00:00",
+                    "retentionDates": 50,
+                },
+                "manbo": {"dates": [], "retentionDates": 50},
+            }
+        }
+        current_fields = {
+            "missevan:旧CV": {
+                "cvName": "旧CV",
+                "works": [{"dramaId": "95512"}],
+                "samples": {"2026-07-10": {"generated_at": "2026-07-10T00:00:00+00:00"}},
+            }
+        }
+        candidate_meta = {
+            "platforms": {
+                "missevan": {
+                    "dates": ["2026-07-17"],
+                    "updated_at": "2026-07-17T00:00:00+00:00",
+                    "retentionDates": 50,
+                },
+                "manbo": {"dates": [], "retentionDates": 50},
+            }
+        }
+        candidate_fields = {
+            "missevan:当前CV": {
+                "cvName": "当前CV",
+                "works": [{"dramaId": "100"}],
+                "samples": {"2026-07-17": {"generated_at": "2026-07-17T00:00:00+00:00"}},
+            }
+        }
+
+        _meta, fields = upstash_v2.merge_cv_v2_authoritative(
+            current_meta,
+            current_fields,
+            candidate_meta,
+            candidate_fields,
+        )
+
+        self.assertNotIn("works", fields["missevan:旧CV"])
+        self.assertIn("2026-07-10", fields["missevan:旧CV"]["samples"])
+        self.assertEqual(fields["missevan:当前CV"]["works"], [{"dramaId": "100"}])
+
     def test_normal_publish_merges_latest_sample_into_authoritative_v2(self) -> None:
         fake = FakeUpstash()
         key = "ranks:trend:missevan:v2"
@@ -513,6 +547,32 @@ class UpstashV2Tests(unittest.TestCase):
         saved = json.loads(fake.hashes[key]["100"])
         self.assertEqual(saved["samples"]["2026-07-10"]["metrics"]["view_count"], 10)
         self.assertEqual(saved["samples"]["2026-07-17"]["metrics"]["view_count"], 20)
+
+    def test_runtime_publishers_do_not_reference_retired_upstash_keys(self) -> None:
+        root = Path(__file__).resolve().parent
+        sources = "\n".join(
+            (root / filename).read_text(encoding="utf-8")
+            for filename in (
+                "upstash_v2.py",
+                "sync_new_drama_ids.py",
+                "fetch_rank_data.py",
+                "build_cv_ranks.py",
+                "archive_manager.py",
+                "upstash_editor.py",
+            )
+        )
+        for key in (
+            "missevan:info:v1",
+            "manbo:info:v1",
+            "ranks:trend:missevan\"",
+            "ranks:trend:manbo\"",
+            "ranks:trend:cv:missevan",
+            "ranks:trend:cv:manbo",
+            "ranks:trend:peak:missevan\"",
+            "watchcount:index",
+            "watchcount:weekly:index",
+        ):
+            self.assertNotIn(key, sources)
 
 
 if __name__ == "__main__":

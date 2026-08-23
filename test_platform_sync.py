@@ -21,8 +21,43 @@ class MissevanLogicalMainCvTests(unittest.TestCase):
         self.assertEqual(
             entries,
             [
-                {"cv_id": 3946, "display_name": "辰朔", "role_name": "秦越", "name_only": False},
-                {"cv_id": None, "display_name": "林风", "role_name": "季南溪", "name_only": True},
+                {
+                    "cv_id": 3946,
+                    "display_name": "辰朔",
+                    "role_name": "秦越",
+                    "name_only": False,
+                    "unknown": False,
+                },
+                {
+                    "cv_id": None,
+                    "display_name": "林风",
+                    "role_name": "季南溪",
+                    "name_only": True,
+                    "unknown": False,
+                },
+            ],
+        )
+
+    def test_unknown_marker_overrides_existing_numeric_main_cvs(self) -> None:
+        entries = platform_sync.missevan_main_cv_entries(
+            {
+                "maincvs": [1, 2],
+                "cvnames": {"1": "旧主役甲", "2": "旧主役乙"},
+                "cvroles": {"1": "角色甲", "2": "角色乙"},
+                "fallbackCvNames": ["主役未知"],
+            }
+        )
+
+        self.assertEqual(
+            entries,
+            [
+                {
+                    "cv_id": None,
+                    "display_name": "暂无",
+                    "role_name": "",
+                    "name_only": True,
+                    "unknown": True,
+                }
             ],
         )
 
