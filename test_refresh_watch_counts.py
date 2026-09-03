@@ -3,6 +3,7 @@ import hashlib
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
@@ -539,6 +540,202 @@ class ArchiveRetryQueueTests(unittest.TestCase):
 
 
 class InfoRefreshTests(unittest.TestCase):
+    def test_refresh_all_backfills_missing_missevan_create_time_and_records_observation(self) -> None:
+        store = {"100": {"dramaId": "100", "title": "猫耳测试", "createTime": ""}}
+        requester = Mock()
+        requester.request_json.side_effect = [
+            {
+                "info": {
+                    "drama": {"name": "猫耳测试", "view_count": 10, "pay_type": 0, "price": 0},
+                    "episodes": {"episode": [{"sound_id": "300", "name": "预告"}]},
+                }
+            },
+            {
+                "info": {
+                    "episodes": {
+                        "episode": [
+                            {
+                                "name": "第一集",
+                                "create_time": datetime(2026, 8, 10, tzinfo=timezone.utc).timestamp(),
+                            }
+                        ]
+                    }
+                }
+            },
+        ]
+        requester.request_count = 2
+        requester.last_backoff_seconds = 0
+        with (
+            patch.object(refresh_watch_counts, "load_json", return_value=store),
+            patch.object(refresh_watch_counts, "load_cache", return_value={"_meta": {}, "counts": {}}),
+            patch.object(refresh_watch_counts, "MissevanRequester", return_value=requester),
+            patch.object(refresh_watch_counts, "save_cache"),
+            patch.object(refresh_watch_counts, "save_missevan_store"),
+        ):
+            stats = refresh_watch_counts.refresh_missevan_watch_counts(refresh_all=True)
+
+        self.assertEqual(requester.request_json.call_count, 2)
+        self.assertEqual(store["100"]["createTime"], "2026.08")
+        self.assertEqual(stats["info_observations"]["100"]["createTime"], "2026.08")
+        self.assertEqual(stats["create_time_checked"], 1)
+        self.assertEqual(stats["create_time_updated"], 1)
+        self.assertEqual(stats["create_time_still_missing"], 0)
+
+    def test_refresh_all_backfills_manbo_create_time_from_same_detail_response(self) -> None:
+        record = {"dramaId": "200", "name": "漫播测试", "createTime": None}
+        store = {"records": [record]}
+        payload = {
+            "data": {
+                "title": "漫播测试",
+                "watchCount": 20,
+                "price": 0,
+                "memberPrice": 0,
+                "vipFree": 0,
+                "setRespList": [
+                    {
+                        "setTitle": "第一集",
+                        "createTime": int(
+                            datetime(2026, 7, 3, tzinfo=timezone.utc).timestamp() * 1000
+                        ),
+                    }
+                ],
+            }
+        }
+        with (
+            patch.object(refresh_watch_counts, "load_json", return_value=store),
+            patch.object(refresh_watch_counts, "load_cache", return_value={"_meta": {}, "counts": {}}),
+            patch.object(refresh_watch_counts, "request_manbo_json", return_value=payload) as request_json,
+            patch.object(refresh_watch_counts, "save_cache"),
+            patch.object(refresh_watch_counts, "save_json"),
+        ):
+            stats = refresh_watch_counts.refresh_manbo_watch_counts(refresh_all=True)
+
+        request_json.assert_called_once()
+        self.assertEqual(record["createTime"], "2026.07")
+        self.assertEqual(stats["info_observations"]["200"]["createTime"], "2026.07")
+        self.assertEqual(stats["create_time_checked"], 1)
+        self.assertEqual(stats["create_time_updated"], 1)
+        self.assertEqual(stats["create_time_still_missing"], 0)
+
+    def test_refresh_all_keeps_create_time_empty_when_no_main_episode_exists(self) -> None:
+        store = {"100": {"dramaId": "100", "title": "仅预告", "createTime": ""}}
+        requester = Mock()
+        requester.request_json.side_effect = [
+            {
+                "info": {
+                    "drama": {"name": "仅预告", "view_count": 10, "pay_type": 0, "price": 0},
+                    "episodes": {"episode": [{"sound_id": "300", "name": "预告"}]},
+                }
+            },
+            {
+                "info": {
+                    "episodes": {
+                        "episode": [
+                            {
+                                "name": "预告",
+                                "create_time": datetime(2026, 8, 10, tzinfo=timezone.utc).timestamp(),
+                            }
+                        ]
+                    }
+                }
+            },
+        ]
+        requester.request_count = 2
+        requester.last_backoff_seconds = 0
+        with (
+            patch.object(refresh_watch_counts, "load_json", return_value=store),
+            patch.object(refresh_watch_counts, "load_cache", return_value={"_meta": {}, "counts": {}}),
+            patch.object(refresh_watch_counts, "MissevanRequester", return_value=requester),
+            patch.object(refresh_watch_counts, "save_cache"),
+            patch.object(refresh_watch_counts, "save_missevan_store"),
+        ):
+            stats = refresh_watch_counts.refresh_missevan_watch_counts(refresh_all=True)
+
+        self.assertEqual(store["100"]["createTime"], "")
+        self.assertNotIn("createTime", stats["info_observations"]["100"])
+        self.assertEqual(stats["create_time_checked"], 1)
+        self.assertEqual(stats["create_time_updated"], 0)
+        self.assertEqual(stats["create_time_still_missing"], 1)
+
+    def test_refresh_all_does_not_request_sound_detail_when_create_time_exists(self) -> None:
+        store = {"100": {"dramaId": "100", "title": "已有日期", "createTime": "2025.01"}}
+        requester = Mock()
+        requester.request_json.return_value = {
+            "info": {
+                "drama": {"name": "已有日期", "view_count": 10, "pay_type": 0, "price": 0},
+                "episodes": {"episode": [{"sound_id": "300", "name": "预告"}]},
+            }
+        }
+        requester.request_count = 1
+        requester.last_backoff_seconds = 0
+        with (
+            patch.object(refresh_watch_counts, "load_json", return_value=store),
+            patch.object(refresh_watch_counts, "load_cache", return_value={"_meta": {}, "counts": {}}),
+            patch.object(refresh_watch_counts, "MissevanRequester", return_value=requester),
+            patch.object(refresh_watch_counts, "save_cache"),
+            patch.object(refresh_watch_counts, "save_missevan_store"),
+        ):
+            stats = refresh_watch_counts.refresh_missevan_watch_counts(refresh_all=True)
+
+        requester.request_json.assert_called_once()
+        self.assertEqual(store["100"]["createTime"], "2025.01")
+        self.assertEqual(stats["create_time_checked"], 0)
+
+    def test_optional_missevan_create_time_failure_does_not_abort_refresh(self) -> None:
+        store = {"100": {"dramaId": "100", "title": "补全失败", "createTime": ""}}
+        requester = Mock()
+        requester.request_json.side_effect = [
+            {
+                "info": {
+                    "drama": {"name": "补全失败", "view_count": 10, "pay_type": 0, "price": 0},
+                    "episodes": {"episode": [{"sound_id": "300", "name": "预告"}]},
+                }
+            },
+            RuntimeError("HTTP_404"),
+        ]
+        requester.request_count = 2
+        requester.last_backoff_seconds = 0
+        with (
+            patch.object(refresh_watch_counts, "load_json", return_value=store),
+            patch.object(refresh_watch_counts, "load_cache", return_value={"_meta": {}, "counts": {}}),
+            patch.object(refresh_watch_counts, "MissevanRequester", return_value=requester),
+            patch.object(refresh_watch_counts, "save_cache"),
+            patch.object(refresh_watch_counts, "save_missevan_store"),
+            patch("builtins.print") as print_mock,
+        ):
+            stats = refresh_watch_counts.refresh_missevan_watch_counts(refresh_all=True)
+
+        self.assertEqual(stats["processed"], 1)
+        self.assertEqual(stats["create_time_checked"], 1)
+        self.assertEqual(stats["create_time_updated"], 0)
+        self.assertEqual(stats["create_time_still_missing"], 1)
+        self.assertEqual(store["100"]["createTime"], "")
+        self.assertTrue(any("createTime 补全失败" in str(call) for call in print_mock.call_args_list))
+
+    def test_missevan_create_time_418_still_interrupts_refresh_all(self) -> None:
+        store = {"100": {"dramaId": "100", "title": "触发限流", "createTime": ""}}
+        requester = Mock()
+        requester.request_json.side_effect = [
+            {
+                "info": {
+                    "drama": {"name": "触发限流", "view_count": 10, "pay_type": 0, "price": 0},
+                    "episodes": {"episode": [{"sound_id": "300", "name": "预告"}]},
+                }
+            },
+            RuntimeError("HTTP_418"),
+        ]
+        requester.request_count = 2
+        requester.last_backoff_seconds = 60
+        with (
+            patch.object(refresh_watch_counts, "load_json", return_value=store),
+            patch.object(refresh_watch_counts, "load_cache", return_value={"_meta": {}, "counts": {}}),
+            patch.object(refresh_watch_counts, "MissevanRequester", return_value=requester),
+            patch.object(refresh_watch_counts, "save_cache"),
+            patch.object(refresh_watch_counts, "save_missevan_store"),
+        ):
+            with self.assertRaises(refresh_watch_counts.MissevanRefreshInterrupted):
+                refresh_watch_counts.refresh_missevan_watch_counts(refresh_all=True)
+
     def test_refresh_all_bypasses_recent_cache_for_both_platforms(self) -> None:
         missevan_requester = Mock()
         missevan_requester.request_json.return_value = {
@@ -886,7 +1083,15 @@ class InfoRefreshTests(unittest.TestCase):
             ensure_ascii=False,
         )
         second = json.dumps(
-            {"100": {"dramaId": 100, "title": "并发新标题", "needpay": False, "soundIds": ["old"]}},
+            {
+                "100": {
+                    "dramaId": 100,
+                    "title": "并发新标题",
+                    "needpay": False,
+                    "soundIds": ["old"],
+                    "createTime": "2026.09",
+                }
+            },
             ensure_ascii=False,
         )
         commands = []
@@ -921,6 +1126,7 @@ class InfoRefreshTests(unittest.TestCase):
                         "needpay": True,
                         "cover": "https://cover.test/missevan-remote.jpg",
                         "soundIds": ["2002", "2001"],
+                        "createTime": "2026.08",
                     }
                 },
                 upstash=fake_upstash,
@@ -930,10 +1136,12 @@ class InfoRefreshTests(unittest.TestCase):
         self.assertEqual(stats["free_to_paid"], 1)
         self.assertEqual(stats["sound_ids_changed"], 1)
         self.assertEqual(stats["cover_changed"], 1)
+        self.assertEqual(stats["create_time_changed"], 0)
         self.assertEqual(saved["100"]["title"], "并发新标题")
         self.assertTrue(saved["100"]["needpay"])
         self.assertEqual(saved["100"]["cover"], "https://cover.test/missevan-remote.jpg")
         self.assertEqual(saved["100"]["soundIds"], ["2002", "2001"])
+        self.assertEqual(saved["100"]["createTime"], "2026.09")
         self.assertEqual([command[0] for command in commands[:4]], ["GET", "EVAL", "GET", "EVAL"])
         self.assertEqual(
             commands[3][3:5],
@@ -972,6 +1180,7 @@ class InfoRefreshTests(unittest.TestCase):
                         "vipFree": 1,
                         "cover": "https://cover.test/manbo-remote.jpg",
                         "soundIds": ["3002", "3001"],
+                        "createTime": "2026.07",
                     }
                 },
                 upstash=fake_upstash,
@@ -982,9 +1191,11 @@ class InfoRefreshTests(unittest.TestCase):
         self.assertEqual(stats["membership_changed"], 1)
         self.assertEqual(stats["sound_ids_changed"], 1)
         self.assertEqual(stats["cover_changed"], 1)
+        self.assertEqual(stats["create_time_changed"], 1)
         self.assertEqual(saved["records"][0]["name"], "并发标题")
         self.assertEqual(saved["records"][0]["cover"], "https://cover.test/manbo-remote.jpg")
         self.assertEqual(saved["records"][0]["soundIds"], ["3002", "3001"])
+        self.assertEqual(saved["records"][0]["createTime"], "2026.07")
         self.assertEqual([command[0] for command in commands[:2]], ["GET", "EVAL"])
         self.assertEqual(
             commands[1][3:5],

@@ -521,6 +521,7 @@ GUI 现在不是一个简单 launcher，而是一个桌面工作台：
 run_weekly_cv_update.ps1
     → refresh_watch_counts.py --refresh-all ✅ 双平台全量刷新
     → latest + history 原子上传并回读 ✅
+    → 空 createTime 补全并发布 info v2 ✅
     → build_cv_ranks.py ✅
     → build_weekly_growth_ranks.py --expected-end-date <UTC日期> ✅
     → update_rank_meta.py cv ✅
@@ -529,6 +530,8 @@ run_weekly_cv_update.ps1
 history 日期不匹配 ❌ 增量榜拒绝发布并保留上一期
 GUI 独立重算 ✅ 直接使用远端 history 最新日期
 ```
+
+`--refresh-all` 会对所有活跃且 `createTime` 为空的剧集进行一次补全。漫播直接复用 `dramaDetail` 的 `setRespList`；猫耳先检查当前详情中的分集时间，仍无法确定时才追加一次 `getdramabysound` 请求。只有识别到正剧首集月份时才写入，预告/PV 不会被误记为上线时间。可选补抓的非 418 异常只记为仍为空，不中断播放量刷新；418 继续触发限流退出。补全字段与封面、付费和 `soundIds` 一起通过 info v2 CAS 发布并回读，且每次 CAS 重试只会填充远端仍为空的 `createTime`。
 
 一个 latest payload 同时包含 `rankings.weekly` 与 `rankings.fourWeek`，各自再分为 `missevan` 和 `manbo`。每个剧目分别按目标日、目标日前 1 天、目标日后 1 天选择自身基线；缺少剧目基线时，仅 `createTime` 为空或创建月属于结束月/前一个自然月的剧目按 0 起算。发布前还会复用 info v2 的最小记录数门禁，防止截断源数据覆盖正常榜单。
 

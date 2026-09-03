@@ -128,6 +128,7 @@ python append_manbo_ids.py 2067945724439429338 2118896513449984153
 
 - 更新双平台 watchcount 缓存
 - 复用详情响应更新 info 中的封面、付费、会员和 `soundIds`
+- 使用 `--refresh-all` 时，对所有 `createTime` 为空的活跃剧集尝试补全；漫播复用详情响应，猫耳仅在需要时追加分集详情请求
 - 对确认下架的剧目执行 info/watchcount 归档
 - 不更新 SQLite
 
@@ -179,6 +180,9 @@ python refresh_watch_counts.py --refresh-all
 - `--missevan` 和 `--manbo` 可以直接指定一个或多个 `dramaId`
 - 只要传了 `--missevan` 或 `--manbo`，脚本就只刷新你指定的 ID，不会再跑全量
 - `--refresh-all` 只绕过一小时 `fetched_at` 缓存；`--force` 仍只控制刷新前是否强制拉取远端 latest
+- `--refresh-all` 找到的 `createTime` 会和其他 info 观察字段一起 CAS 上传到 info v2 并回读；没有正剧分集时保持为空
+- 猫耳可选分集补抓发生 403、404 或网络错误时记录为仍为空并继续；只有 418 维持中断任务的限流语义
+- info v2 CAS 重试会重新检查 `createTime`，并发任务已补入的非空值不会被本次观察值覆盖
 - 猫耳命中 `418` 时会先保存已完成进度，再退出
 
 ### 3.1 生成 7 天 / 4 周播放增量榜
@@ -206,6 +210,7 @@ python build_weekly_growth_ranks.py --expected-end-date 2026-08-28
 ```text
 refresh_watch_counts.py --refresh-all
     → latest + history 原子上传并回读 ✅
+    → 空 createTime 补全并发布 info v2 ✅
     → build_cv_ranks.py ✅
     → build_weekly_growth_ranks.py --expected-end-date <UTC日期> ✅
     → update_rank_meta.py cv ✅

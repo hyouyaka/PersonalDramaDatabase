@@ -25,10 +25,13 @@ from platform_sync import (
     MISSEVAN_INFO_PATH,
     MissevanRequester,
     all_sound_ids,
+    first_main_episode_sound_id,
     iter_missevan_nodes,
     load_cache,
     load_json,
     normalize,
+    pick_first_episode_month,
+    preferred_sound_id,
     request_manbo_json,
     save_cache,
     save_json,
@@ -116,6 +119,54 @@ def manbo_sound_ids(payload: dict) -> list[str]:
     return out
 
 
+def missevan_episode_create_month(episodes: list[dict]) -> str:
+    normalized_episodes = [
+        {
+            **episode,
+            "_create_time_title": episode.get("name")
+            or episode.get("soundstr")
+            or episode.get("title"),
+        }
+        for episode in episodes
+        if isinstance(episode, dict)
+    ]
+    return pick_first_episode_month(
+        normalized_episodes,
+        title_key="_create_time_title",
+        time_key="create_time",
+        milliseconds=False,
+    )
+
+
+def missevan_create_time_observation(info: dict, requester: MissevanRequester) -> str:
+    episodes = (info.get("episodes") or {}).get("episode") or []
+    create_month = missevan_episode_create_month(episodes)
+    if create_month:
+        return create_month
+    sound_id = first_main_episode_sound_id(info)
+    if not sound_id:
+        sound_id, _ = preferred_sound_id(info)
+    if not sound_id:
+        return ""
+    payload = requester.request_json(
+        f"https://www.missevan.com/dramaapi/getdramabysound?sound_id={sound_id}"
+    )
+    sound_info = (payload or {}).get("info") or {}
+    return missevan_episode_create_month(
+        (sound_info.get("episodes") or {}).get("episode") or []
+    )
+
+
+def manbo_create_time_observation(payload: dict) -> str:
+    data = (payload or {}).get("data") or {}
+    return pick_first_episode_month(
+        data.get("setRespList") or [],
+        title_key="setTitle",
+        time_key="createTime",
+        milliseconds=True,
+    )
+
+
 def _apply_info_observations(platform: str, store: dict, observations: dict[str, dict[str, object]]) -> dict[str, int]:
     stats = {
         "changed": 0,
@@ -124,6 +175,7 @@ def _apply_info_observations(platform: str, store: dict, observations: dict[str,
         "membership_changed": 0,
         "sound_ids_changed": 0,
         "cover_changed": 0,
+        "create_time_changed": 0,
     }
     if platform == "missevan":
         records = {
@@ -146,6 +198,8 @@ def _apply_info_observations(platform: str, store: dict, observations: dict[str,
         record_changed = False
         for field, value in fields.items():
             previous = record.get(field)
+            if field == "createTime" and normalize(previous):
+                continue
             if previous == value:
                 continue
             if field == "needpay":
@@ -159,6 +213,8 @@ def _apply_info_observations(platform: str, store: dict, observations: dict[str,
                 stats["sound_ids_changed"] += 1
             elif field == "cover":
                 stats["cover_changed"] += 1
+            elif field == "createTime":
+                stats["create_time_changed"] += 1
             record[field] = value
             record_changed = True
         if record_changed:
@@ -181,6 +237,7 @@ def publish_info_observations(
             "membership_changed": 0,
             "sound_ids_changed": 0,
             "cover_changed": 0,
+            "create_time_changed": 0,
         }
     key = MISSEVAN_INFO_KEY if platform == "missevan" else MANBO_INFO_KEY
     path = MISSEVAN_INFO_PATH if platform == "missevan" else MANBO_INFO_PATH
@@ -342,6 +399,9 @@ def refresh_missevan_watch_counts(
     archived = 0
     retry_requests = 0
     pricing_skipped = 0
+    create_time_checked = 0
+    create_time_updated = 0
+    create_time_still_missing = 0
     info_observations: dict[str, dict[str, object]] = {}
     archive_candidates: dict[str, dict[str, str]] = {}
     now = datetime.now(UTC)
@@ -358,6 +418,9 @@ def refresh_missevan_watch_counts(
             "pricing_skipped": pricing_skipped,
             "info_observations": info_observations,
             "archive_candidates": deepcopy_json(archive_candidates),
+            "create_time_checked": create_time_checked,
+            "create_time_updated": create_time_updated,
+            "create_time_still_missing": create_time_still_missing,
         }
 
     drama_ids: list[str] = []
@@ -394,6 +457,7 @@ def refresh_missevan_watch_counts(
 
     def on_success(drama_id: str, payload: dict) -> None:
         nonlocal processed, pricing_skipped
+        nonlocal create_time_checked, create_time_updated, create_time_still_missing
         info = (payload or {}).get("info") or {}
         drama = info.get("drama") or {}
         pricing_fields, pricing_complete = missevan_pricing_observation(drama)
@@ -404,9 +468,31 @@ def refresh_missevan_watch_counts(
         sound_ids = all_sound_ids(info)
         if sound_ids:
             info_fields["soundIds"] = sound_ids
+        contexts = drama_contexts.get(drama_id, [])
+        needs_create_time = not any(
+            normalize(context_node.get("createTime"))
+            for _series_title, _season_key, context_node in contexts
+        )
+        if refresh_all and needs_create_time:
+            create_time_checked += 1
+            try:
+                create_time = missevan_create_time_observation(info, requester)
+            except Exception as exc:
+                if isinstance(exc, RuntimeError) and "HTTP_418" in str(exc):
+                    raise
+                create_time = ""
+                print(
+                    "[猫耳] createTime 补全失败，保持为空 "
+                    f"ID={drama_id} error={type(exc).__name__}: {exc}"
+                )
+            if create_time:
+                info_fields["createTime"] = create_time
+                create_time_updated += 1
+            else:
+                create_time_still_missing += 1
         if info_fields:
             info_observations[drama_id] = info_fields
-            for _series_title, _season_key, context_node in drama_contexts.get(drama_id, []):
+            for _series_title, _season_key, context_node in contexts:
                 for field, value in info_fields.items():
                     context_node[field] = value
         if not pricing_complete:
@@ -472,6 +558,9 @@ def refresh_manbo_watch_counts(
     archived = 0
     retry_requests = 0
     pricing_skipped = 0
+    create_time_checked = 0
+    create_time_updated = 0
+    create_time_still_missing = 0
     info_observations: dict[str, dict[str, object]] = {}
     archive_candidates: dict[str, dict[str, str]] = {}
     now = datetime.now(UTC)
@@ -505,6 +594,7 @@ def refresh_manbo_watch_counts(
 
     def on_success(record: dict, payload: dict) -> None:
         nonlocal processed, pricing_skipped
+        nonlocal create_time_checked, create_time_updated, create_time_still_missing
         drama_id = str(record.get("dramaId") or "").strip()
         data = payload.get("data") or {}
         pricing_fields, pricing_complete = manbo_pricing_observation(drama_id, payload)
@@ -518,6 +608,14 @@ def refresh_manbo_watch_counts(
         sound_ids = manbo_sound_ids(payload)
         if sound_ids:
             info_fields["soundIds"] = sound_ids
+        if refresh_all and not normalize(record.get("createTime")):
+            create_time_checked += 1
+            create_time = manbo_create_time_observation(payload)
+            if create_time:
+                info_fields["createTime"] = create_time
+                create_time_updated += 1
+            else:
+                create_time_still_missing += 1
         if info_fields:
             info_observations[drama_id] = info_fields
             for field, value in info_fields.items():
@@ -575,6 +673,9 @@ def refresh_manbo_watch_counts(
         "pricing_skipped": pricing_skipped,
         "info_observations": info_observations,
         "archive_candidates": deepcopy_json(archive_candidates),
+        "create_time_checked": create_time_checked,
+        "create_time_updated": create_time_updated,
+        "create_time_still_missing": create_time_still_missing,
     }
 
 
@@ -586,6 +687,9 @@ def print_missevan_stats(stats: dict) -> None:
     print("猫耳 recent backoff seconds:", stats["last_backoff_seconds"])
     print("猫耳 pricing checked:", stats.get("pricing_checked", 0))
     print("猫耳 pricing skipped:", stats.get("pricing_skipped", 0))
+    print("猫耳 createTime checked:", stats.get("create_time_checked", 0))
+    print("猫耳 createTime updated:", stats.get("create_time_updated", 0))
+    print("猫耳 createTime still missing:", stats.get("create_time_still_missing", 0))
 
 
 def print_manbo_stats(stats: dict) -> None:
@@ -595,6 +699,9 @@ def print_manbo_stats(stats: dict) -> None:
     print("漫播 archive retry requests:", stats.get("archive_retry_requests", 0))
     print("漫播 pricing checked:", stats.get("pricing_checked", 0))
     print("漫播 pricing skipped:", stats.get("pricing_skipped", 0))
+    print("漫播 createTime checked:", stats.get("create_time_checked", 0))
+    print("漫播 createTime updated:", stats.get("create_time_updated", 0))
+    print("漫播 createTime still missing:", stats.get("create_time_still_missing", 0))
 
 
 def print_info_publish_stats(platform: str, stats: dict) -> None:
@@ -604,6 +711,7 @@ def print_info_publish_stats(platform: str, stats: dict) -> None:
     print(f"{platform} membership changed:", stats.get("membership_changed", 0))
     print(f"{platform} soundIds changed:", stats.get("sound_ids_changed", 0))
     print(f"{platform} cover changed:", stats.get("cover_changed", 0))
+    print(f"{platform} createTime changed:", stats.get("create_time_changed", 0))
 
 
 def publish_refresh_results(platforms: list[str] | tuple[str, ...], refresh_results: dict[str, dict]) -> None:
@@ -664,7 +772,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--refresh-all",
         action="store_true",
-        help="绕过一小时 fetched_at 缓存，重新抓取所选平台的全部播放量",
+        help="绕过一小时缓存，全量刷新播放量并尝试补全空 createTime",
     )
     parser.add_argument("--no-upload", action="store_true", help="刷新后不上传 watchcount 到 Upstash")
     args = parser.parse_args(argv)
