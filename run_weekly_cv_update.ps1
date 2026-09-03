@@ -48,19 +48,28 @@ function Run-Step {
 }
 
 $ExitCodes = @()
-$RefreshExitCode = Run-Step "refresh_watch_counts.py" @("python", "-X", "utf8", "-u", "refresh_watch_counts.py")
+$RefreshExitCode = Run-Step "refresh_watch_counts.py --refresh-all" @("python", "-X", "utf8", "-u", "refresh_watch_counts.py", "--refresh-all")
 $ExitCodes += $RefreshExitCode
 
 if ([int]$RefreshExitCode -eq 0) {
+    $ExpectedHistoryDate = [DateTime]::UtcNow.ToString('yyyy-MM-dd')
     $BuildExitCode = Run-Step "build_cv_ranks.py" @("python", "-X", "utf8", "-u", "build_cv_ranks.py")
     $ExitCodes += $BuildExitCode
     if ([int]$BuildExitCode -eq 0) {
-        $ExitCodes += Run-Step "update_rank_meta.py cv" @("python", "-X", "utf8", "-u", "update_rank_meta.py", "cv")
+        $GrowthExitCode = Run-Step "build_weekly_growth_ranks.py" @("python", "-X", "utf8", "-u", "build_weekly_growth_ranks.py", "--expected-end-date", $ExpectedHistoryDate)
+        $ExitCodes += $GrowthExitCode
+        if ([int]$GrowthExitCode -eq 0) {
+            $ExitCodes += Run-Step "update_rank_meta.py cv" @("python", "-X", "utf8", "-u", "update_rank_meta.py", "cv")
+        } else {
+            Write-Log "=== update_rank_meta.py cv skipped: build_weekly_growth_ranks.py exit=$GrowthExitCode ==="
+        }
     } else {
+        Write-Log "=== build_weekly_growth_ranks.py skipped: build_cv_ranks.py exit=$BuildExitCode ==="
         Write-Log "=== update_rank_meta.py cv skipped: build_cv_ranks.py exit=$BuildExitCode ==="
     }
 } else {
     Write-Log "=== build_cv_ranks.py skipped: refresh_watch_counts.py exit=$RefreshExitCode ==="
+    Write-Log "=== build_weekly_growth_ranks.py skipped: refresh_watch_counts.py exit=$RefreshExitCode ==="
     Write-Log "=== update_rank_meta.py cv skipped: refresh_watch_counts.py exit=$RefreshExitCode ==="
 }
 

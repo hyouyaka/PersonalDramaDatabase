@@ -170,6 +170,7 @@ python refresh_watch_counts.py --missevan 86686
 python refresh_watch_counts.py --manbo 2195128381907927121
 python refresh_watch_counts.py --missevan 86686 87590
 python refresh_watch_counts.py --manbo 2195128381907927121 2067945724439429338
+python refresh_watch_counts.py --refresh-all
 ```
 
 说明：
@@ -177,7 +178,42 @@ python refresh_watch_counts.py --manbo 2195128381907927121 2067945724439429338
 - `--platform all` 是默认值
 - `--missevan` 和 `--manbo` 可以直接指定一个或多个 `dramaId`
 - 只要传了 `--missevan` 或 `--manbo`，脚本就只刷新你指定的 ID，不会再跑全量
+- `--refresh-all` 只绕过一小时 `fetched_at` 缓存；`--force` 仍只控制刷新前是否强制拉取远端 latest
 - 猫耳命中 `418` 时会先保存已完成进度，再退出
+
+### 3.1 生成 7 天 / 4 周播放增量榜
+
+脚本：`build_weekly_growth_ranks.py`
+
+该脚本只读取 `missevan:watchcount:history`、`manbo:watchcount:history` 和两份 info v2，生成双平台 7 天及 4 周增量 Top 50。结果覆盖本地 `ranks-weekly-growth.json` 和远端 `ranks:weekly-growth:latest`，不保留历史榜单。
+
+```powershell
+python build_weekly_growth_ranks.py
+python build_weekly_growth_ranks.py --no-upload
+python build_weekly_growth_ranks.py --expected-end-date 2026-08-28
+```
+
+统计规则：
+
+- 基线分别为结束日前 7 天和 28 天，允许前后 1 天；精确日期优先，同距时优先较早日期
+- 缺少基线且 `createTime` 为空，或创建月属于结束月/前一个自然月时，按新剧从 0 计算
+- 旧剧缺少基线、零增长、负增长以及缺少 info v2 记录的剧目不入榜
+- 排序为增量降序、当前播放量降序、数字 `dramaId` 升序
+- GUI“榜单数据”区域的“重算 7天/4周增量榜”直接按远端 history 重算，不先抓取播放量
+
+每周任务 `run_weekly_cv_update.ps1` 的执行顺序为：
+
+```text
+refresh_watch_counts.py --refresh-all
+    → latest + history 原子上传并回读 ✅
+    → build_cv_ranks.py ✅
+    → build_weekly_growth_ranks.py --expected-end-date <UTC日期> ✅
+    → update_rank_meta.py cv ✅
+
+刷新、上传、回读或日期校验失败 ❌ 后续榜单/Meta 步骤跳过
+```
+
+当前线上数据只更新 info v2；`missevan:info:v1`、`manbo:info:v1` 属于已退役兼容快照，维护脚本不会同时写入。
 
 ## 4. 清理漫播收费规则
 

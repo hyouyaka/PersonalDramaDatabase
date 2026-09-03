@@ -542,6 +542,54 @@ class UpstashEditorTests(unittest.TestCase):
         saved = json.loads(fake.strings["ranks:cv:latest"])
         self.assertEqual([item["rank"] for item in saved["rankings"]["missevan"]], [1, 2])
 
+    def test_weekly_growth_resource_exposes_four_collections_and_normalizes_ranks(self) -> None:
+        item = {
+            "rank": 9,
+            "platform": "missevan",
+            "dramaId": "123",
+            "title": "测试剧",
+            "viewCount": 100,
+            "viewCountIncrease": 25,
+            "isNew": False,
+            "newReason": None,
+            "mainCvs": [],
+            "catalogName": None,
+            "payStatus": None,
+            "createTime": None,
+        }
+        payload = {
+            "version": 1,
+            "kind": "weeklyViewGrowth",
+            "date": "2026-08-28",
+            "generated_at": "old",
+            "statisticsPeriods": {
+                period: {
+                    platform: {"startDate": start, "endDate": "2026-08-28"}
+                    for platform in ("missevan", "manbo")
+                }
+                for period, start in (("weekly", "2026-08-21"), ("fourWeek", "2026-07-31"))
+            },
+            "rankings": {
+                "weekly": {"missevan": [item], "manbo": []},
+                "fourWeek": {"missevan": [], "manbo": []},
+            },
+        }
+        spec = upstash_editor.RESOURCE_SPECS["ranks:weekly-growth:latest"]
+
+        normalized, _encoded = upstash_editor._normalize_string_payload(
+            spec,
+            payload,
+            "2026-08-28T12:00:00+00:00",
+        )
+        collections = upstash_editor.collection_refs(spec, normalized)
+
+        self.assertEqual(
+            [collection.name for collection in collections],
+            ["7天 / missevan", "7天 / manbo", "4周 / missevan", "4周 / manbo"],
+        )
+        self.assertEqual(normalized["rankings"]["weekly"]["missevan"][0]["rank"], 1)
+        self.assertEqual(normalized["generated_at"], "2026-08-28T12:00:00+00:00")
+
 
 if __name__ == "__main__":
     unittest.main()

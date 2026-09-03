@@ -160,7 +160,7 @@ def publish_rank_string(
     if isinstance(payload, dict):
         if key == "ranks:latest":
             updated_at = str((payload.get("_meta") or {}).get("updated_at") or updated_at)
-        elif key == "ranks:cv:latest":
+        elif payload.get("generated_at"):
             updated_at = str(payload.get("generated_at") or updated_at)
     rank_meta: dict | None = None
     for _attempt in range(3):

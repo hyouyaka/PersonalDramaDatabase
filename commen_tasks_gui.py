@@ -1714,13 +1714,15 @@ class OperationsPage(QWidget):
         self.rank_force = QCheckBox("强制刷新")
         fetch_rank_button = QPushButton("抓取榜单数据")
         only_danmaku_button = QPushButton("仅更新弹幕")
-        self.command_buttons.extend([fetch_rank_button, only_danmaku_button])
+        weekly_growth_button = QPushButton("重算 7天/4周增量榜")
+        self.command_buttons.extend([fetch_rank_button, only_danmaku_button, weekly_growth_button])
         rank_data_layout.addWidget(QLabel("平台"), 0, 0)
         rank_data_layout.addWidget(self.rank_platform_box, 0, 1)
         rank_data_layout.addWidget(self.rank_skip_danmaku, 0, 2)
         rank_data_layout.addWidget(self.rank_force, 0, 3)
         rank_data_layout.addWidget(fetch_rank_button, 1, 0, 1, 2)
         rank_data_layout.addWidget(only_danmaku_button, 1, 2, 1, 2)
+        rank_data_layout.addWidget(weekly_growth_button, 2, 0, 1, 4)
         rank_data_layout.setColumnStretch(1, 1)
         left_layout.addWidget(rank_data_box)
         left_layout.addStretch(1)
@@ -1750,6 +1752,7 @@ class OperationsPage(QWidget):
         sync_remote_button.clicked.connect(self.run_sync_remote_libraries)
         fetch_rank_button.clicked.connect(self.run_fetch_rank_data)
         only_danmaku_button.clicked.connect(self.run_only_danmaku)
+        weekly_growth_button.clicked.connect(self.run_weekly_growth_ranks)
         rank_button.clicked.connect(self.run_rank_images)
         detail_button.clicked.connect(self.run_rank_detail_images)
         clear_button.clicked.connect(self.log_view.clear)
@@ -1835,6 +1838,12 @@ class OperationsPage(QWidget):
         if self.rank_force.isChecked():
             command.append("--force")
         self.run_command_requested.emit(command, "正在更新弹幕数据")
+
+    def run_weekly_growth_ranks(self) -> None:
+        self.run_command_requested.emit(
+            [PYTHON_EXE, "build_weekly_growth_ranks.py"],
+            "正在重算 7天/4周增量榜",
+        )
 
     def run_rank_images(self) -> None:
         missevan_date, manbo_date = self.require_dates()

@@ -329,7 +329,11 @@ def run_archive_retry_queue(
     return {"retry_requests": retry_requests}
 
 
-def refresh_missevan_watch_counts(*, target_ids: set[str] | None = None) -> dict:
+def refresh_missevan_watch_counts(
+    *,
+    target_ids: set[str] | None = None,
+    refresh_all: bool = False,
+) -> dict:
     store = load_json(MISSEVAN_INFO_PATH, {})
     cache = load_cache(MISSEVAN_COUNTS_PATH)
     requester = MissevanRequester()
@@ -371,7 +375,7 @@ def refresh_missevan_watch_counts(*, target_ids: set[str] | None = None) -> dict
     target_drama_ids: list[str] = []
     for idx, drama_id in enumerate(drama_ids, start=1):
         cached = (cache.get("counts") or {}).get(drama_id) or {}
-        if should_skip_recent(cached, now):
+        if not refresh_all and should_skip_recent(cached, now):
             print(f"[猫耳] 跳过 ID={drama_id} ({idx}/{len(drama_ids)})")
             skipped += 1
             continue
@@ -456,7 +460,11 @@ def refresh_missevan_watch_counts(*, target_ids: set[str] | None = None) -> dict
     return current_stats()
 
 
-def refresh_manbo_watch_counts(*, target_ids: set[str] | None = None) -> dict:
+def refresh_manbo_watch_counts(
+    *,
+    target_ids: set[str] | None = None,
+    refresh_all: bool = False,
+) -> dict:
     store = load_json(MANBO_INFO_PATH, {"records": []})
     cache = load_cache(MANBO_COUNTS_PATH)
     processed = 0
@@ -474,7 +482,7 @@ def refresh_manbo_watch_counts(*, target_ids: set[str] | None = None) -> dict:
     for idx, record in enumerate(target_records, start=1):
         drama_id = str(record.get("dramaId") or "").strip()
         cached = (cache.get("counts") or {}).get(drama_id) or {}
-        if should_skip_recent(cached, now):
+        if not refresh_all and should_skip_recent(cached, now):
             print(f"[漫播] 跳过 ID={drama_id} ({idx}/{len(target_records)})")
             skipped += 1
             continue
@@ -623,9 +631,12 @@ def publish_refresh_results(platforms: list[str] | tuple[str, ...], refresh_resu
         )
 
 
-def run_missevan_refresh(target_ids: set[str] | None) -> dict:
+def run_missevan_refresh(target_ids: set[str] | None, *, refresh_all: bool = False) -> dict:
     try:
-        stats = refresh_missevan_watch_counts(target_ids=target_ids)
+        kwargs = {"target_ids": target_ids}
+        if refresh_all:
+            kwargs["refresh_all"] = True
+        stats = refresh_missevan_watch_counts(**kwargs)
     except RuntimeError as exc:
         if "HTTP_418" not in str(exc):
             raise
@@ -635,8 +646,11 @@ def run_missevan_refresh(target_ids: set[str] | None) -> dict:
     return stats
 
 
-def run_manbo_refresh(target_ids: set[str] | None) -> dict:
-    stats = refresh_manbo_watch_counts(target_ids=target_ids)
+def run_manbo_refresh(target_ids: set[str] | None, *, refresh_all: bool = False) -> dict:
+    kwargs = {"target_ids": target_ids}
+    if refresh_all:
+        kwargs["refresh_all"] = True
+    stats = refresh_manbo_watch_counts(**kwargs)
     print_manbo_stats(stats)
     return stats
 
@@ -647,6 +661,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--missevan", nargs="+", help="只刷新指定猫耳 dramaId，可传多个")
     parser.add_argument("--manbo", nargs="+", help="只刷新指定漫播 dramaId，可传多个")
     parser.add_argument("--force", action="store_true", help="刷新前无条件拉取远端 watchcount latest")
+    parser.add_argument(
+        "--refresh-all",
+        action="store_true",
+        help="绕过一小时 fetched_at 缓存，重新抓取所选平台的全部播放量",
+    )
     parser.add_argument("--no-upload", action="store_true", help="刷新后不上传 watchcount 到 Upstash")
     args = parser.parse_args(argv)
     load_env_file(ROOT / ".env")
@@ -683,8 +702,8 @@ def main(argv: list[str] | None = None) -> int:
         missevan_interrupted = False
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = {
-                executor.submit(run_missevan_refresh, None): "missevan",
-                executor.submit(run_manbo_refresh, None): "manbo",
+                executor.submit(run_missevan_refresh, None, refresh_all=args.refresh_all): "missevan",
+                executor.submit(run_manbo_refresh, None, refresh_all=args.refresh_all): "manbo",
             }
             for future in as_completed(futures):
                 try:
@@ -703,7 +722,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if do_missevan:
         try:
-            refresh_results["missevan"] = run_missevan_refresh(missevan_ids or None)
+            refresh_results["missevan"] = run_missevan_refresh(
+                missevan_ids or None,
+                refresh_all=args.refresh_all,
+            )
         except MissevanRefreshInterrupted as exc:
             refresh_results["missevan"] = exc.stats
             if not args.no_upload:
@@ -716,7 +738,10 @@ def main(argv: list[str] | None = None) -> int:
         refreshed_platforms.append("missevan")
 
     if do_manbo:
-        refresh_results["manbo"] = run_manbo_refresh(manbo_ids or None)
+        refresh_results["manbo"] = run_manbo_refresh(
+            manbo_ids or None,
+            refresh_all=args.refresh_all,
+        )
         refreshed_platforms.append("manbo")
 
     if not args.no_upload:

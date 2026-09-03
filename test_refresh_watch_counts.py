@@ -259,6 +259,25 @@ class RefreshWatchCountsCliTests(unittest.TestCase):
         refresh_missevan.assert_called_once_with(target_ids=None)
         refresh_manbo.assert_not_called()
 
+    def test_refresh_all_is_forwarded_without_changing_force_sync(self) -> None:
+        with (
+            patch.object(refresh_watch_counts, "sync_remote_watchcount_if_newer") as sync_remote,
+            patch.object(
+                refresh_watch_counts,
+                "refresh_missevan_watch_counts",
+                return_value={"processed": 1, "skipped": 0, "archived": 0, "request_count": 1, "last_backoff_seconds": 0},
+            ) as refresh_missevan,
+            patch.object(refresh_watch_counts, "refresh_manbo_watch_counts") as refresh_manbo,
+            patch.object(refresh_watch_counts, "upload_watchcount_file"),
+            patch("builtins.print"),
+        ):
+            result = refresh_watch_counts.main(["--platform", "missevan", "--refresh-all"])
+
+        self.assertEqual(result, 0)
+        sync_remote.assert_called_once_with("missevan", refresh_watch_counts.MISSEVAN_COUNTS_PATH, force=False)
+        refresh_missevan.assert_called_once_with(target_ids=None, refresh_all=True)
+        refresh_manbo.assert_not_called()
+
     def test_explicit_manbo_ids_download_only_manbo_info(self) -> None:
         with (
             patch.object(refresh_watch_counts, "sync_remote_watchcount_if_newer"),
@@ -520,6 +539,39 @@ class ArchiveRetryQueueTests(unittest.TestCase):
 
 
 class InfoRefreshTests(unittest.TestCase):
+    def test_refresh_all_bypasses_recent_cache_for_both_platforms(self) -> None:
+        missevan_requester = Mock()
+        missevan_requester.request_json.return_value = {
+            "info": {"drama": {"name": "猫耳", "view_count": 10, "pay_type": 0, "price": 0}}
+        }
+        missevan_requester.request_count = 1
+        missevan_requester.last_backoff_seconds = 0
+        with (
+            patch.object(refresh_watch_counts, "load_json", return_value={"100": {"dramaId": "100"}}),
+            patch.object(refresh_watch_counts, "load_cache", return_value={"_meta": {}, "counts": {"100": {"fetched_at": "recent"}}}),
+            patch.object(refresh_watch_counts, "should_skip_recent", return_value=True),
+            patch.object(refresh_watch_counts, "MissevanRequester", return_value=missevan_requester),
+            patch.object(refresh_watch_counts, "save_cache"),
+            patch.object(refresh_watch_counts, "save_missevan_store"),
+        ):
+            missevan_stats = refresh_watch_counts.refresh_missevan_watch_counts(refresh_all=True)
+
+        manbo_payload = {"data": {"title": "漫播", "watchCount": 20, "price": 0}}
+        with (
+            patch.object(refresh_watch_counts, "load_json", return_value={"records": [{"dramaId": "200"}]}),
+            patch.object(refresh_watch_counts, "load_cache", return_value={"_meta": {}, "counts": {"200": {"fetched_at": "recent"}}}),
+            patch.object(refresh_watch_counts, "should_skip_recent", return_value=True),
+            patch.object(refresh_watch_counts, "request_manbo_json", return_value=manbo_payload) as manbo_request,
+            patch.object(refresh_watch_counts, "save_cache"),
+            patch.object(refresh_watch_counts, "save_json"),
+        ):
+            manbo_stats = refresh_watch_counts.refresh_manbo_watch_counts(refresh_all=True)
+
+        missevan_requester.request_json.assert_called_once()
+        manbo_request.assert_called_once()
+        self.assertEqual(missevan_stats["skipped"], 0)
+        self.assertEqual(manbo_stats["skipped"], 0)
+
     def test_missevan_418_carries_completed_info_observations(self) -> None:
         store = {
             "100": {"dramaId": 100, "title": "已完成", "soundIds": ["old"]},

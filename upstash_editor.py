@@ -150,6 +150,14 @@ RESOURCE_SPECS: dict[str, ResourceSpec] = {
             local_path=ROOT / "ranks-cv.json",
         ),
         ResourceSpec(
+            "ranks:weekly-growth:latest",
+            "最新 7天/4周增量榜",
+            "string",
+            "ranks_weekly_growth_latest",
+            rank_scope="cv",
+            local_path=ROOT / "ranks-weekly-growth.json",
+        ),
+        ResourceSpec(
             "ranks:trend:missevan:v2",
             "猫耳趋势榜",
             "hash",
@@ -542,6 +550,66 @@ def validate_payload(spec: ResourceSpec, payload: object, *, hash_meta: dict | N
                         raise ValueError(f"Missing or duplicate cvName in {spec.key}.{group}.{platform}: {name!r}")
                     names.add(name)
         return
+    if spec.kind == "ranks_weekly_growth_latest":
+        root = _require_dict(payload, spec.key)
+        if root.get("version") != 1 or root.get("kind") != "weeklyViewGrowth":
+            raise ValueError(f"{spec.key} must use weeklyViewGrowth version 1.")
+        periods = _require_dict(root.get("statisticsPeriods"), f"{spec.key}.statisticsPeriods")
+        rankings = _require_dict(root.get("rankings"), f"{spec.key}.rankings")
+        for period in ("weekly", "fourWeek"):
+            period_dates = _require_dict(periods.get(period), f"{spec.key}.statisticsPeriods.{period}")
+            period_rankings = _require_dict(rankings.get(period), f"{spec.key}.rankings.{period}")
+            for platform in ("missevan", "manbo"):
+                dates = _require_dict(
+                    period_dates.get(platform),
+                    f"{spec.key}.statisticsPeriods.{period}.{platform}",
+                )
+                for field in ("startDate", "endDate"):
+                    value = str(dates.get(field) or "")
+                    try:
+                        datetime.strptime(value, "%Y-%m-%d")
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"{spec.key}.statisticsPeriods.{period}.{platform}.{field} "
+                            "must be YYYY-MM-DD."
+                        ) from exc
+                records = period_rankings.get(platform)
+                if not isinstance(records, list) or len(records) > 50:
+                    raise ValueError(f"{spec.key}.rankings.{period}.{platform} must contain at most 50 items.")
+                seen: set[str] = set()
+                for index, item in enumerate(records, 1):
+                    record = _require_dict(
+                        item,
+                        f"{spec.key}.rankings.{period}.{platform}[{index - 1}]",
+                    )
+                    if record.get("rank") != index:
+                        raise ValueError(f"{spec.key}.rankings.{period}.{platform} ranks must be consecutive.")
+                    if record.get("platform") != platform:
+                        raise ValueError(f"{spec.key}.rankings.{period}.{platform}[{index - 1}] platform mismatch.")
+                    drama_id = _validate_numeric_id(
+                        record.get("dramaId"),
+                        f"{spec.key}.rankings.{period}.{platform}[{index - 1}].dramaId",
+                    )
+                    if drama_id in seen:
+                        raise ValueError(f"Duplicate dramaId in {spec.key}.rankings.{period}.{platform}: {drama_id}")
+                    seen.add(drama_id)
+                    view_count = record.get("viewCount")
+                    increase = record.get("viewCountIncrease")
+                    if isinstance(view_count, bool) or not isinstance(view_count, int) or view_count < 0:
+                        raise ValueError(f"{spec.key} viewCount must be a non-negative integer.")
+                    if isinstance(increase, bool) or not isinstance(increase, int) or increase <= 0:
+                        raise ValueError(f"{spec.key} viewCountIncrease must be a positive integer.")
+                    if not isinstance(record.get("mainCvs"), list):
+                        raise ValueError(f"{spec.key} mainCvs must be a JSON array.")
+                    is_new = record.get("isNew")
+                    reason = record.get("newReason")
+                    if not isinstance(is_new, bool):
+                        raise ValueError(f"{spec.key} isNew must be a boolean.")
+                    if is_new and reason not in ("missingCreateTime", "createdInEndMonth"):
+                        raise ValueError(f"{spec.key} new records must include a valid newReason.")
+                    if not is_new and reason is not None:
+                        raise ValueError(f"{spec.key} non-new records must use null newReason.")
+        return
 
     fields = _require_dict(payload, spec.key)
     for field, value in fields.items():
@@ -586,6 +654,18 @@ def collection_refs(spec: ResourceSpec, payload: object) -> list[CollectionRef]:
             for group in ("rankings", "paidRankings")
             for platform in ("missevan", "manbo")
         ]
+    if spec.kind == "ranks_weekly_growth_latest":
+        root = _require_dict(payload, spec.key)
+        return [
+            CollectionRef(
+                f"{'7天' if period == 'weekly' else '4周'} / {platform}",
+                root["rankings"][period][platform],
+                "dramaId",
+                platform,
+            )
+            for period in ("weekly", "fourWeek")
+            for platform in ("missevan", "manbo")
+        ]
     return [CollectionRef("趋势实体", _require_dict(payload, spec.key), None)]
 
 
@@ -605,6 +685,12 @@ def _normalize_string_payload(spec: ResourceSpec, payload: object, now: str) -> 
         for group in ("rankings", "paidRankings"):
             for platform in ("missevan", "manbo"):
                 for rank, item in enumerate(root[group][platform], 1):
+                    item["rank"] = rank
+    elif spec.kind == "ranks_weekly_growth_latest":
+        root["generated_at"] = now
+        for period in ("weekly", "fourWeek"):
+            for platform in ("missevan", "manbo"):
+                for rank, item in enumerate(root["rankings"][period][platform], 1):
                     item["rank"] = rank
     validate_payload(spec, root)
     return root, compact_json(root)

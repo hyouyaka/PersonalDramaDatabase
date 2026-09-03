@@ -12,6 +12,16 @@ class CommandBuilderTests(unittest.TestCase):
             [commen_tasks_gui.PYTHON_EXE, "sync_remote_libraries.py"],
         )
 
+    def test_weekly_growth_button_runs_independent_history_rebuild(self) -> None:
+        page = SimpleNamespace(run_command_requested=Mock())
+
+        commen_tasks_gui.OperationsPage.run_weekly_growth_ranks(page)
+
+        page.run_command_requested.emit.assert_called_once_with(
+            [commen_tasks_gui.PYTHON_EXE, "build_weekly_growth_ranks.py"],
+            "正在重算 7天/4周增量榜",
+        )
+
 
 class UpstashEditorStateTests(unittest.TestCase):
     def test_collection_switch_clears_previous_edit_target(self) -> None:

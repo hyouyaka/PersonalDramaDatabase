@@ -507,6 +507,31 @@ GUI 现在不是一个简单 launcher，而是一个桌面工作台：
 
 这些变量主要被 `fetch_ongoing.py` 用来优先走 app timeline。
 
+## Weekly Growth Ranking
+
+`build_weekly_growth_ranks.py` 是独立的 7 天 / 4 周播放增量榜构建器。它只对播放量 history 做两次 `HGETALL`，不读取 watchcount latest，也不请求平台接口；展示元数据直接关联 info v2。
+
+| 数据 | Upstash key | 发布方式 |
+|---|---|---|
+| 猫耳 / 漫播剧目元数据 | `{platform}:info:v2` | 只读 |
+| 猫耳 / 漫播播放量历史 | `{platform}:watchcount:history` | 只读 Hash |
+| 最新增量榜 | `ranks:weekly-growth:latest` | String CAS 覆盖，并登记到 `ranks:meta.cv.resources` |
+
+```text
+run_weekly_cv_update.ps1
+    → refresh_watch_counts.py --refresh-all ✅ 双平台全量刷新
+    → latest + history 原子上传并回读 ✅
+    → build_cv_ranks.py ✅
+    → build_weekly_growth_ranks.py --expected-end-date <UTC日期> ✅
+    → update_rank_meta.py cv ✅
+
+刷新/上传/回读失败 ❌ 后续榜单步骤全部跳过
+history 日期不匹配 ❌ 增量榜拒绝发布并保留上一期
+GUI 独立重算 ✅ 直接使用远端 history 最新日期
+```
+
+一个 latest payload 同时包含 `rankings.weekly` 与 `rankings.fourWeek`，各自再分为 `missevan` 和 `manbo`。每个剧目分别按目标日、目标日前 1 天、目标日后 1 天选择自身基线；缺少剧目基线时，仅 `createTime` 为空或创建月属于结束月/前一个自然月的剧目按 0 起算。发布前还会复用 info v2 的最小记录数门禁，防止截断源数据覆盖正常榜单。
+
 ## Tests
 
 当前仓库里与新功能最直接对应的自动化测试主要有：
@@ -522,6 +547,9 @@ GUI 现在不是一个简单 launcher，而是一个桌面工作台：
   - 覆盖 `--only-danmaku` 的缓存 / `0` 值 / `--force` 刷新语义
   - 覆盖普通模式下 `--skip-danmaku` 对 metric 中弹幕字段的写入语义
   - 覆盖 remote partial/fallback merge 行为
+- `test_build_weekly_growth_ranks.py`
+  - 覆盖纯 history 读取、7/28 天基线和日期门禁
+  - 覆盖新剧判断、Top 50、排序和 info v2 元数据映射
 
 ## Summary
 
