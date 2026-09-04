@@ -19,6 +19,7 @@ class RankMetaTests(unittest.TestCase):
                         "publishedAt": "2026-06-12T11:30:00+00:00",
                     },
                     "cv": {"updatedAt": None, "publishedAt": None},
+                    "watchcountGrowth": {"updatedAt": None, "publishedAt": None},
                 },
                 ensure_ascii=False,
             )
@@ -34,6 +35,10 @@ class RankMetaTests(unittest.TestCase):
         self.assertEqual(result["normal"]["updatedAt"], "2026-06-12T11:30:00+00:00")
         self.assertEqual(result["normal"]["publishedAt"], "2026-06-12T11:30:00+00:00")
         self.assertEqual(result["cv"], {"updatedAt": None, "publishedAt": None})
+        self.assertEqual(
+            result["watchcountGrowth"],
+            {"updatedAt": None, "publishedAt": None},
+        )
         upstash.assert_called_once()
         command = upstash.call_args.args[0]
         self.assertEqual(command[0], "EVAL")
@@ -70,6 +75,28 @@ class RankMetaTests(unittest.TestCase):
 
         self.assertRegex(timestamp, r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$")
         self.assertNotRegex(timestamp, re.escape("+00:00Z"))
+
+    def test_watchcount_growth_is_a_supported_scope(self) -> None:
+        updated = {
+            "normal": {"updatedAt": None, "publishedAt": None, "resources": {}},
+            "cv": {"updatedAt": None, "publishedAt": None, "resources": {}},
+            "watchcountGrowth": {
+                "updatedAt": "2026-09-03T12:00:00+00:00",
+                "publishedAt": "2026-09-03T12:00:00+00:00",
+                "resources": {"ranks:weekly-growth:latest": {"dataType": "string"}},
+            },
+        }
+        upstash = Mock(return_value=json.dumps(updated, ensure_ascii=False))
+
+        with patch("builtins.print"):
+            result = update_rank_meta.update_rank_meta(
+                "watchcountGrowth",
+                now=lambda: datetime(2026, 9, 3, 12, 0, tzinfo=timezone.utc),
+                upstash=upstash,
+            )
+
+        self.assertIn("ranks:weekly-growth:latest", result["watchcountGrowth"]["resources"])
+        self.assertEqual(upstash.call_args.args[0][-2], "watchcountGrowth")
 
     def test_set_failure_raises(self) -> None:
         upstash = Mock(return_value=None)

@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent
 BACKUP_ROOT = ROOT / "recovery_backups" / "upstash_editor"
 CURRENT_MIRROR_ROOT = BACKUP_ROOT / "current"
 RANK_META_KEY = "ranks:meta"
+WEEKLY_GROWTH_RANK_KEY = "ranks:weekly-growth:latest"
 STAGING_TTL_SECONDS = 24 * 60 * 60
 HASH_WRITE_CHUNK_SIZE = 100
 GENERATED_MISSEVAN_CVID_MIN = 330000
@@ -75,7 +76,7 @@ class ResourceSpec:
     label: str
     redis_type: Literal["string", "hash"]
     kind: str
-    rank_scope: Literal["normal", "cv"] | None = None
+    rank_scope: Literal["normal", "cv", "watchcountGrowth"] | None = None
     local_path: Path | None = None
 
 
@@ -150,11 +151,11 @@ RESOURCE_SPECS: dict[str, ResourceSpec] = {
             local_path=ROOT / "ranks-cv.json",
         ),
         ResourceSpec(
-            "ranks:weekly-growth:latest",
+            WEEKLY_GROWTH_RANK_KEY,
             "最新 7天/4周增量榜",
             "string",
             "ranks_weekly_growth_latest",
-            rank_scope="cv",
+            rank_scope="watchcountGrowth",
             local_path=ROOT / "ranks-weekly-growth.json",
         ),
         ResourceSpec(
@@ -554,6 +555,10 @@ def validate_payload(spec: ResourceSpec, payload: object, *, hash_meta: dict | N
         root = _require_dict(payload, spec.key)
         if root.get("version") != 1 or root.get("kind") != "weeklyViewGrowth":
             raise ValueError(f"{spec.key} must use weeklyViewGrowth version 1.")
+        for field in ("missevanDramaCount", "manboDramaCount"):
+            value = root.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{spec.key}.{field} must be a non-negative integer.")
         periods = _require_dict(root.get("statisticsPeriods"), f"{spec.key}.statisticsPeriods")
         rankings = _require_dict(root.get("rankings"), f"{spec.key}.rankings")
         for period in ("weekly", "fourWeek"):
@@ -778,10 +783,10 @@ def build_rank_meta_update(
     byte_count: int,
     updated_at: str,
 ) -> dict:
-    if scope not in ("normal", "cv"):
+    if scope not in ("normal", "cv", "watchcountGrowth"):
         raise ValueError(f"Unsupported rank meta scope: {scope}")
     meta = _decode_json_object(current)
-    for name in ("normal", "cv"):
+    for name in ("normal", "cv", "watchcountGrowth"):
         section = meta.get(name)
         if not isinstance(section, dict):
             section = {"updatedAt": None, "publishedAt": None, "resources": {}}
@@ -797,6 +802,8 @@ def build_rank_meta_update(
         "bytes": byte_count,
         "updatedAt": updated_at,
     }
+    if scope == "watchcountGrowth" and key == WEEKLY_GROWTH_RANK_KEY:
+        meta["cv"]["resources"].pop(key, None)
     return meta
 
 

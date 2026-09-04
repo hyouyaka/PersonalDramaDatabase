@@ -199,6 +199,44 @@ class UpstashV2Tests(unittest.TestCase):
         self.assertIn("ranks:latest", meta["normal"]["resources"])
         self.assertIn("ranks:cv:latest", meta["cv"]["resources"])
 
+    def test_watchcount_growth_rank_uses_independent_meta_scope(self) -> None:
+        fake = FakeUpstash()
+        fake.strings[upstash_v2.RANK_META_KEY] = upstash_v2.compact_json(
+            {
+                "normal": {"resources": {}},
+                "cv": {
+                    "updatedAt": "2026-08-28T12:00:00+00:00",
+                    "publishedAt": "2026-08-28T12:00:00+00:00",
+                    "resources": {
+                        "ranks:weekly-growth:latest": {
+                            "dataType": "string",
+                            "contentSha1": "legacy-growth",
+                            "bytes": 100,
+                            "updatedAt": "2026-08-28T12:00:00+00:00",
+                        },
+                        "ranks:cv:latest": {
+                            "dataType": "string",
+                            "contentSha1": "cv-rank",
+                            "bytes": 200,
+                            "updatedAt": "2026-08-28T12:00:00+00:00",
+                        },
+                    },
+                },
+            }
+        )
+
+        upstash_v2.publish_rank_string(
+            "ranks:weekly-growth:latest",
+            {"generated_at": "2026-09-03T12:00:00+00:00"},
+            scope="watchcountGrowth",
+            upstash=fake,
+        )
+
+        meta = json.loads(fake.strings[upstash_v2.RANK_META_KEY])
+        self.assertIn("ranks:weekly-growth:latest", meta["watchcountGrowth"]["resources"])
+        self.assertNotIn("ranks:weekly-growth:latest", meta["cv"]["resources"])
+        self.assertIn("ranks:cv:latest", meta["cv"]["resources"])
+
     def test_legacy_publish_mode_cannot_disable_v2_writes(self) -> None:
         fake = FakeUpstash()
         result = upstash_v2.publish_info_v2(

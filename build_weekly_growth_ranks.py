@@ -10,6 +10,7 @@ from platform_sync import (
     MANBO_CATALOG_NAME_ALIASES,
     MANBO_CATALOG_NAME_BY_ID,
     MISSEVAN_CATALOG_NAME_BY_ID,
+    iter_missevan_nodes,
     manbo_main_cv_display_names,
     missevan_main_cv_entries,
     normalize,
@@ -71,6 +72,22 @@ def info_indexes(payloads: dict[str, object]) -> dict[str, dict[str, dict]]:
             if drama_id:
                 manbo[drama_id] = value
     return {"missevan": missevan, "manbo": manbo}
+
+
+def count_missevan_dramas(store: dict) -> int:
+    return sum(
+        1
+        for _series_title, _season_key, node in iter_missevan_nodes(store or {})
+        if normalize(node.get("dramaId"))
+    )
+
+
+def count_manbo_dramas(store: dict) -> int:
+    return sum(
+        1
+        for record in (store or {}).get("records") or []
+        if isinstance(record, dict) and normalize(record.get("dramaId"))
+    )
 
 
 def history_date_set(history: dict[str, dict]) -> set[str]:
@@ -259,7 +276,7 @@ def build_period_ranking(
 
 def load_remote_sources(
     upstash: Callable[[list[object]], object],
-) -> tuple[dict[str, dict[str, dict]], dict[str, dict[str, dict]]]:
+) -> tuple[dict[str, dict[str, dict]], dict[str, dict[str, dict]], dict[str, int]]:
     histories = {
         platform: decode_watchcount_history(
             platform,
@@ -273,7 +290,11 @@ def load_remote_sources(
     }
     assert_info_download_is_safe(MISSEVAN_INFO_KEY, info_payloads["missevan"])
     assert_info_download_is_safe(MANBO_INFO_KEY, info_payloads["manbo"])
-    return histories, info_indexes(info_payloads)
+    drama_counts = {
+        "missevan": count_missevan_dramas(info_payloads["missevan"]),
+        "manbo": count_manbo_dramas(info_payloads["manbo"]),
+    }
+    return histories, info_indexes(info_payloads), drama_counts
 
 
 def build_payload(
@@ -287,7 +308,7 @@ def build_payload(
         if expected_end_date is not None
         else None
     )
-    histories, info = load_remote_sources(upstash)
+    histories, info, drama_counts = load_remote_sources(upstash)
     end_dates = {
         platform: latest_history_date(platform, histories[platform])
         for platform in PLATFORMS
@@ -333,6 +354,8 @@ def build_payload(
         "kind": "weeklyViewGrowth",
         "date": max(end_dates.values()).isoformat(),
         "generated_at": generated_at or now_iso(),
+        "missevanDramaCount": drama_counts["missevan"],
+        "manboDramaCount": drama_counts["manbo"],
         "statisticsPeriods": periods,
         "rankings": rankings,
     }
@@ -368,7 +391,7 @@ def main(
         )
         print(f"[ok] {period}: {counts}")
     if not args.no_upload:
-        publish_rank_string(RANK_KEY, payload, scope="cv", upstash=upstash)
+        publish_rank_string(RANK_KEY, payload, scope="watchcountGrowth", upstash=upstash)
         print(f"[ok] published {RANK_KEY}")
     return 0
 

@@ -30,12 +30,19 @@ class WeeklyCvUpdateScriptTests(unittest.TestCase):
             '$ExitCodes += Run-Step "update_rank_meta.py cv" @("python", "-X", "utf8", "-u", "update_rank_meta.py", "cv")',
             script,
         )
+        self.assertIn(
+            '$ExitCodes += Run-Step "update_rank_meta.py watchcountGrowth" @("python", "-X", "utf8", "-u", "update_rank_meta.py", "watchcountGrowth")',
+            script,
+        )
         self.assertIn("build_cv_ranks.py skipped", script)
         self.assertIn("build_weekly_growth_ranks.py skipped: build_cv_ranks.py", script)
         self.assertIn("build_weekly_growth_ranks.py skipped: refresh_watch_counts.py", script)
         self.assertIn("update_rank_meta.py cv skipped: build_weekly_growth_ranks.py", script)
         self.assertIn("update_rank_meta.py cv skipped: build_cv_ranks.py", script)
         self.assertIn("update_rank_meta.py cv skipped: refresh_watch_counts.py", script)
+        self.assertIn("update_rank_meta.py watchcountGrowth skipped: build_weekly_growth_ranks.py", script)
+        self.assertIn("update_rank_meta.py watchcountGrowth skipped: build_cv_ranks.py", script)
+        self.assertIn("update_rank_meta.py watchcountGrowth skipped: refresh_watch_counts.py", script)
 
 
 if __name__ == "__main__":

@@ -128,6 +128,8 @@ class WeeklyGrowthRankTests(unittest.TestCase):
         )
         self.assertFalse(any("watchcount:latest" in str(command) for command in fake.commands))
         self.assertEqual(payload["date"], "2026-08-28")
+        self.assertEqual(payload["missevanDramaCount"], 100)
+        self.assertEqual(payload["manboDramaCount"], 50)
         self.assertEqual(payload["statisticsPeriods"]["weekly"]["missevan"]["startDate"], "2026-08-21")
         self.assertEqual(payload["statisticsPeriods"]["fourWeek"]["missevan"]["startDate"], "2026-07-31")
 
@@ -242,7 +244,7 @@ class WeeklyGrowthRankTests(unittest.TestCase):
             self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["kind"], "weeklyViewGrowth")
             publish.assert_not_called()
 
-    def test_main_publishes_latest_key_with_cv_resource_scope(self) -> None:
+    def test_main_publishes_latest_key_with_own_resource_scope(self) -> None:
         fake = base_fake()
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "growth.json"
@@ -250,8 +252,8 @@ class WeeklyGrowthRankTests(unittest.TestCase):
                 growth.main([], upstash=fake, output_path=output)
             publish.assert_called_once()
             args, kwargs = publish.call_args
-            self.assertEqual(args[0], growth.RANK_KEY)
-            self.assertEqual(kwargs["scope"], "cv")
+            self.assertEqual(args[0], "ranks:weekly-growth:latest")
+            self.assertEqual(kwargs["scope"], "watchcountGrowth")
             self.assertIs(kwargs["upstash"], fake)
 
 

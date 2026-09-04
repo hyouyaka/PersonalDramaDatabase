@@ -562,6 +562,8 @@ class UpstashEditorTests(unittest.TestCase):
             "kind": "weeklyViewGrowth",
             "date": "2026-08-28",
             "generated_at": "old",
+            "missevanDramaCount": 100,
+            "manboDramaCount": 50,
             "statisticsPeriods": {
                 period: {
                     platform: {"startDate": start, "endDate": "2026-08-28"}
@@ -589,6 +591,7 @@ class UpstashEditorTests(unittest.TestCase):
         )
         self.assertEqual(normalized["rankings"]["weekly"]["missevan"][0]["rank"], 1)
         self.assertEqual(normalized["generated_at"], "2026-08-28T12:00:00+00:00")
+        self.assertEqual(spec.rank_scope, "watchcountGrowth")
 
 
 if __name__ == "__main__":

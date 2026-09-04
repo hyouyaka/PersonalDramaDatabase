@@ -189,7 +189,7 @@ python refresh_watch_counts.py --refresh-all
 
 脚本：`build_weekly_growth_ranks.py`
 
-该脚本只读取 `missevan:watchcount:history`、`manbo:watchcount:history` 和两份 info v2，生成双平台 7 天及 4 周增量 Top 50。结果覆盖本地 `ranks-weekly-growth.json` 和远端 `ranks:weekly-growth:latest`，不保留历史榜单。
+该脚本只读取 `missevan:watchcount:history`、`manbo:watchcount:history` 和两份 info v2，生成双平台 7 天及 4 周增量 Top 50。结果覆盖本地 `ranks-weekly-growth.json` 和远端 `ranks:weekly-growth:latest`，不保留历史榜单。顶层的 `missevanDramaCount`、`manboDramaCount` 按两份 info v2 中带有效 `dramaId` 的剧集总数计算，与 CV 榜口径一致。
 
 ```powershell
 python build_weekly_growth_ranks.py
@@ -214,6 +214,7 @@ refresh_watch_counts.py --refresh-all
     → build_cv_ranks.py ✅
     → build_weekly_growth_ranks.py --expected-end-date <UTC日期> ✅
     → update_rank_meta.py cv ✅
+    → update_rank_meta.py watchcountGrowth ✅
 
 刷新、上传、回读或日期校验失败 ❌ 后续榜单/Meta 步骤跳过
 ```

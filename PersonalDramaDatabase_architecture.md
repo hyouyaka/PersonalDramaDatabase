@@ -515,7 +515,7 @@ GUI 现在不是一个简单 launcher，而是一个桌面工作台：
 |---|---|---|
 | 猫耳 / 漫播剧目元数据 | `{platform}:info:v2` | 只读 |
 | 猫耳 / 漫播播放量历史 | `{platform}:watchcount:history` | 只读 Hash |
-| 最新增量榜 | `ranks:weekly-growth:latest` | String CAS 覆盖，并登记到 `ranks:meta.cv.resources` |
+| 最新增量榜 | `ranks:weekly-growth:latest` | String CAS 覆盖，并登记到 `ranks:meta.watchcountGrowth.resources` |
 
 ```text
 run_weekly_cv_update.ps1
@@ -525,11 +525,16 @@ run_weekly_cv_update.ps1
     → build_cv_ranks.py ✅
     → build_weekly_growth_ranks.py --expected-end-date <UTC日期> ✅
     → update_rank_meta.py cv ✅
+    → update_rank_meta.py watchcountGrowth ✅
 
 刷新/上传/回读失败 ❌ 后续榜单步骤全部跳过
 history 日期不匹配 ❌ 增量榜拒绝发布并保留上一期
 GUI 独立重算 ✅ 直接使用远端 history 最新日期
 ```
+
+增量榜顶层的 `missevanDramaCount` 与 `manboDramaCount` 统计对应 info v2 中带有效 `dramaId` 的全部剧集，与 CV 榜剧集数量口径一致；不以入榜数或存在 history 的剧集数代替。
+
+首次以 `watchcountGrowth` scope 发布时，CAS 候选 Meta 会同时删除历史版本遗留在 `cv.resources` 中的同名资源登记；榜单正文与迁移后的 `ranks:meta` 在同一次原子提交中生效，其他 CV 资源保持不变。
 
 `--refresh-all` 会对所有活跃且 `createTime` 为空的剧集进行一次补全。漫播直接复用 `dramaDetail` 的 `setRespList`；猫耳先检查当前详情中的分集时间，仍无法确定时才追加一次 `getdramabysound` 请求。只有识别到正剧首集月份时才写入，预告/PV 不会被误记为上线时间。可选补抓的非 418 异常只记为仍为空，不中断播放量刷新；418 继续触发限流退出。补全字段与封面、付费和 `soundIds` 一起通过 info v2 CAS 发布并回读，且每次 CAS 重试只会填充远端仍为空的 `createTime`。
 

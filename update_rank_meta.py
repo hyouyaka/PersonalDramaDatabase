@@ -10,7 +10,7 @@ from sync_new_drama_ids import ROOT, configure_stdio, load_env_file, upstash_req
 
 
 RANK_META_KEY = "ranks:meta"
-SCOPES = ("normal", "cv")
+SCOPES = ("normal", "cv", "watchcountGrowth")
 UPDATE_RANK_META_SCRIPT = r'''
 local raw = redis.call("GET", KEYS[1])
 local meta = {}
@@ -28,6 +28,7 @@ end
 
 ensure_section("normal")
 ensure_section("cv")
+ensure_section("watchcountGrowth")
 local resources = meta[ARGV[1]]["resources"]
 meta[ARGV[1]] = {updatedAt = ARGV[2], publishedAt = ARGV[2], resources = resources}
 
