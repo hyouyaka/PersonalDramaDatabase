@@ -2018,6 +2018,95 @@ class QueueDramaIdValidationTests(unittest.TestCase):
 
 
 class ManboDanmakuStabilityTests(unittest.TestCase):
+    def test_manbo_web_api_prefers_current_host(self) -> None:
+        request_json = Mock(return_value={"code": 200, "data": {}})
+
+        result = fetch_rank_data.request_manbo_web_json(
+            "/web_manbo/example?value=1",
+            request_json=request_json,
+        )
+
+        self.assertEqual(result["code"], 200)
+        request_json.assert_called_once_with(
+            "https://manbo.kilaaudio.com/web_manbo/example?value=1"
+        )
+
+    def test_manbo_web_api_falls_back_to_legacy_host(self) -> None:
+        def request_json(url: str) -> dict:
+            if url.startswith("https://manbo.kilaaudio.com"):
+                raise RuntimeError("current host unavailable")
+            return {"code": 200, "data": {}}
+
+        requester = Mock(side_effect=request_json)
+        with patch("builtins.print"):
+            result = fetch_rank_data.request_manbo_web_json(
+                "web_manbo/example",
+                request_json=requester,
+            )
+
+        self.assertEqual(result["code"], 200)
+        self.assertEqual(
+            [call.args[0] for call in requester.call_args_list],
+            [
+                "https://manbo.kilaaudio.com/web_manbo/example",
+                "https://www.kilamanbo.com/web_manbo/example",
+            ],
+        )
+
+    def test_manbo_web_api_falls_back_on_business_failure(self) -> None:
+        requester = Mock(
+            side_effect=[
+                {"code": 400, "msg": "bad request", "data": {}},
+                {"code": 200, "data": {}},
+            ]
+        )
+
+        with patch("builtins.print"):
+            result = fetch_rank_data.request_manbo_web_json(
+                "/web_manbo/example",
+                request_json=requester,
+            )
+
+        self.assertEqual(result["code"], 200)
+        self.assertEqual(requester.call_count, 2)
+
+    def test_manbo_web_api_falls_back_on_invalid_danmaku_structure(self) -> None:
+        requester = Mock(
+            side_effect=[
+                {"code": 200, "data": {}},
+                {"code": 200, "data": {"count": 0, "list": []}},
+            ]
+        )
+
+        with patch("builtins.print"):
+            result = fetch_rank_data.request_manbo_web_json(
+                "/web_manbo/getDanmaKuPgList?pageSize=200&dramaSetId=1&pageNo=1",
+                request_json=requester,
+            )
+
+        self.assertEqual(result["data"], {"count": 0, "list": []})
+        self.assertEqual(requester.call_count, 2)
+
+    def test_manbo_drama_detail_accepts_all_compatible_set_list_fields(self) -> None:
+        for field in ("radioDramaSetRespList", "dramaSetRespList", "sets"):
+            with self.subTest(field=field):
+                requester = Mock(
+                    return_value={"code": 200, "data": {field: [{"setId": "set-1"}]}}
+                )
+
+                result = fetch_rank_data.request_manbo_web_json(
+                    "/web_manbo/dramaDetail?dramaId=1",
+                    request_json=requester,
+                )
+
+                self.assertEqual(
+                    fetch_rank_data._extract_manbo_set_list(result["data"]),
+                    [{"setId": "set-1"}],
+                )
+                requester.assert_called_once_with(
+                    "https://manbo.kilaaudio.com/web_manbo/dramaDetail?dramaId=1"
+                )
+
     def _manbo_page_requester(self, pages: dict[tuple[str, int], dict]):
         def request_json(url: str) -> dict:
             query = parse_qs(urlparse(url).query)

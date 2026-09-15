@@ -247,6 +247,16 @@ MANBO_DANMAKU_SHORT_PAGE_RETRIES = env_int("MANBO_DANMAKU_SHORT_PAGE_RETRIES", 4
 MANBO_DANMAKU_SHORT_PAGE_RETRY_DELAY = env_float("MANBO_DANMAKU_SHORT_PAGE_RETRY_DELAY", 1.2)
 DANMAKU_DRAMA_RETRY_ATTEMPTS = 3
 MANBO_DANMAKU_LOW_VALUE_RATIO = 0.02
+MANBO_WEB_API_BASE_URLS = (
+    "https://manbo.kilaaudio.com",
+    "https://www.kilamanbo.com",
+)
+MANBO_SET_LIST_FIELDS = (
+    "setRespList",
+    "radioDramaSetRespList",
+    "dramaSetRespList",
+    "sets",
+)
 
 
 class DanmakuRefreshError(RuntimeError):
@@ -255,6 +265,62 @@ class DanmakuRefreshError(RuntimeError):
 
 class RejectedDramaRecord(RuntimeError):
     """Raised when platform detail proves an ID is outside the supported libraries."""
+
+
+def validate_manbo_web_response(path: str, data: object) -> dict:
+    """Reject successful HTTP responses that are not usable Manbo Web API payloads."""
+    if not isinstance(data, dict):
+        raise RuntimeError(f"invalid Manbo Web API response type: {type(data).__name__}")
+
+    if "code" in data:
+        try:
+            business_code = int(data["code"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"invalid Manbo Web API business code: {data['code']!r}") from exc
+        if business_code != 200:
+            message = data.get("msg") or data.get("message") or "unknown error"
+            raise RuntimeError(f"Manbo Web API business failure: code={business_code}, message={message}")
+
+    payload = data.get("data")
+    if not isinstance(payload, dict):
+        payload = data.get("b")
+    if not isinstance(payload, dict):
+        raise RuntimeError("invalid Manbo Web API response: missing object payload")
+
+    endpoint_path = path.split("?", 1)[0].rstrip("/")
+    if endpoint_path.endswith("/getDanmaKuPgList"):
+        entries = payload.get("list")
+        if "count" not in payload or not isinstance(entries, list):
+            raise RuntimeError("invalid Manbo danmaku response: expected count and list")
+        try:
+            if int(payload["count"]) < 0:
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"invalid Manbo danmaku count: {payload.get('count')!r}") from exc
+    elif endpoint_path.endswith("/dramaDetail"):
+        if not any(isinstance(payload.get(field), list) for field in MANBO_SET_LIST_FIELDS):
+            raise RuntimeError(
+                "invalid Manbo drama detail response: expected a supported set list field"
+            )
+
+    return data
+
+
+def request_manbo_web_json(path: str, *, request_json) -> dict:
+    """Request a Manbo Web API path, preferring the current host with legacy fallback."""
+    errors: list[tuple[str, Exception]] = []
+    normalized_path = "/" + path.lstrip("/")
+    for index, base_url in enumerate(MANBO_WEB_API_BASE_URLS):
+        url = f"{base_url}{normalized_path}"
+        try:
+            data = request_json(url)
+            return validate_manbo_web_response(normalized_path, data)
+        except Exception as exc:
+            errors.append((url, exc))
+            if index + 1 < len(MANBO_WEB_API_BASE_URLS):
+                print(f"    [manbo] WARN: Web API unavailable at {base_url}; trying fallback")
+    attempts = "; ".join(f"{url}: {exc}" for url, exc in errors)
+    raise RuntimeError(f"Manbo Web API failed on all configured hosts: {attempts}") from errors[-1][1]
 
 # ---------------------------------------------------------------------------
 # Upstash helpers (adapted from sync_new_drama_ids.py)
@@ -1637,7 +1703,7 @@ def _extract_manbo_set_id(episode: dict) -> str | None:
 
 
 def _extract_manbo_set_list(payload: dict) -> list[dict]:
-    for key in ("setRespList", "radioDramaSetRespList", "dramaSetRespList", "sets"):
+    for key in MANBO_SET_LIST_FIELDS:
         value = payload.get(key)
         if isinstance(value, list):
             return [item for item in value if isinstance(item, dict)]
@@ -1650,12 +1716,24 @@ def fetch_manbo_paid_set_ids(
     request_json=request_manbo_json,
 ) -> list[str]:
     """Fetch Manbo drama detail and return paid episode/set IDs."""
-    detail_urls = [
-        f"https://www.kilamanbo.com/web_manbo/dramaDetail?dramaId={drama_id}",
-        f"https://api.kilamanbo.com/api/v530/radio/drama/detail?radioDramaId={drama_id}",
+    detail_requests = [
+        lambda: request_manbo_web_json(
+            f"/web_manbo/dramaDetail?dramaId={drama_id}",
+            request_json=request_json,
+        ),
+        lambda: request_json(
+            f"https://api.kilamanbo.com/api/v530/radio/drama/detail?radioDramaId={drama_id}"
+        ),
     ]
-    for url in detail_urls:
-        data = request_json(url)
+    last_error: Exception | None = None
+    had_successful_response = False
+    for load_detail in detail_requests:
+        try:
+            data = load_detail()
+        except Exception as exc:
+            last_error = exc
+            continue
+        had_successful_response = True
         payload = data.get("data") or data.get("b") or {}
         episodes = _extract_manbo_set_list(payload)
         paid_ids = []
@@ -1665,6 +1743,8 @@ def fetch_manbo_paid_set_ids(
                 paid_ids.append(set_id)
         if paid_ids or episodes:
             return list(dict.fromkeys(paid_ids))
+    if not had_successful_response and last_error is not None:
+        raise last_error
     return []
 
 
@@ -1679,8 +1759,8 @@ def _request_manbo_danmaku_page(
     short_page_retry_delay: float = MANBO_DANMAKU_SHORT_PAGE_RETRY_DELAY,
     expected_total_count: int | None = None,
 ) -> dict:
-    url = (
-        "https://www.kilamanbo.com/web_manbo/getDanmaKuPgList"
+    path = (
+        "/web_manbo/getDanmaKuPgList"
         f"?pageSize={page_size}&dramaSetId={set_id}&pageNo={page_no}"
     )
     last_error: Exception | None = None
@@ -1689,7 +1769,7 @@ def _request_manbo_danmaku_page(
         data = None
         for attempt in range(1, MANBO_DANMAKU_REQUEST_RETRIES + 1):
             try:
-                data = request_json(url)
+                data = request_manbo_web_json(path, request_json=request_json)
                 break
             except Exception as exc:
                 last_error = exc
