@@ -479,6 +479,43 @@ class ArchiveRetryQueueTests(unittest.TestCase):
                 self.assertEqual(archived, [("1", expected_reason)])
                 self.assertEqual(now[0], 210)
 
+    def test_four_missevan_403s_record_null_without_archiving(self) -> None:
+        store = {"100": {"dramaId": 100, "title": "伪风控剧"}}
+        cache = {
+            "_meta": {},
+            "counts": {
+                "100": {
+                    "name": "旧名称",
+                    "view_count": 123,
+                    "fetched_at": "2026-07-01T00:00:00+00:00",
+                }
+            },
+        }
+        requester = Mock()
+        requester.request_json.side_effect = [self.http_error(403) for _ in range(4)]
+        requester.request_count = 4
+        requester.last_backoff_seconds = 0
+
+        with (
+            patch.object(refresh_watch_counts, "load_json", return_value=store),
+            patch.object(refresh_watch_counts, "load_cache", return_value=cache),
+            patch.object(refresh_watch_counts, "MissevanRequester", return_value=requester),
+            patch.object(refresh_watch_counts, "ARCHIVE_RETRY_DELAYS", (0, 0, 0)),
+            patch.object(refresh_watch_counts, "apply_local_archive_candidates") as apply_archive,
+            patch.object(refresh_watch_counts, "save_cache"),
+            patch.object(refresh_watch_counts, "save_missevan_store"),
+            patch("builtins.print"),
+        ):
+            stats = refresh_watch_counts.refresh_missevan_watch_counts(refresh_all=True)
+
+        self.assertEqual(stats["failed"], 1)
+        self.assertEqual(stats["archived"], 0)
+        self.assertEqual(stats["archive_candidates"], {})
+        self.assertIsNone(cache["counts"]["100"]["view_count"])
+        self.assertEqual(cache["counts"]["100"]["name"], "旧名称")
+        self.assertIn("100", store)
+        apply_archive.assert_not_called()
+
     def test_manbo_archive_signal_requires_both_code_and_message(self) -> None:
         self.assertEqual(
             refresh_watch_counts.archive_reason(

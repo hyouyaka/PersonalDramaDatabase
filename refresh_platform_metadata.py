@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from urllib.parse import quote
 
 from clean_manbo_pricing import MANBO_PRICING_EXCLUSIONS, classify_manbo_pricing
+from archive_manager import ARCHIVE_ENABLED, ARCHIVE_RETRY_DELAYS
 from cvid_map_tools import (
     ensure_generated_missevan_cv_entry,
     ensure_name_only_cv_entry,
@@ -62,6 +63,7 @@ from platform_sync import (
     MissevanRequester,
     preview_sound_ids,
 )
+from refresh_watch_counts import run_archive_retry_queue
 
 
 MISSEVAN_BLOCKLIST = {"47639", "25812"}
@@ -1068,11 +1070,6 @@ def resolve_missevan_type(raw_type: object) -> int:
         return 3
 
 
-def is_http_403(exc: Exception) -> bool:
-    response = getattr(exc, "response", None)
-    return getattr(response, "status_code", None) == 403
-
-
 def archive_missevan_node(archive: dict, series_title: str, season_key: str, node: dict, watch_count: dict | None) -> None:
     archived_node = deepcopy(node)
     archived_node["archivedReason"] = "HTTP_403"
@@ -1104,10 +1101,11 @@ def refresh_missevan(
     processed = 0
     skipped = 0
     archived = 0
+    failed = 0
     rejected: list[dict[str, str]] = []
 
-    pending_nodes: list[tuple[str, str, dict]] = []
     pending_nodes = list(iter_missevan_nodes(store))
+    request_nodes: list[tuple[int, str, str, dict, str, bool]] = []
 
     for idx, (series_title, season_key, node) in enumerate(pending_nodes, start=1):
         drama_id = str(node.get("dramaId") or "").strip()
@@ -1136,37 +1134,45 @@ def refresh_missevan(
             skipped += 1
             continue
 
-        try:
-            drama_payload = requester.request_json(f"https://www.missevan.com/dramaapi/getdrama?drama_id={drama_id}")
-        except RuntimeError:
-            save_missevan_store(MISSEVAN_INFO_PATH, store)
-            save_json(MISSEVAN_ARCHIVED_INFO_PATH, archive)
-            if update_counts:
-                save_cache(MISSEVAN_COUNTS_PATH, cache)
-            raise
-        except Exception as exc:
-            if is_http_403(exc):
-                watch_count = (cache.get("counts") or {}).get(drama_id)
-                archive_missevan_node(archive, series_title, season_key, node, watch_count)
-                remove_missevan_node(store, series_title, season_key)
-                cache.get("counts", {}).pop(drama_id, None)
-                save_missevan_store(MISSEVAN_INFO_PATH, store)
-                save_json(MISSEVAN_ARCHIVED_INFO_PATH, archive)
-                if update_counts:
-                    save_cache(MISSEVAN_COUNTS_PATH, cache)
-                archived += 1
-                print(f"[猫耳] 403归档 ID={drama_id} {season_key} title={normalize(node.get('title') or series_title)}")
-                continue
-            save_missevan_store(MISSEVAN_INFO_PATH, store)
-            save_json(MISSEVAN_ARCHIVED_INFO_PATH, archive)
-            if update_counts:
-                save_cache(MISSEVAN_COUNTS_PATH, cache)
-            print(
-                "Failed while refreshing 猫耳 metadata. "
-                f"Progress has been saved. dramaId={drama_id} title={normalize(node.get('title') or series_title)} "
-                f"error={type(exc).__name__}: {exc}"
-            )
-            raise
+        request_nodes.append((idx, series_title, season_key, node, drama_id, manual_unknown_main_cv))
+
+    def request_one(context: tuple[int, str, str, dict, str, bool], request_number: int) -> dict:
+        _idx, _series_title, _season_key, _node, drama_id, _manual_unknown_main_cv = context
+        print(f"[猫耳] 正在刷新 ID={drama_id}，请求 {request_number}/4")
+        return requester.request_json(f"https://www.missevan.com/dramaapi/getdrama?drama_id={drama_id}")
+
+    def on_archive(context: tuple[int, str, str, dict, str, bool], _reason: str) -> None:
+        nonlocal archived, failed
+        _idx, series_title, season_key, node, drama_id, _manual_unknown_main_cv = context
+        if ARCHIVE_ENABLED["missevan"]:
+            watch_count = (cache.get("counts") or {}).get(drama_id)
+            archive_missevan_node(archive, series_title, season_key, node, watch_count)
+            remove_missevan_node(store, series_title, season_key)
+            cache.get("counts", {}).pop(drama_id, None)
+            archived += 1
+            message = "403归档"
+        else:
+            previous = (cache.get("counts") or {}).get(drama_id) or {}
+            cache.setdefault("counts", {})[drama_id] = {
+                "name": normalize(previous.get("name")) or normalize(node.get("title") or series_title),
+                "view_count": None,
+                "fetched_at": utc_now(),
+            }
+            failed += 1
+            message = "4次HTTP 403，统计失败并记录null"
+        save_missevan_store(MISSEVAN_INFO_PATH, store)
+        save_json(MISSEVAN_ARCHIVED_INFO_PATH, archive)
+        if update_counts:
+            save_cache(MISSEVAN_COUNTS_PATH, cache)
+        print(f"[猫耳] {message} ID={drama_id} {season_key} title={normalize(node.get('title') or series_title)}")
+
+    def process_success(
+        context: tuple[int, str, str, dict, str, bool],
+        drama_payload: dict,
+    ) -> None:
+        nonlocal missing_catalog, processed
+        idx, series_title, season_key, node, drama_id, manual_unknown_main_cv = context
+
         info = (drama_payload or {}).get("info") or {}
         drama = info.get("drama") or {}
         remote_title = normalize(drama.get("name"))
@@ -1181,7 +1187,7 @@ def refresh_missevan(
                 print(f"[猫耳] rejected ID={drama_id}: {reason}")
             else:
                 print(f"[猫耳] WARN existing record rejected by current detail ID={drama_id}: {reason}")
-            continue
+            return
         sound_id, used_preview_sound = preferred_sound_id(info)
         preview_sound_id_list = preview_sound_ids(info)
         first_episode_sound_id = first_main_episode_sound_id(info)
@@ -1320,6 +1326,27 @@ def refresh_missevan(
             if update_counts:
                 save_cache(MISSEVAN_COUNTS_PATH, cache)
 
+    try:
+        run_archive_retry_queue(
+            "missevan",
+            request_nodes,
+            drama_id_of=lambda context: context[4],
+            request_one=request_one,
+            on_success=process_success,
+            on_archive=on_archive,
+            retry_delays=ARCHIVE_RETRY_DELAYS,
+        )
+    except Exception as exc:
+        save_missevan_store(MISSEVAN_INFO_PATH, store)
+        save_json(MISSEVAN_ARCHIVED_INFO_PATH, archive)
+        if update_counts:
+            save_cache(MISSEVAN_COUNTS_PATH, cache)
+        print(
+            "Failed while refreshing 猫耳 metadata. Progress has been saved. "
+            f"error={type(exc).__name__}: {exc}"
+        )
+        raise
+
     save_missevan_store(MISSEVAN_INFO_PATH, store)
     save_json(MISSEVAN_ARCHIVED_INFO_PATH, archive)
     if update_counts:
@@ -1331,6 +1358,7 @@ def refresh_missevan(
         "unknown_catalogs": sorted(unknown_catalogs),
         "missing_catalog": missing_catalog,
         "archived": archived,
+        "failed": failed,
         "last_backoff_seconds": requester.last_backoff_seconds,
         "request_count": requester.request_count,
         "rejected": rejected,
@@ -1632,6 +1660,7 @@ def main() -> int:
     print("猫耳 seasons refreshed:", missevan_stats["processed"])
     print("猫耳 seasons skipped:", missevan_stats["skipped"])
     print("猫耳 seasons archived:", missevan_stats["archived"])
+    print("猫耳 seasons failed:", missevan_stats.get("failed", 0))
     print("猫耳 missing catalog:", missevan_stats["missing_catalog"])
     print("猫耳 unknown catalogs:", missevan_stats["unknown_catalogs"])
     print("猫耳 requests:", missevan_stats["request_count"])

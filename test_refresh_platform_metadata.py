@@ -5,6 +5,90 @@ import refresh_platform_metadata
 import platform_sync
 
 
+class Missevan403FallbackTests(unittest.TestCase):
+    @staticmethod
+    def http_error(status: int) -> Exception:
+        exc = ValueError(f"HTTP {status}")
+        exc.response = Mock(status_code=status)
+        return exc
+
+    def test_four_403s_keep_metadata_and_record_null_watchcount(self) -> None:
+        store = {"100": {"dramaId": 100, "title": "伪风控剧"}}
+        archive = {"version": 1, "platform": "missevan", "records": {}}
+        cache = {
+            "_meta": {},
+            "counts": {"100": {"name": "旧名称", "view_count": 123}},
+        }
+        requester = Mock()
+        requester.request_json.side_effect = [self.http_error(403) for _ in range(4)]
+        requester.request_count = 4
+        requester.last_backoff_seconds = 0
+
+        with (
+            patch.object(refresh_platform_metadata, "load_json", side_effect=[store, archive]),
+            patch.object(refresh_platform_metadata, "load_cache", return_value=cache),
+            patch.object(refresh_platform_metadata, "MissevanRequester", return_value=requester),
+            patch.object(refresh_platform_metadata, "ARCHIVE_RETRY_DELAYS", (0, 0, 0)),
+            patch.object(refresh_platform_metadata, "archive_missevan_node") as archive_node,
+            patch.object(refresh_platform_metadata, "remove_missevan_node") as remove_node,
+            patch.object(refresh_platform_metadata, "save_missevan_store"),
+            patch.object(refresh_platform_metadata, "save_json"),
+            patch.object(refresh_platform_metadata, "save_cache"),
+            patch("builtins.print"),
+        ):
+            stats = refresh_platform_metadata.refresh_missevan()
+
+        self.assertEqual(requester.request_json.call_count, 4)
+        self.assertEqual(stats["failed"], 1)
+        self.assertEqual(stats["archived"], 0)
+        self.assertIsNone(cache["counts"]["100"]["view_count"])
+        self.assertEqual(cache["counts"]["100"]["name"], "旧名称")
+        self.assertIn("100", store)
+        archive_node.assert_not_called()
+        remove_node.assert_not_called()
+
+    def test_later_drama_gets_first_request_before_prior_drama_retry(self) -> None:
+        store = {
+            "100": {"dramaId": 100, "title": "伪风控剧", "fallbackCvNames": ["主役未知"], "type": 3},
+            "101": {"dramaId": 101, "title": "正常剧", "fallbackCvNames": ["主役未知"], "type": 3},
+        }
+        archive = {"version": 1, "platform": "missevan", "records": {}}
+        cache = {
+            "_meta": {},
+            "counts": {
+                "100": {"name": "伪风控剧", "view_count": 123},
+                "101": {"name": "正常剧", "view_count": 456},
+            },
+        }
+        requester = Mock()
+        requester.request_json.side_effect = [
+            self.http_error(403),
+            {"info": {"drama": {"id": 101, "name": "正常剧", "catalog": 89, "view_count": 456}}},
+            self.http_error(403),
+            self.http_error(403),
+            self.http_error(403),
+        ]
+        requester.request_count = 5
+        requester.last_backoff_seconds = 0
+
+        with (
+            patch.object(refresh_platform_metadata, "load_json", side_effect=[store, archive]),
+            patch.object(refresh_platform_metadata, "load_cache", return_value=cache),
+            patch.object(refresh_platform_metadata, "MissevanRequester", return_value=requester),
+            patch.object(refresh_platform_metadata, "ARCHIVE_RETRY_DELAYS", (0, 0, 0)),
+            patch.object(refresh_platform_metadata, "save_missevan_store"),
+            patch.object(refresh_platform_metadata, "save_json"),
+            patch.object(refresh_platform_metadata, "save_cache"),
+            patch("builtins.print"),
+        ):
+            stats = refresh_platform_metadata.refresh_missevan()
+
+        request_ids = [call.args[0].split("drama_id=")[1] for call in requester.request_json.call_args_list]
+        self.assertEqual(request_ids, ["100", "101", "100", "100", "100"])
+        self.assertEqual(stats["processed"], 1)
+        self.assertEqual(stats["failed"], 1)
+
+
 class FirstEpisodeMonthTests(unittest.TestCase):
     def test_explicit_first_episode_beats_earlier_unnumbered_candidate(self) -> None:
         entries = [

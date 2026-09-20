@@ -18,7 +18,7 @@
 
 - 双平台主役 CV 统一映射
 - 漫播收费规则清理
-- 猫耳 403 剧目归档
+- 猫耳 403 剧目归档实现（当前因伪风控暂停自动执行）
 - SQLite/Excel 导出
 - 榜单抓取、ongoing 保活、弹幕 UID 统计
 - 小红书风格榜单图与明细图渲染
@@ -239,8 +239,11 @@ flowchart LR
 - 源库动态字段通过 Upstash CAS 合并发布，避免覆盖并发更新的其他 metadata
 - 猫耳命中 418 时会先保存并发布已完成剧目的当前进度，再以退出码 `2` 退出
 - 猫耳 HTTP 403、漫播 HTTP 200 响应体中的 `code=400` 且 `msg=作品已下架` 使用 30/60/120 秒延迟重试，共最多 4 次请求
-- 重试使用延迟队列，等待期间继续抓取其他作品；连续 4 次命中后才生成归档候选
-- info、latest、history 与 archive key 通过单次 Upstash CAS/Lua 原子迁移；旧日期快照不重写
+- 重试使用延迟队列，等待期间继续抓取其他作品
+- 猫耳连续 4 次 HTTP 403 时不生成归档候选：活跃 info 保持不变，latest 的 `view_count` 写为 `null`，history 不追加当日点
+- CV 榜将显式 `view_count: null` 按 0 汇总并保留作品项；完全缺失 watchcount 条目的剧目仍不参与
+- 猫耳归档实现保留在 `ARCHIVE_ENABLED["missevan"]` 开关之后，当前为关闭；漫播明确下架信号仍会生成归档候选
+- 启用归档时，info、latest、history 与 archive key 通过单次 Upstash CAS/Lua 原子迁移；旧日期快照不重写
 - watchcount 发布会同时从 latest 与 history 排除全部 archive ID，避免本地缓存残留令已归档剧目复活
 
 注意：

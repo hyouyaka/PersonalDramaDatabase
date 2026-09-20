@@ -42,6 +42,14 @@ ARCHIVE_SIGNALS = {
         "payloadMessage": "作品已下架",
     },
 }
+# Missevan currently returns HTTP 403 for some anti-abuse challenges that do
+# not mean the drama was removed. Keep the archive implementation available,
+# but do not move Missevan records automatically until that signal is reliable
+# again. Manbo's explicit response-body signal remains enabled.
+ARCHIVE_ENABLED = {
+    "missevan": False,
+    "manbo": True,
+}
 ARCHIVE_RETRY_DELAYS = (30.0, 60.0, 120.0)
 ARCHIVE_PUBLISH_MAX_ATTEMPTS = 3
 

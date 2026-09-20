@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import time
 
 from archive_manager import (
+    ARCHIVE_ENABLED,
     ARCHIVE_RETRY_DELAYS,
     ARCHIVE_SIGNALS,
     apply_local_archive_candidates,
@@ -324,16 +325,18 @@ def run_archive_retry_queue(
     request_one,
     on_success,
     on_archive,
+    retry_delays: tuple[float, ...] | None = None,
     monotonic=time.monotonic,
     sleep=time.sleep,
 ) -> dict[str, int]:
     retry_heap: list[tuple[float, int, int, object]] = []
     sequence = 0
     retry_requests = 0
+    effective_retry_delays = ARCHIVE_RETRY_DELAYS if retry_delays is None else retry_delays
 
     def enqueue(item: object, requests_done: int, reason: str) -> None:
         nonlocal sequence
-        delay = ARCHIVE_RETRY_DELAYS[requests_done - 1]
+        delay = effective_retry_delays[requests_done - 1]
         sequence += 1
         heapq.heappush(retry_heap, (monotonic() + delay, sequence, requests_done, item))
         print(
@@ -397,6 +400,7 @@ def refresh_missevan_watch_counts(
     processed = 0
     skipped = 0
     archived = 0
+    failed = 0
     retry_requests = 0
     pricing_skipped = 0
     create_time_checked = 0
@@ -411,6 +415,7 @@ def refresh_missevan_watch_counts(
             "processed": processed,
             "skipped": skipped,
             "archived": archived,
+            "failed": failed,
             "request_count": requester.request_count,
             "last_backoff_seconds": requester.last_backoff_seconds,
             "archive_retry_requests": retry_requests,
@@ -507,15 +512,26 @@ def refresh_missevan_watch_counts(
             save_cache(MISSEVAN_COUNTS_PATH, cache)
 
     def on_archive(drama_id: str, reason: str) -> None:
-        nonlocal archived
-        archive_candidates[drama_id] = {
-            "archivedAt": utc_now(),
-            "archivedReason": reason,
-        }
-        archived += 1
+        nonlocal archived, failed
         contexts = drama_contexts.get(drama_id, [])
         title = normalize(contexts[0][2].get("title")) if contexts else ""
-        print(f"[猫耳] 4次HTTP 403后归档 ID={drama_id} title={title}")
+        if ARCHIVE_ENABLED["missevan"]:
+            archive_candidates[drama_id] = {
+                "archivedAt": utc_now(),
+                "archivedReason": reason,
+            }
+            archived += 1
+            print(f"[猫耳] 4次HTTP 403后归档 ID={drama_id} title={title}")
+            return
+
+        previous = (cache.get("counts") or {}).get(drama_id) or {}
+        cache["counts"][drama_id] = {
+            "name": normalize(previous.get("name")) or title,
+            "view_count": None,
+            "fetched_at": utc_now(),
+        }
+        failed += 1
+        print(f"[猫耳] 4次HTTP 403，统计失败并记录null ID={drama_id} title={title}")
 
     def save_progress() -> None:
         if archive_candidates:
@@ -683,6 +699,7 @@ def print_missevan_stats(stats: dict) -> None:
     print("猫耳 watch counts processed:", stats["processed"])
     print("猫耳 watch counts skipped:", stats["skipped"])
     print("猫耳 watch counts archived:", stats["archived"])
+    print("猫耳 watch counts failed:", stats.get("failed", 0))
     print("猫耳 requests:", stats["request_count"])
     print("猫耳 recent backoff seconds:", stats["last_backoff_seconds"])
     print("猫耳 pricing checked:", stats.get("pricing_checked", 0))

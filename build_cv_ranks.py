@@ -200,9 +200,16 @@ def collect_missevan_works(
         drama_id = normalize(node.get("dramaId"))
         if not drama_id:
             continue
-        view_count = safe_int_or_none((counts.get(drama_id) or {}).get("view_count"))
-        if view_count is None:
+        count_entry = counts.get(drama_id)
+        if not isinstance(count_entry, dict) or "view_count" not in count_entry:
             continue
+        raw_view_count = count_entry.get("view_count")
+        if raw_view_count is None:
+            view_count = 0
+        else:
+            view_count = safe_int_or_none(raw_view_count)
+            if view_count is None:
+                continue
         main_cvs = missevan_main_cv_names(node)
         title = normalize(node.get("seriesTitle") or node.get("title"))
         is_paid = is_paid_missevan_work(node)
@@ -250,9 +257,16 @@ def collect_manbo_works(
         drama_id = normalize(record.get("dramaId"))
         if not drama_id:
             continue
-        view_count = safe_int_or_none((counts.get(drama_id) or {}).get("view_count"))
-        if view_count is None:
+        count_entry = counts.get(drama_id)
+        if not isinstance(count_entry, dict) or "view_count" not in count_entry:
             continue
+        raw_view_count = count_entry.get("view_count")
+        if raw_view_count is None:
+            view_count = 0
+        else:
+            view_count = safe_int_or_none(raw_view_count)
+            if view_count is None:
+                continue
         main_cvs = manbo_main_cv_names(record)
         is_paid = is_paid_manbo_work(record)
         base_work = {

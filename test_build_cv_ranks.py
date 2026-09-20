@@ -77,6 +77,53 @@ class BuildCvRanksTests(unittest.TestCase):
 
         self.assertEqual(buckets["林风"]["totalViewCount"], 100)
         self.assertEqual(buckets["林风"]["works"][0]["mainCvs"], ["辰朔", "林风"])
+
+    def test_invalid_view_counts_are_skipped_but_explicit_null_is_zero(self) -> None:
+        missevan_ids, manbo_ids, name_index, avatar_index = build_cv_ranks.build_map_indexes({})
+        common = {
+            "missevan_ids": missevan_ids,
+            "manbo_ids": manbo_ids,
+            "name_index": name_index,
+            "avatar_index": avatar_index,
+        }
+        missevan_buckets: dict[str, dict] = {}
+        manbo_buckets: dict[str, dict] = {}
+
+        build_cv_ranks.collect_missevan_works(
+            missevan_buckets,
+            store={
+                "100": {"dramaId": 100, "maincvs": [11], "cvnames": {"11": "猫耳CV"}},
+                "101": {"dramaId": 101, "maincvs": [11], "cvnames": {"11": "猫耳CV"}},
+                "102": {"dramaId": 102, "maincvs": [11], "cvnames": {"11": "猫耳CV"}},
+            },
+            counts={
+                "100": {"view_count": None},
+                "101": {"view_count": ""},
+                "102": {"view_count": "not-a-count"},
+            },
+            **common,
+        )
+        build_cv_ranks.collect_manbo_works(
+            manbo_buckets,
+            store={
+                "records": [
+                    {"dramaId": "200", "mainCvIds": [22], "mainCvNames": ["漫播CV"]},
+                    {"dramaId": "201", "mainCvIds": [22], "mainCvNames": ["漫播CV"]},
+                    {"dramaId": "202", "mainCvIds": [22], "mainCvNames": ["漫播CV"]},
+                ]
+            },
+            counts={
+                "200": {"view_count": None},
+                "201": {"view_count": ""},
+                "202": {"view_count": "not-a-count"},
+            },
+            **common,
+        )
+
+        self.assertEqual([work["dramaId"] for work in missevan_buckets["猫耳CV"]["works"]], ["100"])
+        self.assertEqual(missevan_buckets["猫耳CV"]["works"][0]["viewCount"], 0)
+        self.assertEqual([work["dramaId"] for work in manbo_buckets["漫播CV"]["works"]], ["200"])
+        self.assertEqual(manbo_buckets["漫播CV"]["works"][0]["viewCount"], 0)
     def write_json(self, tmp: str, name: str, payload: dict) -> Path:
         path = Path(tmp) / name
         path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -207,9 +254,10 @@ class BuildCvRanksTests(unittest.TestCase):
             self.assertEqual(missevan_cv["cvName"], "Canonical CV")
             self.assertEqual(missevan_cv["avatar"], "https://avatar.test/canonical.jpg")
             self.assertEqual(missevan_cv["totalViewCount"], 100)
-            self.assertEqual(missevan_cv["workCount"], 1)
-            self.assertEqual([work["dramaId"] for work in missevan_cv["works"]], ["100"])
+            self.assertEqual(missevan_cv["workCount"], 2)
+            self.assertEqual([work["dramaId"] for work in missevan_cv["works"]], ["100", "101"])
             self.assertEqual(missevan_cv["works"][0]["cover"], "m-cover")
+            self.assertEqual(missevan_cv["works"][1]["viewCount"], 0)
             self.assertIs(missevan_cv["works"][0]["isPaid"], False)
             self.assertEqual(payload["paidRankings"]["missevan"], [])
 

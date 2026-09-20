@@ -268,6 +268,27 @@ class UploadJsonValidationTests(unittest.TestCase):
 
 
 class WatchcountSyncTests(unittest.TestCase):
+    def test_null_latest_does_not_create_a_false_zero_history_point(self) -> None:
+        existing = {
+            "100": {
+                "name": "剧",
+                "points": [["2026-09-13", 123]],
+            }
+        }
+        payload = {
+            "_meta": {"updated_at": "2026-09-20T04:00:00+00:00"},
+            "counts": {"100": {"name": "剧", "view_count": None}},
+        }
+
+        merged = sync_new_drama_ids.merge_watchcount_history(
+            existing,
+            payload,
+            "2026-09-20",
+            ["2026-09-13", "2026-09-20"],
+        )
+
+        self.assertEqual(merged["100"]["points"], [["2026-09-13", 123]])
+
     def write_cache(self, tmp: str, payload: dict) -> Path:
         path = Path(tmp) / "watch-counts.json"
         path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
