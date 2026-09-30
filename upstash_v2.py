@@ -413,7 +413,7 @@ def build_normal_trend_v2(payload: dict, platform: str, *, retention_dates: int 
             samples[str(date)] = {
                 "generated_at": str(raw_sample.get("generated_at") or ""),
                 "metrics": metrics,
-                "ranks": ranks,
+                "ranks": ranks if raw_sample.get("ranks") is not None else None,
             }
         if not samples:
             continue
@@ -576,7 +576,26 @@ def _merge_latest_entity_samples(
         }
         for date, sample in candidate_samples.items():
             if str(date) in incoming_dates:
-                samples[str(date)] = sample
+                date_key = str(date)
+                previous = samples.get(date_key)
+                if isinstance(previous, dict) and isinstance(sample, dict):
+                    merged_sample = {**previous, **sample}
+                    previous_metrics = previous.get("metrics") if isinstance(previous.get("metrics"), dict) else {}
+                    incoming_metrics = sample.get("metrics") if isinstance(sample.get("metrics"), dict) else {}
+                    if isinstance(previous.get("metrics"), dict) or isinstance(sample.get("metrics"), dict):
+                        merged_metrics = {**previous_metrics, **incoming_metrics}
+                        for metric, value in incoming_metrics.items():
+                            if value is None and previous_metrics.get(metric) is not None:
+                                merged_metrics[metric] = previous_metrics[metric]
+                        merged_sample["metrics"] = merged_metrics
+                    for metric in ("view_count", "position", "fetched_at"):
+                        if sample.get(metric) is None and previous.get(metric) is not None:
+                            merged_sample[metric] = previous[metric]
+                    if sample.get("ranks") is None and previous.get("ranks") is not None:
+                        merged_sample["ranks"] = previous["ranks"]
+                    samples[date_key] = merged_sample
+                else:
+                    samples[date_key] = sample
         record = {**existing, **candidate, "samples": samples}
         if samples:
             merged[field] = record

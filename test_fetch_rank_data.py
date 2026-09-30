@@ -57,6 +57,34 @@ class RankFetch418CheckpointTests(unittest.TestCase):
         self.assertEqual(repeated["first_rate_limited_at"], initial["first_rate_limited_at"])
         self.assertEqual(repeated["expires_at"], initial["expires_at"])
 
+    def test_checkpoint_preserves_per_metric_success_markers_for_resume(self) -> None:
+        store = self._store()
+        store["missevan"]["dramas"]["1"] = {
+            "view_count": 120,
+            "_metric_fetched_at": {"view_count": "2026-09-29T02:00:00+00:00"},
+        }
+        invocation = fetch_rank_data.checkpoint_invocation(("missevan",), skip_danmaku=False, force=True)
+        payload = fetch_rank_data.build_418_checkpoint(
+            store,
+            self._progress(missevan_pending=["2"]),
+            invocation,
+            resume_hours=3,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "checkpoint.json"
+            fetch_rank_data.save_418_checkpoint_atomic(path, payload)
+            resumed = fetch_rank_data.load_418_checkpoint(
+                path,
+                resume_hours=3,
+                expected_platforms=("missevan",),
+                skip_danmaku=False,
+            )
+
+        self.assertEqual(
+            resumed["store"]["missevan"]["dramas"]["1"]["_metric_fetched_at"],
+            {"view_count": "2026-09-29T02:00:00+00:00"},
+        )
+
     def test_expired_checkpoint_is_deleted(self) -> None:
         first = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
         invocation = fetch_rank_data.checkpoint_invocation(("missevan",), skip_danmaku=False, force=True)
@@ -354,6 +382,9 @@ class RankFetch418CheckpointTests(unittest.TestCase):
                 fetch_rank_data.main()
 
             upload.assert_called_once()
+            self.assertEqual(upload.call_args.args, (store, ("missevan", "manbo")))
+            self.assertFalse(upload.call_args.kwargs["include_rank_samples"])
+            self.assertFalse(upload.call_args.kwargs["include_peak_trend"])
             self.assertFalse(checkpoint_path.exists())
 
     def test_noop_null_danmaku_repair_keeps_checkpoint(self) -> None:
@@ -502,6 +533,28 @@ class RankFullStoreKeyTests(unittest.TestCase):
         self.assertEqual(command[3:5], ["ranks:latest", "ranks:meta"])
         self.assertEqual(json.loads(command[5]), store)
 
+    def test_upload_full_ranks_does_not_publish_internal_metric_fetch_markers(self) -> None:
+        store = {
+            "_meta": {"_metric_capture_started_at": "2026-09-29T00:00:00+00:00"},
+            "missevan": {
+                "ranks": {},
+                "dramas": {
+                    "1": {
+                        "name": "猫耳",
+                        "view_count": 10,
+                        "_metric_fetched_at": {"view_count": "2026-09-29T00:00:00+00:00"},
+                    }
+                },
+            }
+        }
+        with patch.object(fetch_rank_data, "publish_rank_string") as publish, patch("builtins.print"):
+            fetch_rank_data.upload_full_ranks(store)
+
+        uploaded = publish.call_args.args[1]
+        self.assertNotIn("_metric_capture_started_at", uploaded["_meta"])
+        self.assertNotIn("_metric_fetched_at", uploaded["missevan"]["dramas"]["1"])
+        self.assertIn("_metric_fetched_at", store["missevan"]["dramas"]["1"])
+
     def test_load_remote_full_ranks_reads_latest_key_only(self) -> None:
         payload = {"_meta": {"updated_at": "2026-05-08T00:33:19+00:00"}}
 
@@ -554,6 +607,32 @@ class RankFullStoreKeyTests(unittest.TestCase):
         trend.assert_called_once()
         latest.assert_called_once_with(store)
         self.assertEqual(result, store)
+
+    def test_upload_rank_outputs_can_publish_metrics_without_cached_rank_samples(self) -> None:
+        store = {
+            "missevan": {
+                "ranks": {"popular_weekly": {"items": [{"dramaId": "1"}]}, "peak": {"items": []}},
+                "dramas": {"1": {"name": "猫耳", "danmaku_uid_count": 5}},
+            },
+            "manbo": {"ranks": {}, "dramas": {}},
+        }
+        with (
+            patch.object(fetch_rank_data, "now_iso", return_value="2026-05-16T00:00:00+00:00"),
+            patch.object(fetch_rank_data, "upload_missevan_peak_trend") as peak,
+            patch.object(fetch_rank_data, "upload_rank_trend_snapshot") as trend,
+            patch.object(fetch_rank_data, "upload_full_ranks"),
+            patch("builtins.print"),
+        ):
+            fetch_rank_data.upload_rank_outputs(
+                store,
+                ("missevan",),
+                include_rank_samples=False,
+                include_peak_trend=False,
+            )
+
+        peak.assert_not_called()
+        self.assertEqual(trend.call_args.args[3]["ranks"], {})
+        self.assertFalse(trend.call_args.kwargs["rank_sample_captured"])
 
 
 class SeriesInfoStoreTests(unittest.TestCase):
@@ -633,6 +712,78 @@ class RankTrendPayloadTests(unittest.TestCase):
                 },
             },
         }
+
+    def test_daily_snapshot_nulls_cached_metrics_without_a_successful_fetch_today(self) -> None:
+        store = {
+            "missevan": {
+                "ranks": {},
+                "dramas": {
+                    "93038": {
+                        "name": "一屋暗灯",
+                        "view_count": 200,
+                        "danmaku_uid_count": 45,
+                        "reward_num": 8,
+                        "_metric_fetched_at": {
+                            "view_count": "2026-09-29T02:00:00+00:00",
+                            "danmaku_uid_count": "2026-09-28T02:00:00+00:00",
+                        },
+                    }
+                },
+            }
+        }
+        payloads = fetch_rank_data.build_rank_snapshot_payloads(
+            store,
+            platforms=("missevan",),
+            history_date="2026-09-29",
+            generated_at="2026-09-29T03:00:00+00:00",
+        )
+
+        metrics = payloads["missevan"]["metrics"]["dramas"]["93038"]
+        self.assertEqual(metrics["view_count"], 200)
+        self.assertIsNone(metrics["danmaku_uid_count"])
+        self.assertIsNone(metrics["reward_num"])
+        self.assertIsNone(metrics["subscription_num"])
+
+        trend = fetch_rank_data.build_rank_trend_payload(
+            None,
+            "missevan",
+            "2026-09-29",
+            payloads["missevan"]["metrics"],
+            payloads["missevan"]["list"],
+            generated_at="2026-09-29T03:00:00+00:00",
+        )
+        sample_metrics = trend["dramas"]["93038"]["samples"]["2026-09-29"]["metrics"]
+        self.assertEqual(sample_metrics["view_count"], 200)
+        self.assertIsNone(sample_metrics["danmaku_uid_count"])
+        self.assertIsNone(sample_metrics["reward_num"])
+
+    def test_detail_fetched_before_utc_midnight_is_valid_for_same_run_published_after_midnight(self) -> None:
+        store = {
+            "_meta": {"_metric_capture_started_at": "2026-09-29T23:00:00+00:00"},
+            "manbo": {
+                "ranks": {},
+                "dramas": {
+                    "1": {
+                        "view_count": 1409207,
+                        "pay_count": 3389,
+                        "_metric_fetched_at": {
+                            "view_count": "2026-09-29T23:52:22+00:00",
+                            "pay_count": "2026-09-28T23:52:22+00:00",
+                        },
+                    }
+                },
+            },
+        }
+
+        metrics = fetch_rank_data._build_metric_payload(
+            store,
+            "manbo",
+            "2026-09-30",
+            "2026-09-30T00:47:14+00:00",
+        )["dramas"]["1"]
+
+        self.assertEqual(metrics["view_count"], 1409207)
+        self.assertIsNone(metrics["pay_count"])
 
     def test_build_rank_trend_payload_merges_metrics_and_rank_badges(self) -> None:
         payload = fetch_rank_data.build_rank_trend_payload(
@@ -831,8 +982,119 @@ class RankTrendPayloadTests(unittest.TestCase):
         self.assertIn("2026-04-01", payload["dates"])
         self.assertNotIn(old_dates[0], payload["series"]["系列剧"]["samples"])
 
+    def test_build_peak_trend_payload_nulls_cached_rank_when_not_fetched_today(self) -> None:
+        payload = fetch_rank_data.build_missevan_peak_trend_payload(
+            {
+                "dates": ["2026-09-28"],
+                "series": {
+                    "系列剧": {
+                        "name": "系列剧",
+                        "samples": {"2026-09-28": {"view_count": 855745, "position": 1}},
+                    }
+                },
+            },
+            {
+                "missevan": {
+                    "ranks": {
+                        "peak": {
+                            "fetched_at": "2026-09-28T02:00:00+00:00",
+                            "items": [{"name": "系列剧", "view_count": 855745}],
+                        }
+                    }
+                }
+            },
+            "2026-09-29",
+            "2026-09-29T02:00:00+00:00",
+            pruned_dates=(),
+        )
+
+        self.assertEqual(payload["series"]["系列剧"]["samples"]["2026-09-29"], {
+            "view_count": None,
+            "position": None,
+            "fetched_at": None,
+        })
+
 
 class RankTrendBackfillTests(unittest.TestCase):
+    def test_peak_backfill_matches_publication_across_utc_midnight(self) -> None:
+        generated_at = "2026-09-30T00:47:00+00:00"
+        for fetched_at, expected_names in (
+            ("2026-09-29T23:20:00+00:00", {"系列剧"}),
+            ("2026-09-29T22:20:00+00:00", set()),
+            ("2026-09-30T01:00:00+00:00", set()),
+        ):
+            with self.subTest(fetched_at=fetched_at):
+                store = {
+                    "_meta": {
+                        "_metric_capture_started_at": "2026-09-29T23:00:00+00:00",
+                        "updated_at": generated_at,
+                    },
+                    "missevan": {
+                        "ranks": {"peak": {
+                            "fetched_at": fetched_at,
+                            "items": [{"name": "系列剧", "view_count": 123}],
+                        }},
+                        "dramas": {},
+                    },
+                }
+                normal = fetch_rank_data.build_missevan_peak_trend_payload(
+                    None, store, "2026-09-30", generated_at, pruned_dates=(),
+                )
+                with patch.object(fetch_rank_data, "publish_rank_string") as upload, patch("builtins.print"):
+                    fetch_rank_data.upload_full_ranks(store)
+                latest = upload.call_args.args[1]
+                self.assertNotIn("_metric_capture_started_at", latest["_meta"])
+                with (
+                    patch.object(fetch_rank_data, "_load_upstash_json", return_value=latest),
+                    patch.object(fetch_rank_data, "load_archived_drama_ids", return_value={}),
+                    patch.object(fetch_rank_data, "publish_peak_trend_v2") as publish,
+                ):
+                    history_date = fetch_rank_data.backfill_missevan_peak_trend_from_latest()
+                self.assertEqual(history_date, "2026-09-30")
+                self.assertEqual(set(normal["series"]), expected_names)
+                self.assertEqual(publish.call_args.args[0], normal)
+
+    def test_history_date_from_store_meta_uses_utc(self) -> None:
+        for timestamp, expected_date in (
+            ("2026-09-29T23:30:00+00:00", "2026-09-29"),
+            ("2026-09-30T07:30:00+08:00", "2026-09-29"),
+            ("2026-09-29T23:30:00-04:00", "2026-09-30"),
+            ("2026-09-29T23:30:00", "2026-09-29"),
+        ):
+            with self.subTest(timestamp=timestamp):
+                self.assertEqual(
+                    fetch_rank_data._history_date_from_store_meta({"_meta": {"updated_at": timestamp}}),
+                    (expected_date, timestamp),
+                )
+
+    def test_peak_backfill_keeps_capture_when_local_timestamp_is_next_day(self) -> None:
+        latest = {
+            "_meta": {"updated_at": "2026-09-30T07:30:00+08:00"},
+            "missevan": {
+                "ranks": {
+                    "peak": {
+                        "fetched_at": "2026-09-29T23:20:00+00:00",
+                        "items": [{"name": "系列剧", "view_count": 123}],
+                    }
+                },
+                "dramas": {},
+            },
+        }
+        with (
+            patch.object(fetch_rank_data, "_load_upstash_json", return_value=latest),
+            patch.object(fetch_rank_data, "load_archived_drama_ids", return_value={}),
+            patch.object(fetch_rank_data, "publish_peak_trend_v2") as publish,
+        ):
+            history_date = fetch_rank_data.backfill_missevan_peak_trend_from_latest()
+
+        self.assertEqual(history_date, "2026-09-29")
+        payload = publish.call_args.args[0]
+        self.assertEqual(payload["dates"], ["2026-09-29"])
+        self.assertEqual(
+            payload["series"]["系列剧"]["samples"]["2026-09-29"],
+            {"view_count": 123, "position": 1, "fetched_at": "2026-09-29T23:20:00+00:00"},
+        )
+
     def test_upload_rank_trend_snapshot_publishes_only_v2(self) -> None:
         with patch.object(fetch_rank_data, "publish_trend_v2_best_effort") as publish:
             payload = fetch_rank_data.upload_rank_trend_snapshot(
@@ -964,7 +1226,7 @@ class MissevanRankLimitTests(unittest.TestCase):
         self.assertEqual(selected, {"promoted"})
         self.assertEqual(skipped, 1)
 
-    def test_marker_flows_into_metrics_and_trend(self) -> None:
+    def test_not_required_marker_becomes_explicit_null_in_daily_trend(self) -> None:
         marker = fetch_rank_data.MISSEVAN_DANMAKU_NOT_REQUIRED
         store = {
             "missevan": {
@@ -984,8 +1246,10 @@ class MissevanRankLimitTests(unittest.TestCase):
             generated_at=generated_at,
         )
 
-        self.assertEqual(metrics["dramas"]["bottom"]["danmaku_uid_count"], marker)
-        self.assertEqual(trend["dramas"]["bottom"]["samples"]["2026-07-16"]["metrics"]["danmaku_uid_count"], marker)
+        self.assertIsNone(metrics["dramas"]["bottom"]["danmaku_uid_count"])
+        self.assertIsNone(trend["dramas"]["bottom"]["samples"]["2026-07-16"]["metrics"]["danmaku_uid_count"])
+        self.assertIn("view_count", trend["dramas"]["bottom"]["samples"]["2026-07-16"]["metrics"])
+        self.assertIsNone(trend["dramas"]["bottom"]["samples"]["2026-07-16"]["metrics"]["view_count"])
 
     def test_skip_danmaku_run_reapplies_marker_before_publish(self) -> None:
         marker = fetch_rank_data.MISSEVAN_DANMAKU_NOT_REQUIRED
@@ -1125,6 +1389,40 @@ class RankTrendCliTests(unittest.TestCase):
 
 
 class NullDanmakuRepairTests(unittest.TestCase):
+    def test_latest_not_required_marker_excludes_trend_null_or_missing_metric(self) -> None:
+        latest = {
+            "missevan": {
+                "ranks": {},
+                "dramas": {
+                    "bottom": {"danmaku_uid_count": fetch_rank_data.MISSEVAN_DANMAKU_NOT_REQUIRED},
+                    "eligible": {"danmaku_uid_count": 0},
+                },
+            },
+        }
+        for metrics in ({"danmaku_uid_count": None}, {}):
+            with self.subTest(metrics=metrics):
+                trend = {
+                    "dates": ["2026-09-29"],
+                    "dramas": {
+                        drama_id: {"samples": {"2026-09-29": {"metrics": metrics, "ranks": []}}}
+                        for drama_id in ("bottom", "eligible", "trend-only")
+                    },
+                }
+                with (
+                    patch.object(fetch_rank_data, "_load_upstash_json_strict", return_value=latest),
+                    patch.object(fetch_rank_data, "_load_normal_trend_v2_strict", return_value=trend),
+                ):
+                    targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers(
+                        "missevan", "2026-09-29",
+                    )
+
+                self.assertEqual(targets, {"eligible", "trend-only"})
+                self.assertEqual(sources, {"eligible": ["trend"], "trend-only": ["trend"]})
+                self.assertEqual(
+                    latest["missevan"]["dramas"]["bottom"]["danmaku_uid_count"],
+                    fetch_rank_data.MISSEVAN_DANMAKU_NOT_REQUIRED,
+                )
+
     def setUp(self) -> None:
         archive_patcher = patch.object(
             fetch_rank_data,
@@ -2364,6 +2662,180 @@ class MissevanDanmakuLoggingTests(unittest.TestCase):
 
 
 class TargetCatalogAdmissionTests(unittest.TestCase):
+    def test_missevan_retry_preserves_successful_metrics_when_sources_lack_values(self) -> None:
+        captured_at = "2026-09-29T02:00:00+00:00"
+        fields = ("view_count", "reward_num", "reward_total", "subscription_num")
+        for retry_kind in ("missing", "null", "no-episodes", "zero"):
+            with self.subTest(retry_kind=retry_kind):
+                entry = {}
+                def responses(kind):
+                    value = None if kind == "null" else (0 if kind == "zero" else 123)
+                    drama = {"name": "广播剧", "catalog": 89}
+                    reward = {}
+                    ranks = {}
+                    sound = {}
+                    if kind != "missing":
+                        drama["view_count"] = value
+                        reward["reward_num"] = value
+                        ranks["list"] = None if value is None else ([] if value == 0 else [{"coin": value}])
+                        sound["subscription_num"] = value
+                    episodes = [] if kind == "no-episodes" else [{"sound_id": "sound-1"}]
+                    return [
+                        {"info": {"drama": drama, "episodes": {"episode": episodes}}},
+                        {"info": reward}, {"info": ranks}, {"info": {"drama": sound}},
+                    ][:3 if kind == "no-episodes" else 4]
+                requester = Mock()
+                with patch.object(fetch_rank_data, "now_iso", return_value=captured_at):
+                    requester.request_json.side_effect = responses("success")
+                    fetch_rank_data._fetch_one_missevan(requester, "1", entry, skip_danmaku=True, clear_danmaku_on_skip=False)
+                    requester.request_json.side_effect = responses(retry_kind)
+                    fetch_rank_data._fetch_one_missevan(requester, "1", entry, skip_danmaku=True, clear_danmaku_on_skip=False)
+                store = {
+                    "_meta": {"_metric_capture_started_at": "2026-09-29T01:00:00+00:00"},
+                    "missevan": {"dramas": {"1": entry}},
+                }
+                metrics = fetch_rank_data._build_metric_payload(store, "missevan", "2026-09-29", "2026-09-29T03:00:00+00:00")["dramas"]["1"]
+                self.assertEqual({field: metrics[field] for field in fields}, {
+                    field: 0 if retry_kind == "zero" else 123 for field in fields
+                })
+
+    def test_manbo_retry_preserves_successful_metrics_when_sources_lack_values(self) -> None:
+        captured_at = "2026-09-29T02:00:00+00:00"
+        for vip_free in (0, 1):
+            for retry_kind in ("missing", "null", "zero"):
+                with self.subTest(vip_free=vip_free, retry_kind=retry_kind):
+                    pay_field = "memberListenCount" if vip_free else "payCount"
+                    body = {"category": 1, "title": "广播剧", "vipFree": vip_free}
+                    success = {**body, "watchCount": 123, "favoriteCount": 123, pay_field: 123,
+                               "radioDramaRankResp": {"totalDiamond": 123}}
+                    retry = dict(body)
+                    if retry_kind != "missing":
+                        value = None if retry_kind == "null" else 0
+                        retry.update({"watchCount": value, "favoriteCount": value, pay_field: value,
+                                      "radioDramaRankResp": {"totalDiamond": value}})
+                    entry = {}
+                    with (
+                        patch.object(fetch_rank_data, "request_manbo_json", side_effect=[{"data": success}, {"data": retry}]),
+                        patch.object(fetch_rank_data, "now_iso", return_value=captured_at),
+                    ):
+                        fetch_rank_data._fetch_one_manbo("1", entry)
+                        fetch_rank_data._fetch_one_manbo("1", entry)
+                    store = {
+                        "_meta": {"_metric_capture_started_at": "2026-09-29T01:00:00+00:00"},
+                        "manbo": {"dramas": {"1": entry}},
+                    }
+                    metrics = fetch_rank_data._build_metric_payload(store, "manbo", "2026-09-29", "2026-09-29T03:00:00+00:00")["dramas"]["1"]
+                    fields = ("view_count", "favorite_count", "pay_count", "diamond_value")
+                    self.assertEqual({field: metrics[field] for field in fields}, {
+                        field: 0 if retry_kind == "zero" else 123 for field in fields
+                    })
+
+    def test_failed_missevan_detail_does_not_make_cached_metrics_fresh(self) -> None:
+        class FailedRequester:
+            def request_json(self, _url: str) -> dict:
+                raise RuntimeError("detail unavailable")
+
+        store = {
+            "missevan": {
+                "ranks": {},
+                "dramas": {"1": {"name": "旧剧名", "view_count": 855745, "danmaku_uid_count": 20}},
+            }
+        }
+        with patch.object(fetch_rank_data, "save_json"), patch("builtins.print"):
+            fetch_rank_data.fetch_missevan_drama_details(
+                FailedRequester(),
+                {"1"},
+                store,
+                skip_danmaku=False,
+                danmaku_ids={"1"},
+            )
+
+        metrics = fetch_rank_data._build_metric_payload(
+            store,
+            "missevan",
+            "2026-09-29",
+            "2026-09-29T03:00:00+00:00",
+        )["dramas"]["1"]
+        self.assertIsNone(metrics["view_count"])
+        self.assertIsNone(metrics["danmaku_uid_count"])
+
+    def test_missevan_detail_marks_each_metric_only_after_its_source_succeeds(self) -> None:
+        class FakeRequester:
+            def request_json(self, url: str) -> dict:
+                if "getdrama?" in url:
+                    return {
+                        "info": {
+                            "drama": {"name": "广播剧", "catalog": 89, "view_count": 123},
+                            "episodes": {"episode": [{"sound_id": "sound-1"}]},
+                        }
+                    }
+                if "drama-reward-detail" in url:
+                    raise RuntimeError("reward endpoint unavailable")
+                if "user-reward-rank" in url:
+                    return {"info": {"list": []}}
+                if "getdramabysound" in url:
+                    return {"info": {"drama": {"subscription_num": 456}}}
+                raise AssertionError(url)
+
+        entry = {
+            "view_count": 10,
+            "danmaku_uid_count": 20,
+            "reward_num": 30,
+            "reward_total": 40,
+            "subscription_num": 50,
+        }
+        with patch.object(fetch_rank_data, "now_iso", return_value="2026-09-29T03:00:00+00:00"):
+            fetch_rank_data._fetch_one_missevan(
+                FakeRequester(),
+                "1",
+                entry,
+                skip_danmaku=True,
+                clear_danmaku_on_skip=False,
+            )
+
+        self.assertEqual(entry["view_count"], 123)
+        self.assertEqual(entry["reward_num"], 30)
+        self.assertEqual(entry["reward_total"], 0)
+        self.assertEqual(entry["subscription_num"], 456)
+        self.assertEqual(
+            set(entry["_metric_fetched_at"]),
+            {"view_count", "reward_total", "subscription_num"},
+        )
+
+    def test_manbo_detail_marks_only_metrics_returned_by_the_detail_response(self) -> None:
+        entry = {
+            "view_count": 10,
+            "favorite_count": 20,
+            "pay_count": 30,
+            "diamond_value": 40,
+        }
+        payload = {
+            "data": {
+                "category": 1,
+                "title": "广播剧",
+                "watchCount": 123,
+                "vipFree": 1,
+                "memberListenCount": 456,
+                "radioDramaRankResp": {},
+            }
+        }
+        with (
+            patch.object(fetch_rank_data, "request_manbo_json", return_value=payload),
+            patch.object(fetch_rank_data, "now_iso", return_value="2026-09-29T03:00:00+00:00"),
+        ):
+            fetch_rank_data._fetch_one_manbo("1", entry)
+
+        self.assertEqual(entry["view_count"], 123)
+        self.assertEqual(entry["pay_count"], 456)
+        self.assertEqual(set(entry["_metric_fetched_at"]), {"view_count", "pay_count"})
+
+    def test_successful_empty_missevan_danmaku_is_a_fresh_zero(self) -> None:
+        entry = {}
+        fetch_rank_data._fetch_missevan_danmaku(None, [], entry)
+
+        self.assertEqual(entry["danmaku_uid_count"], 0)
+        self.assertIn("danmaku_uid_count", entry["_metric_fetched_at"])
+
     def test_manbo_detail_rejects_empty_title(self) -> None:
         with patch.object(fetch_rank_data, "request_manbo_json", return_value={"data": {"category": 1, "title": ""}}):
             with self.assertRaisesRegex(fetch_rank_data.RejectedDramaRecord, "empty title"):

@@ -66,7 +66,6 @@ RANK_FETCH_418_CHECKPOINT_VERSION = 1
 CACHE_WINDOW = timedelta(hours=12)
 RANK_TREND_RETENTION_DATES = 90
 SAVE_LOCK = threading.Lock()
-LOCAL_TIMEZONE = datetime.now().astimezone().tzinfo or timezone.utc
 
 load_env_file(HERE / ".env")
 
@@ -434,8 +433,19 @@ return payload
 
 def upload_full_ranks(store: dict) -> None:
     """Upload complete merged ranks under the latest full-rank key."""
-    payload = json.dumps(store, ensure_ascii=False)
-    publish_rank_string("ranks:latest", store, scope="normal", upstash=upstash_request)
+    public_store = json.loads(json.dumps(store, ensure_ascii=False))
+    public_meta = public_store.get("_meta") or {}
+    capture_started_at = public_meta.pop("_metric_capture_started_at", None)
+    if capture_started_at:
+        # Backfill must use the same capture window as the original publication.
+        public_meta["capture_started_at"] = capture_started_at
+    for platform in PLATFORMS:
+        dramas = (public_store.get(platform) or {}).get("dramas") or {}
+        for entry in dramas.values():
+            if isinstance(entry, dict):
+                entry.pop("_metric_fetched_at", None)
+    payload = json.dumps(public_store, ensure_ascii=False)
+    publish_rank_string("ranks:latest", public_store, scope="normal", upstash=upstash_request)
     print(f"[ok] uploaded merged ranks to Upstash ({len(payload)} bytes)")
 
 
@@ -466,6 +476,8 @@ def upload_rank_outputs(
     platforms: tuple[str, ...] | list[str],
     *,
     archived_by_platform: dict[str, set[str]] | None = None,
+    include_rank_samples: bool = True,
+    include_peak_trend: bool = True,
 ) -> dict:
     filter_archived_dramas(store, archived_by_platform=archived_by_platform)
     generated_at = now_iso()
@@ -476,7 +488,7 @@ def upload_rank_outputs(
         history_date=history_date,
         generated_at=generated_at,
     )
-    if "missevan" in platforms:
+    if include_peak_trend and "missevan" in platforms:
         upload_missevan_peak_trend(
             store,
             history_date=history_date,
@@ -484,12 +496,16 @@ def upload_rank_outputs(
         )
     for platform in platforms:
         snapshot = payloads[platform]
+        list_payload = snapshot["list"]
+        if not include_rank_samples:
+            list_payload = {**list_payload, "ranks": {}}
         upload_rank_trend_snapshot(
             platform,
             history_date,
             snapshot["metrics"],
-            snapshot["list"],
+            list_payload,
             generated_at=generated_at,
+            rank_sample_captured=include_rank_samples,
         )
     upload_full_ranks(store)
     return store
@@ -562,6 +578,23 @@ def _build_rank_list_payload(store: dict, platform: str, history_date: str, gene
     }
 
 
+def was_fetched_for_snapshot(store: dict, captured_at: object, history_date: str, generated_at: str) -> bool:
+    if not captured_at:
+        return False
+    meta = store.get("_meta") or {}
+    capture_started_at = meta.get("_metric_capture_started_at") or meta.get("capture_started_at")
+    if not capture_started_at:
+        return str(captured_at)[:10] == history_date
+    try:
+        return (
+            _parse_iso_datetime(capture_started_at)
+            <= _parse_iso_datetime(captured_at)
+            <= _parse_iso_datetime(generated_at)
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 def _build_metric_payload(store: dict, platform: str, history_date: str, generated_at: str) -> dict:
     metric_fields = (
         "name",
@@ -585,11 +618,18 @@ def _build_metric_payload(store: dict, platform: str, history_date: str, generat
     for drama_id, entry in (store.get(platform, {}).get("dramas") or {}).items():
         if not isinstance(entry, dict):
             continue
-        dramas[str(drama_id)] = {
+        metric_entry = {
             field: entry.get(field)
             for field in metric_fields
             if field in entry
         }
+        fetched_at = entry.get("_metric_fetched_at")
+        fetched_at = fetched_at if isinstance(fetched_at, dict) else {}
+        for field in TREND_METRIC_FIELDS:
+            captured_at = fetched_at.get(field)
+            captured_this_run = was_fetched_for_snapshot(store, captured_at, history_date, generated_at)
+            metric_entry[field] = entry.get(field) if captured_this_run else None
+        dramas[str(drama_id)] = metric_entry
     return {
         "version": 1,
         "date": history_date,
@@ -609,6 +649,26 @@ TREND_METRIC_FIELDS = (
     "pay_count",
     "diamond_value",
 )
+
+
+def mark_metric_fetched(entry: dict, field: str, *, fetched_at: str | None = None) -> None:
+    """Remember when this metric was actually fetched, including across 418 checkpoints."""
+    if field not in TREND_METRIC_FIELDS:
+        raise ValueError(f"Unsupported trend metric: {field}")
+    markers = entry.setdefault("_metric_fetched_at", {})
+    if not isinstance(markers, dict):
+        markers = {}
+        entry["_metric_fetched_at"] = markers
+    markers[field] = fetched_at or now_iso()
+
+
+def assign_fetched_metric(entry: dict, field: str, value: object) -> None:
+    """Keep the last successful value and marker together when a retry lacks data."""
+    if value is None:
+        entry.setdefault(field, 0)
+        return
+    entry[field] = value
+    mark_metric_fetched(entry, field)
 
 TREND_DRAMA_FIELDS = (
     "cover",
@@ -642,7 +702,7 @@ def _trend_metrics_from_entry(entry: dict) -> dict:
     return {
         field: entry.get(field)
         for field in TREND_METRIC_FIELDS
-        if field in entry and entry.get(field) is not None
+        if field in entry
     }
 
 
@@ -724,6 +784,7 @@ def build_rank_trend_payload(
     *,
     generated_at: str,
     pruned_dates: list[str] | tuple[str, ...] | set[str] = (),
+    rank_sample_captured: bool = True,
 ) -> dict:
     if platform not in PLATFORMS:
         raise ValueError(f"Unsupported platform: {platform}")
@@ -784,7 +845,7 @@ def build_rank_trend_payload(
             entry["samples"][history_date] = {
                 "generated_at": sample_generated_at,
                 "metrics": _trend_metrics_from_entry(metric_entry),
-                "ranks": rank_badges.get(drama_id_text, []),
+                "ranks": rank_badges.get(drama_id_text, []) if rank_sample_captured else None,
             }
             dramas[drama_id_text] = entry
 
@@ -820,6 +881,7 @@ def upload_rank_trend_snapshot(
     *,
     generated_at: str,
     pruned_dates: list[str] | tuple[str, ...] | set[str] = (),
+    rank_sample_captured: bool = True,
 ) -> dict:
     v2_payload = build_rank_trend_payload(
         None,
@@ -829,6 +891,7 @@ def upload_rank_trend_snapshot(
         list_payload if isinstance(list_payload, dict) else None,
         generated_at=generated_at,
         pruned_dates=pruned_dates,
+        rank_sample_captured=rank_sample_captured,
     )
     publish_trend_v2_best_effort(
         NORMAL_TREND_V2_KEYS[platform],
@@ -869,8 +932,19 @@ def build_missevan_peak_trend_payload(
         series_payload[str(name)] = copied
 
     peak_rank = (store.get("missevan", {}).get("ranks") or {}).get("peak") or {}
-    fetched_at = peak_rank.get("fetched_at") or generated_at
+    fetched_at = peak_rank.get("fetched_at")
+    peak_captured_today = was_fetched_for_snapshot(store, fetched_at, history_date, generated_at)
+    if not peak_captured_today:
+        for entry in series_payload.values():
+            samples = entry.setdefault("samples", {})
+            samples[history_date] = {
+                "view_count": None,
+                "position": None,
+                "fetched_at": None,
+            }
     for position, item in enumerate(peak_rank.get("items") or [], 1):
+        if not peak_captured_today:
+            break
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or "").strip()
@@ -933,12 +1007,10 @@ def upload_missevan_peak_trend(
 
 
 def _history_date_from_store_meta(store: dict) -> tuple[str, str]:
+    """Use UTC dates, matching daily trend publication and capture checks."""
     updated_at = str((store.get("_meta") or {}).get("updated_at") or now_iso())
     try:
-        parsed = datetime.fromisoformat(updated_at)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(LOCAL_TIMEZONE).date().isoformat(), updated_at
+        return _parse_iso_datetime(updated_at).date().isoformat(), updated_at
     except ValueError:
         return updated_at[:10], updated_at
 
@@ -1107,6 +1179,7 @@ def assign_manbo_danmaku_uid_count(entry: dict, drama_id: str, uid_count: int) -
             f"threshold={MANBO_DANMAKU_LOW_VALUE_RATIO:.0%}"
         )
     entry["danmaku_uid_count"] = uid_count
+    mark_metric_fetched(entry, "danmaku_uid_count")
 
 
 def init_ranks_store() -> dict:
@@ -1275,7 +1348,7 @@ def fetch_missevan_ranks(
             drama_ids = missevan_series.get(name) or upstash_series.get(name, [])
             peak_items.append({
                 "name": name,
-                "view_count": el.get("view_count", 0),
+                "view_count": el.get("view_count"),
                 "cover": el.get("cover", ""),
                 "cvs": cvs,
                 "dramaIds": drama_ids,
@@ -1430,14 +1503,18 @@ def _fetch_one_missevan(
 
     entry["name"] = title
     entry["cover"] = drama.get("cover", entry.get("cover", ""))
-    entry["view_count"] = drama.get("view_count", 0)
+    assign_fetched_metric(entry, "view_count", drama.get("view_count"))
 
     # Reward detail
     try:
         reward_url = f"https://www.missevan.com/reward/drama-reward-detail?drama_id={drama_id}"
         reward_data = requester.request_json(reward_url)
         reward_info = reward_data.get("info") or {}
-        entry["reward_num"] = int(reward_info.get("reward_num") or reward_info.get("data", {}).get("reward_num") or 0)
+        reward_detail = reward_info.get("data")
+        reward_num = reward_info.get("reward_num")
+        if reward_num is None and isinstance(reward_detail, dict):
+            reward_num = reward_detail.get("reward_num")
+        assign_fetched_metric(entry, "reward_num", int(reward_num) if reward_num is not None else None)
     except Exception:
         entry.setdefault("reward_num", 0)
 
@@ -1446,10 +1523,13 @@ def _fetch_one_missevan(
         rank_url = f"https://www.missevan.com/reward/user-reward-rank?period=3&drama_id={drama_id}"
         rank_data = requester.request_json(rank_url)
         rank_info = rank_data.get("info") or {}
-        rank_list = rank_info.get("list") or rank_info.get("data") or []
+        rank_list = rank_info.get("list")
+        if rank_list is None:
+            rank_list = rank_info.get("data")
         if isinstance(rank_list, dict):
-            rank_list = rank_list.get("list") or []
-        entry["reward_total"] = sum(int(item.get("coin") or 0) for item in rank_list)
+            rank_list = rank_list.get("list")
+        reward_total = sum(int(item.get("coin") or 0) for item in rank_list) if isinstance(rank_list, list) else None
+        assign_fetched_metric(entry, "reward_total", reward_total)
     except Exception:
         entry.setdefault("reward_total", 0)
 
@@ -1460,7 +1540,7 @@ def _fetch_one_missevan(
             sound_url = f"https://www.missevan.com/dramaapi/getdramabysound?sound_id={sound_ids[0]}"
             sound_data = requester.request_json(sound_url)
             sound_drama = (sound_data.get("info") or {}).get("drama") or {}
-            entry["subscription_num"] = sound_drama.get("subscription_num", 0)
+            assign_fetched_metric(entry, "subscription_num", sound_drama.get("subscription_num"))
             lastupdate = sound_drama.get("lastupdate_time")
             if lastupdate:
                 if isinstance(lastupdate, (int, float)):
@@ -1473,7 +1553,7 @@ def _fetch_one_missevan(
             entry.setdefault("subscription_num", 0)
             entry.setdefault("updated_at", None)
     else:
-        entry["subscription_num"] = 0
+        entry.setdefault("subscription_num", 0)
         entry["updated_at"] = None
 
     # Danmaku UID count
@@ -1499,6 +1579,7 @@ def _fetch_missevan_danmaku(requester: MissevanRequester, episodes: list[dict], 
 
     if not paid_sounds:
         entry["danmaku_uid_count"] = 0
+        mark_metric_fetched(entry, "danmaku_uid_count")
         print("    [danmaku] paid_sounds=0 success=0 failed=0 unique_users=0")
         return
 
@@ -1530,6 +1611,7 @@ def _fetch_missevan_danmaku(requester: MissevanRequester, episodes: list[dict], 
     if failed_sounds:
         raise DanmakuRefreshError(f"failed Missevan danmaku sounds: {', '.join(failed_sounds)}")
     entry["danmaku_uid_count"] = len(uid_set)
+    mark_metric_fetched(entry, "danmaku_uid_count")
 
 
 def _parse_missevan_dm_xml(xml_text: str, uid_set: set[str]) -> None:
@@ -1644,24 +1726,19 @@ def _fetch_one_manbo(drama_id: str, entry: dict) -> None:
 
     entry["name"] = title
     entry["cover"] = body.get("coverPic") or body.get("largePic") or body.get("cover", entry.get("cover", ""))
-    entry["view_count"] = body.get("watchCount", 0)
-    entry["favorite_count"] = body.get("favoriteCount", 0)
+    assign_fetched_metric(entry, "view_count", body.get("watchCount"))
+    assign_fetched_metric(entry, "favorite_count", body.get("favoriteCount"))
 
     # isVIP: whether the drama is a VIP (member) drama
     vip_free = int(body.get("vipFree") or 0)
     entry["isVIP"] = vip_free == 1
 
     # pay_count: use memberListenCount for member dramas, payCount otherwise
-    pay_count = body.get("payCount", 0)
-    member_listen = body.get("memberListenCount", 0)
-    if vip_free == 1:
-        entry["pay_count"] = member_listen
-    else:
-        entry["pay_count"] = pay_count
+    assign_fetched_metric(entry, "pay_count", body.get("memberListenCount" if vip_free == 1 else "payCount"))
 
     # diamond_value: from v530 radioDramaRankResp.totalDiamond
     rank_resp = body.get("radioDramaRankResp") or {}
-    entry["diamond_value"] = rank_resp.get("totalDiamond", 0)
+    assign_fetched_metric(entry, "diamond_value", rank_resp.get("totalDiamond"))
 
     # updated_at
     update_time = body.get("updateTime")
@@ -2485,6 +2562,13 @@ def collect_null_danmaku_ids_from_layers(
             elif is_empty_danmaku_value(metrics_sample.get("danmaku_uid_count")):
                 _add_repair_source(targets, sources, str(drama_id), "trend")
 
+    # Daily trend nulls do not override an explicit latest-layer terminal marker.
+    if platform == "missevan" and isinstance(latest_dramas, dict):
+        for drama_id, entry in latest_dramas.items():
+            if isinstance(entry, dict) and is_missevan_danmaku_not_required(entry.get("danmaku_uid_count")):
+                targets.discard(str(drama_id))
+                sources.pop(str(drama_id), None)
+
     if platform == "manbo":
         _drop_manbo_peak_only_targets(targets, sources, payloads, history_date)
 
@@ -2922,6 +3006,8 @@ def main() -> None:
     store["manbo"].setdefault("ranks", {})
     store["manbo"].setdefault("dramas", {})
     sanitize_rank_store(store)
+    if not resumed_from_checkpoint or not store["_meta"].get("_metric_capture_started_at"):
+        store["_meta"]["_metric_capture_started_at"] = now_iso()
     archived_by_platform = filter_archived_dramas(store)
     archived_missevan_ids = set(archived_by_platform.get("missevan") or set())
     archived_manbo_ids = set(archived_by_platform.get("manbo") or set())
@@ -2936,6 +3022,8 @@ def main() -> None:
             store,
             active_platforms,
             archived_by_platform=archived_by_platform,
+            include_rank_samples=False,
+            include_peak_trend=False,
         )
         clear_418_checkpoint_after_publish(RANK_FETCH_418_CHECKPOINT_PATH)
         print("=== Done (only-danmaku) ===")

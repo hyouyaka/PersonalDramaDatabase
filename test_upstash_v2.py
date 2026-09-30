@@ -342,6 +342,121 @@ class UpstashV2Tests(unittest.TestCase):
         metrics = fields["100"]["samples"]["2026-03-01"]["metrics"]
         self.assertEqual(metrics, {"view_count": 2, "subscription_num": 4})
 
+    def test_normal_v2_same_day_nulls_keep_previously_successful_metrics(self) -> None:
+        current_meta = {
+            "version": 2,
+            "platform": "missevan",
+            "dates": ["2026-09-29"],
+            "retentionDates": 45,
+        }
+        current_fields = {
+            "100": {
+                "version": 2,
+                "id": "100",
+                "samples": {
+                    "2026-09-29": {
+                        "generated_at": "2026-09-29T02:00:00+00:00",
+                        "metrics": {"view_count": 500, "danmaku_uid_count": 12},
+                        "ranks": [{"key": "hot", "name": "热榜", "position": 2}],
+                    }
+                },
+            }
+        }
+        candidate_meta = {
+            "version": 2,
+            "platform": "missevan",
+            "dates": ["2026-09-29"],
+            "retentionDates": 45,
+        }
+        candidate_fields = {
+            "100": {
+                "version": 2,
+                "id": "100",
+                "samples": {
+                    "2026-09-29": {
+                        "generated_at": "2026-09-29T05:00:00+00:00",
+                        "metrics": {"view_count": None, "danmaku_uid_count": None, "subscription_num": 7},
+                        "ranks": None,
+                    }
+                },
+            }
+        }
+
+        _meta, fields = upstash_v2.merge_normal_v2_authoritative(
+            current_meta,
+            current_fields,
+            candidate_meta,
+            candidate_fields,
+        )
+        sample = fields["100"]["samples"]["2026-09-29"]
+        self.assertEqual(sample["metrics"], {"view_count": 500, "danmaku_uid_count": 12, "subscription_num": 7})
+        self.assertEqual(sample["ranks"], [{"key": "hot", "name": "热榜", "position": 2}])
+
+    def test_same_day_observed_empty_rank_list_clears_prior_rank(self) -> None:
+        meta = {"version": 2, "platform": "missevan", "dates": ["2026-09-29"], "retentionDates": 45}
+        current = {"100": {"samples": {"2026-09-29": {"metrics": {"view_count": 5}, "ranks": [{"key": "hot"}]}}}}
+        incoming = {"100": {"samples": {"2026-09-29": {"metrics": {"view_count": 6}, "ranks": []}}}}
+
+        _meta, fields = upstash_v2.merge_normal_v2_authoritative(meta, current, meta, incoming)
+
+        self.assertEqual(fields["100"]["samples"]["2026-09-29"]["ranks"], [])
+
+    def test_normal_v2_distinguishes_unobserved_ranks_from_observed_empty_ranks(self) -> None:
+        payload = {
+            "dates": ["2026-09-29"],
+            "dramas": {
+                "100": {"samples": {"2026-09-29": {"metrics": {"view_count": None}, "ranks": None}}},
+                "101": {"samples": {"2026-09-29": {"metrics": {"view_count": None}, "ranks": []}}},
+            },
+        }
+
+        _meta, fields = upstash_v2.build_normal_trend_v2(payload, "missevan")
+
+        self.assertIsNone(fields["100"]["samples"]["2026-09-29"]["ranks"])
+        self.assertEqual(fields["101"]["samples"]["2026-09-29"]["ranks"], [])
+
+    def test_peak_v2_same_day_nulls_keep_previously_successful_sample(self) -> None:
+        current_meta = {"version": 2, "kind": "peak", "dates": ["2026-09-29"], "retentionDates": 45}
+        current_fields = {
+            "系列剧": {
+                "version": 2,
+                "name": "系列剧",
+                "samples": {
+                    "2026-09-29": {
+                        "view_count": 855745,
+                        "position": 1,
+                        "fetched_at": "2026-09-29T02:00:00+00:00",
+                    }
+                },
+            }
+        }
+        candidate_meta = {"version": 2, "kind": "peak", "dates": ["2026-09-29"], "retentionDates": 45}
+        candidate_fields = {
+            "系列剧": {
+                "version": 2,
+                "name": "系列剧",
+                "samples": {
+                    "2026-09-29": {"view_count": None, "position": None, "fetched_at": None}
+                },
+            }
+        }
+
+        _meta, fields = upstash_v2.merge_normal_v2_authoritative(
+            current_meta,
+            current_fields,
+            candidate_meta,
+            candidate_fields,
+        )
+
+        self.assertEqual(
+            fields["系列剧"]["samples"]["2026-09-29"],
+            {
+                "view_count": 855745,
+                "position": 1,
+                "fetched_at": "2026-09-29T02:00:00+00:00",
+            },
+        )
+
     def test_normal_v2_preserves_danmaku_not_required_marker(self) -> None:
         payload = {
             "dates": ["2026-07-16"],
