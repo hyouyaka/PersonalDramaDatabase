@@ -2704,9 +2704,8 @@ def write_repaired_danmaku_layers(
             if not isinstance(sample_metrics, dict):
                 sample_metrics = {}
                 sample["metrics"] = sample_metrics
-            for field in TREND_METRIC_FIELDS:
-                if field in source_entry and field not in sample_metrics:
-                    sample_metrics[field] = source_entry[field]
+            # This repair fetches only danmaku; cached metrics may belong to another date.
+            # Preserve other target-day metrics, including explicit nulls and missing fields.
             sample_metrics["danmaku_uid_count"] = count
 
     publish_rank_string(

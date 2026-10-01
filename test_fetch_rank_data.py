@@ -1932,6 +1932,92 @@ class NullDanmakuRepairTests(unittest.TestCase):
         trend_metrics = trend_written["dramas"]["600"]["samples"]["2026-05-28"]["metrics"]
         self.assertEqual(trend_metrics["danmaku_uid_count"], 42)
 
+    def test_repair_does_not_copy_cached_metrics_into_target_date(self) -> None:
+        history_date = "2026-10-01"
+        cached_at = "2026-07-01T12:00:00+00:00"
+        generated_at = "2026-10-01T12:00:00+00:00"
+        cached_metrics = {
+            "view_count": 855745,
+            "favorite_count": 200,
+            "subscription_num": 300,
+            "reward_num": 400,
+            "reward_total": 500,
+            "pay_count": 600,
+            "diamond_value": 700,
+        }
+        cases = {
+            "missing-drama": None,
+            "missing-sample": None,
+            "missing-metrics": {"ranks": []},
+            "invalid-metrics": {"metrics": None, "ranks": []},
+            "missing-fields": {"metrics": {"danmaku_uid_count": None}, "ranks": []},
+            "existing-values": {
+                "metrics": {
+                    "view_count": None,
+                    "favorite_count": 0,
+                    "pay_count": 123,
+                    "danmaku_uid_count": None,
+                },
+                "ranks": [{"key": "hot", "rank": 1}],
+            },
+        }
+        for platform in fetch_rank_data.PLATFORMS:
+            for case, target_sample in cases.items():
+                for count in (0, 42):
+                    with self.subTest(platform=platform, case=case, count=count):
+                        samples = {
+                            "2026-07-01": {"metrics": dict(cached_metrics), "ranks": []},
+                        }
+                        if target_sample is not None:
+                            samples[history_date] = json.loads(json.dumps(target_sample))
+                        payloads = {
+                            "latest": {
+                                "_meta": {"updated_at": cached_at},
+                                platform: {
+                                    "ranks": {},
+                                    "dramas": {"600": {
+                                        "name": "drama",
+                                        **cached_metrics,
+                                        "danmaku_uid_count": None,
+                                        "fetched_at": cached_at,
+                                    }},
+                                },
+                            },
+                            "trend": {
+                                "platform": platform,
+                                "dates": sorted(samples),
+                                "dramas": {} if case == "missing-drama" else {
+                                    "600": {"id": "600", "name": "drama", "samples": samples},
+                                },
+                            },
+                            "archived": {},
+                        }
+                        with (
+                            patch.object(fetch_rank_data, "collect_null_danmaku_ids_from_layers",
+                                         return_value=({"600"}, {"600": ["latest"]}, payloads)),
+                            patch.object(fetch_rank_data, "_repair_one_danmaku", return_value=("600", count)),
+                            patch.object(fetch_rank_data, "publish_rank_string") as publish_latest,
+                            patch.object(fetch_rank_data, "publish_normal_trend_v2") as publish_trend,
+                            patch.object(fetch_rank_data, "now_iso", return_value=generated_at),
+                            patch.object(fetch_rank_data, "upstash_request", side_effect=AssertionError("offline test")),
+                            patch("builtins.print"),
+                        ):
+                            result = fetch_rank_data.repair_null_danmaku_for_platform(platform, history_date)
+
+                        self.assertEqual(result["repaired"], {"600": count})
+                        written_samples = publish_trend.call_args.args[1]["dramas"]["600"]["samples"]
+                        written_sample = written_samples[history_date]
+                        expected_metrics = dict((target_sample or {}).get("metrics") or {})
+                        expected_metrics["danmaku_uid_count"] = count
+                        self.assertEqual(written_sample["metrics"], expected_metrics)
+                        self.assertEqual(written_sample["ranks"], (target_sample or {}).get("ranks", []))
+                        self.assertEqual(written_sample["generated_at"], generated_at)
+                        if case != "missing-drama":
+                            self.assertEqual(written_samples["2026-07-01"]["metrics"], cached_metrics)
+                        latest_entry = publish_latest.call_args.args[1][platform]["dramas"]["600"]
+                        self.assertEqual(latest_entry["danmaku_uid_count"], count)
+                        self.assertEqual({field: latest_entry[field] for field in cached_metrics}, cached_metrics)
+
     def test_repair_creates_metric_entry_when_target_only_in_trend(self) -> None:
         payloads = {
             "metrics": {"version": 1, "date": "2026-05-28", "platform": "missevan", "dramas": {}},
