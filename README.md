@@ -328,6 +328,7 @@ python export_sqlite_to_workbook.py
 - 猫耳人气周榜、人气月榜、畅销周榜、畅销月榜保存前 50 位；仅前 30 位计算弹幕 UID
 - 仅位于上述榜单第 31–50 位、未进入任一榜前 30 且不在 ongoing 的 drama，会把 `danmaku_uid_count` 写成字符串 `"无需抓取"`
 - `danmaku_uid_count` 的公开类型为非负整数或 `"无需抓取"`；补填和 `--only-danmaku` 均跳过该字符串
+- 当天没有榜单记录且当天采集到的指标全为空时，trend 不会为历史剧创建当天样本，已有历史样本会保留；有效的 `0`、已采指标或榜单记录仍会写入
 
 `--only-danmaku`：
 
@@ -335,6 +336,20 @@ python export_sqlite_to_workbook.py
 - 直接遍历当前 store 里已有的 drama metrics
 - 传 `--force` 时，直接刷新这些现有 drama 的弹幕
 - 不传 `--force` 时，只有在 `danmaku_uid_count` 为正且 `fetched_at` 仍在 12 小时缓存内时才跳过；其他情况都会刷新
+
+空弹幕修复：
+
+- `--repair-null-danmaku` 默认只修复 latest 或当天 trend 中为空、且仍属于当前弹幕采集范围的剧目；范围按 `ranks:latest` 已保存榜单和 ongoing 记录计算，不会重新抓榜
+- 猫耳按标准榜各自的弹幕限额（前 30 位）并入 ongoing；漫播按非巅峰榜并入 ongoing。两平台都会排除归档剧，猫耳也排除标记为 `无需抓取` 的剧目；漫播仅巅峰榜剧目继续排除，除非它也在 ongoing
+- 手动维护整份 latest / trend 缓存时，显式使用 `--repair-null-danmaku --repair-all-null-danmaku`。这个选项仍保留归档、`无需抓取` 和漫播巅峰榜过滤
+- `--dry-run` 只列出目标，不抓取、不发布；必要远端数据读取失败仍会报错
+- 正常修复只要仍有目标失败，命令就以非零状态退出；已成功的剧目仍会发布，部分失败时会保留 418 checkpoint
+
+```powershell
+python fetch_rank_data.py --repair-null-danmaku --dry-run
+python fetch_rank_data.py --repair-null-danmaku
+python fetch_rank_data.py --repair-null-danmaku --repair-all-null-danmaku --dry-run
+```
 
 常用命令：
 

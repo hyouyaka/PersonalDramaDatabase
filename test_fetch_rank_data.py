@@ -408,7 +408,9 @@ class RankFetch418CheckpointTests(unittest.TestCase):
                 patch.object(fetch_rank_data, "repair_null_danmaku_mode", return_value=results),
                 patch("builtins.print"),
             ):
-                fetch_rank_data.main()
+                with self.assertRaises(SystemExit) as exc:
+                    fetch_rank_data.main()
+                self.assertEqual(exc.exception.code, 1)
 
             self.assertTrue(checkpoint_path.exists())
 
@@ -833,6 +835,59 @@ class RankTrendPayloadTests(unittest.TestCase):
         sample = payload["dramas"]["93038"]["samples"]["2026-05-16"]
         self.assertEqual(sample["ranks"], [])
         self.assertEqual(sample["metrics"]["subscription_num"], 67)
+
+    def test_build_rank_trend_payload_skips_only_unranked_all_null_new_sample(self) -> None:
+        history_date = "2026-05-16"
+        old_date = "2026-05-15"
+        current = {
+            "platform": "missevan",
+            "dates": [old_date],
+            "dramas": {
+                "blank": {
+                    "id": "blank",
+                    "name": "历史剧",
+                    "samples": {old_date: {"metrics": {"view_count": 10}, "ranks": []}},
+                },
+            },
+        }
+        metrics = {
+            "generated_at": f"{history_date}T12:00:00+00:00",
+            "dramas": {
+                "blank": {"name": "历史剧", "view_count": None, "danmaku_uid_count": None},
+                "zero": {"name": "零值剧", "danmaku_uid_count": 0},
+                "ranked": {"name": "榜单剧", "view_count": None, "danmaku_uid_count": None},
+                "only-danmaku": {"name": "弹幕剧", "danmaku_uid_count": 0},
+            },
+        }
+        list_payload = {
+            "ranks": {"new_daily": {"name": "新品日榜", "items": [{"drama_id": "ranked"}]}},
+        }
+
+        payload = fetch_rank_data.build_rank_trend_payload(
+            current,
+            "missevan",
+            history_date,
+            metrics,
+            list_payload,
+            generated_at=f"{history_date}T12:00:00+00:00",
+        )
+
+        self.assertEqual(payload["dramas"]["blank"]["samples"], current["dramas"]["blank"]["samples"])
+        self.assertNotIn(history_date, payload["dramas"]["blank"]["samples"])
+        self.assertEqual(payload["dramas"]["zero"]["samples"][history_date]["metrics"]["danmaku_uid_count"], 0)
+        self.assertEqual(payload["dramas"]["ranked"]["samples"][history_date]["ranks"][0]["key"], "new_daily")
+
+        only_danmaku = fetch_rank_data.build_rank_trend_payload(
+            None,
+            "missevan",
+            history_date,
+            {"dramas": {"only-danmaku": {"danmaku_uid_count": 0}}},
+            {"ranks": {}},
+            generated_at=f"{history_date}T12:00:00+00:00",
+            rank_sample_captured=False,
+        )
+        self.assertIsNone(only_danmaku["dramas"]["only-danmaku"]["samples"][history_date]["ranks"])
+        self.assertEqual(only_danmaku["dramas"]["only-danmaku"]["samples"][history_date]["metrics"]["danmaku_uid_count"], 0)
 
     def test_build_rank_trend_payload_prunes_old_dates_and_empty_dramas(self) -> None:
         current = {
@@ -1330,6 +1385,7 @@ class MissevanRankLimitTests(unittest.TestCase):
             targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers(
                 "missevan",
                 "2026-07-16",
+                all_null_danmaku=True,
             )
 
         self.assertEqual(targets, set())
@@ -1387,12 +1443,56 @@ class RankTrendCliTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "publish failed"):
                 fetch_rank_data.main()
 
+    def test_repair_all_option_requires_repair_mode(self) -> None:
+        with patch.object(sys, "argv", ["fetch_rank_data.py", "--repair-all-null-danmaku"]):
+            with self.assertRaises(SystemExit) as exc:
+                fetch_rank_data.main()
+        self.assertEqual(exc.exception.code, 2)
+
+    def test_partial_repair_failure_exits_nonzero_and_keeps_checkpoint(self) -> None:
+        results = {
+            "missevan": {"targets": ["ok"], "repaired": {"ok": 4}, "failed": []},
+            "manbo": {"targets": ["bad"], "repaired": {}, "failed": ["bad"]},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "checkpoint.json"
+            checkpoint_path.write_text("checkpoint", encoding="utf-8")
+            with (
+                patch.object(sys, "argv", ["fetch_rank_data.py", "--repair-null-danmaku"]),
+                patch.object(fetch_rank_data, "RANK_FETCH_418_CHECKPOINT_PATH", checkpoint_path),
+                patch.object(fetch_rank_data, "repair_null_danmaku_mode", return_value=results),
+                patch.object(fetch_rank_data, "clear_418_checkpoint_after_publish") as clear_checkpoint,
+                patch("builtins.print") as print_log,
+            ):
+                with self.assertRaises(SystemExit) as exc:
+                    fetch_rank_data.main()
+
+            self.assertEqual(exc.exception.code, 1)
+            self.assertTrue(checkpoint_path.exists())
+            clear_checkpoint.assert_not_called()
+            printed = "\n".join(str(call.args[0]) for call in print_log.call_args_list)
+            self.assertIn("[error] repair summary manbo", printed)
+            self.assertIn("one or more danmaku repairs failed", printed)
+
+    def test_dry_run_does_not_exit_nonzero_for_failed_result(self) -> None:
+        results = {"manbo": {"targets": ["bad"], "repaired": {}, "failed": ["bad"]}}
+        with (
+            patch.object(sys, "argv", ["fetch_rank_data.py", "--repair-null-danmaku", "--dry-run"]),
+            patch.object(fetch_rank_data, "repair_null_danmaku_mode", return_value=results) as repair,
+            patch.object(fetch_rank_data, "clear_418_checkpoint_after_publish") as clear_checkpoint,
+            patch("builtins.print"),
+        ):
+            fetch_rank_data.main()
+
+        self.assertTrue(repair.call_args.kwargs["dry_run"])
+        clear_checkpoint.assert_not_called()
+
 
 class NullDanmakuRepairTests(unittest.TestCase):
     def test_latest_not_required_marker_excludes_trend_null_or_missing_metric(self) -> None:
         latest = {
             "missevan": {
-                "ranks": {},
+                "ranks": {"popular_weekly": {"items": ["eligible"]}},
                 "dramas": {
                     "bottom": {"danmaku_uid_count": fetch_rank_data.MISSEVAN_DANMAKU_NOT_REQUIRED},
                     "eligible": {"danmaku_uid_count": 0},
@@ -1409,7 +1509,13 @@ class NullDanmakuRepairTests(unittest.TestCase):
                     },
                 }
                 with (
-                    patch.object(fetch_rank_data, "_load_upstash_json_strict", return_value=latest),
+                    patch.object(
+                        fetch_rank_data,
+                        "_load_upstash_json_strict",
+                        side_effect=lambda key: {
+                            "ongoing:missevan": {"records": {"trend-only": {"dramaId": "trend-only"}}},
+                        }.get(key, latest),
+                    ),
                     patch.object(fetch_rank_data, "_load_normal_trend_v2_strict", return_value=trend),
                 ):
                     targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers(
@@ -1476,16 +1582,151 @@ class NullDanmakuRepairTests(unittest.TestCase):
             targets, _sources, payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers(
                 "missevan",
                 "2026-05-28",
+                all_null_danmaku=True,
             )
 
         self.assertEqual(targets, {"101"})
         self.assertNotIn("100", payloads["latest"]["missevan"]["dramas"])
 
+    def test_repair_scope_defaults_to_current_targets_and_full_scope_is_explicit(self) -> None:
+        history_date = "2026-10-02"
+        old_date = "2026-07-01"
+        rank_ids = [f"rank-{position}" for position in range(1, 32)]
+        latest_template = {
+            "_meta": {"updated_at": f"{history_date}T03:00:00+00:00"},
+            "missevan": {
+                "ranks": {"popular_weekly": {"items": rank_ids}},
+                "dramas": {
+                    "rank-1": {"name": "榜内", "danmaku_uid_count": None},
+                    "rank-31": {"name": "限额外", "danmaku_uid_count": None},
+                    "ongoing-only": {"name": "连载", "danmaku_uid_count": None},
+                    "cache-only": {"name": "历史缓存", "danmaku_uid_count": 44},
+                    "not-required": {
+                        "name": "无需抓取",
+                        "danmaku_uid_count": fetch_rank_data.MISSEVAN_DANMAKU_NOT_REQUIRED,
+                    },
+                    "archived": {"name": "已归档", "danmaku_uid_count": None},
+                },
+            },
+            "manbo": {"ranks": {}, "dramas": {}},
+        }
+        trend = {
+            "dates": [old_date, history_date],
+            "dramas": {
+                drama_id: {
+                    "samples": {
+                        history_date: {"metrics": {"danmaku_uid_count": None}, "ranks": []},
+                    }
+                }
+                for drama_id in (
+                    "rank-1", "rank-31", "ongoing-only", "cache-only", "not-required", "archived",
+                )
+            },
+        }
+        trend["dramas"]["cache-only"]["samples"][old_date] = {
+            "metrics": {"danmaku_uid_count": 44},
+            "ranks": [],
+        }
+        ongoing = {"records": {"ongoing-only": {"dramaId": "ongoing-only"}}}
+        self.archive_loader.return_value = {"missevan": {"archived"}, "manbo": set()}
+
+        def load_strict(key: str) -> object:
+            if key == "ranks:latest":
+                return json.loads(json.dumps(latest_template))
+            if key == "ongoing:missevan":
+                return ongoing
+            raise AssertionError(f"unexpected strict read: {key}")
+
+        with (
+            patch.object(fetch_rank_data, "_load_upstash_json_strict", side_effect=load_strict),
+            patch.object(fetch_rank_data, "_load_normal_trend_v2_strict", return_value=trend),
+        ):
+            current_targets, current_sources, _ = fetch_rank_data.collect_null_danmaku_ids_from_layers(
+                "missevan", history_date,
+            )
+
+        self.assertEqual(current_targets, {"rank-1", "ongoing-only"})
+        self.assertEqual(set(current_sources), current_targets)
+
+        with (
+            patch.object(fetch_rank_data, "_load_upstash_json_strict", side_effect=load_strict),
+            patch.object(fetch_rank_data, "_load_normal_trend_v2_strict", return_value=trend),
+        ):
+            all_targets, _sources, _ = fetch_rank_data.collect_null_danmaku_ids_from_layers(
+                "missevan", history_date, all_null_danmaku=True,
+            )
+
+        self.assertEqual(all_targets, {"rank-1", "rank-31", "ongoing-only", "cache-only"})
+
+    def test_default_repair_scope_fails_when_required_remote_scope_data_is_missing(self) -> None:
+        latest = {"missevan": {"ranks": {}, "dramas": {}}}
+        with (
+            patch.object(fetch_rank_data, "_load_upstash_json_strict", return_value=latest),
+            patch.object(fetch_rank_data, "_load_normal_trend_v2_strict", return_value={"dates": [], "dramas": {}}),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Required ongoing data.*ongoing:missevan"):
+                fetch_rank_data.collect_null_danmaku_ids_from_layers("missevan", "2026-10-02")
+
+        with (
+            patch.object(
+                fetch_rank_data,
+                "_load_upstash_json_strict",
+                side_effect=lambda key: latest if key == "ranks:latest" else {"records": {}},
+            ),
+            patch.object(fetch_rank_data, "_load_normal_trend_v2_strict", return_value={"dates": [], "dramas": {}}),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Required Missevan standard rank data"):
+                fetch_rank_data.collect_null_danmaku_ids_from_layers(
+                    "missevan", "2026-10-02",
+                )
+
+    def test_default_manbo_scope_uses_non_peak_ranks_and_ongoing(self) -> None:
+        history_date = "2026-10-02"
+        latest = {
+            "manbo": {
+                "ranks": {
+                    "hot": {"items": [{"dramaId": "hot"}]},
+                    "peak": {"items": [{"dramaId": "peak-only"}, {"dramaId": "peak-ongoing"}]},
+                },
+                "dramas": {
+                    "hot": {"danmaku_uid_count": None},
+                    "peak-only": {"danmaku_uid_count": None},
+                    "peak-ongoing": {"danmaku_uid_count": None},
+                    "cache-only": {"danmaku_uid_count": None},
+                },
+            },
+            "missevan": {"ranks": {}, "dramas": {}},
+        }
+        trend = {
+            "dates": [history_date],
+            "dramas": {
+                drama_id: {
+                    "samples": {history_date: {"metrics": {"danmaku_uid_count": None}, "ranks": []}}
+                }
+                for drama_id in ("hot", "peak-only", "peak-ongoing", "cache-only")
+            },
+        }
+        ongoing = {"records": {"peak-ongoing": {"dramaId": "peak-ongoing"}}}
+        with (
+            patch.object(
+                fetch_rank_data,
+                "_load_upstash_json_strict",
+                side_effect=lambda key: latest if key == "ranks:latest" else ongoing,
+            ),
+            patch.object(fetch_rank_data, "_load_normal_trend_v2_strict", return_value=trend),
+        ):
+            targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers(
+                "manbo", history_date,
+            )
+
+        self.assertEqual(targets, {"hot", "peak-ongoing"})
+        self.assertEqual(sources["peak-ongoing"], ["latest", "trend"])
+
     def test_resolve_repair_history_date_falls_back_to_latest_timestamp(self) -> None:
         latest = {"_meta": {"updated_at": "2026-05-28T23:30:00+00:00"}}
         with (
             patch.object(fetch_rank_data, "_load_normal_trend_v2_strict", return_value={"dates": []}),
-            patch.object(fetch_rank_data, "_load_upstash_json", return_value=latest) as load_latest,
+            patch.object(fetch_rank_data, "_load_upstash_json_strict", return_value=latest) as load_latest,
         ):
             result = fetch_rank_data.resolve_repair_history_date("manbo")
 
@@ -1517,7 +1758,7 @@ class NullDanmakuRepairTests(unittest.TestCase):
             patch.object(
                 fetch_rank_data,
                 "_load_upstash_json_strict",
-                side_effect=lambda key: responses[key],
+                side_effect=lambda key: responses.get(key, {"records": {}}),
             ) as load,
             patch.object(
                 fetch_rank_data,
@@ -1528,6 +1769,7 @@ class NullDanmakuRepairTests(unittest.TestCase):
             targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers(
                 "missevan",
                 "2026-05-28",
+                all_null_danmaku=True,
             )
 
         self.assertEqual(targets, {"latest-null", "trend-null"})
@@ -1627,14 +1869,14 @@ class NullDanmakuRepairTests(unittest.TestCase):
         }
 
         with (
-            patch.object(fetch_rank_data, "_load_upstash_json_strict", side_effect=lambda key: responses.get(key)),
+            patch.object(fetch_rank_data, "_load_upstash_json_strict", side_effect=lambda key: responses.get(key, {"records": {}})),
             patch.object(
                 fetch_rank_data,
                 "_load_normal_trend_v2_strict",
                 return_value=responses["ranks:trend:missevan"],
             ),
         ):
-            targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers("missevan", "2026-05-28")
+            targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers("missevan", "2026-05-28", all_null_danmaku=True)
 
         self.assertEqual(targets, {"latest-missing", "trend-null"})
         self.assertEqual(sources["latest-missing"], ["latest"])
@@ -1675,14 +1917,14 @@ class NullDanmakuRepairTests(unittest.TestCase):
         }
 
         with (
-            patch.object(fetch_rank_data, "_load_upstash_json_strict", side_effect=lambda key: responses.get(key)),
+            patch.object(fetch_rank_data, "_load_upstash_json_strict", side_effect=lambda key: responses.get(key, {"records": {}})),
             patch.object(
                 fetch_rank_data,
                 "_load_normal_trend_v2_strict",
                 return_value=responses["ranks:trend:missevan"],
             ),
         ):
-            targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers("missevan", "2026-05-28")
+            targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers("missevan", "2026-05-28", all_null_danmaku=True)
 
         self.assertEqual(targets, {"93038"})
         self.assertEqual(sources["93038"], ["trend"])
@@ -1766,6 +2008,7 @@ class NullDanmakuRepairTests(unittest.TestCase):
                     },
                 },
             },
+            "ongoing:manbo": {"records": {}},
         }
 
         with (
@@ -1777,7 +2020,9 @@ class NullDanmakuRepairTests(unittest.TestCase):
             ),
             patch.object(fetch_rank_data, "_load_upstash_json", side_effect=lambda key: responses.get(key)),
         ):
-            targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers("manbo", "2026-05-28")
+            targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers(
+                "manbo", "2026-05-28", all_null_danmaku=True,
+            )
 
         self.assertEqual(targets, {"hot-only", "peak-and-hot"})
         self.assertNotIn("peak-only", sources)
@@ -1839,7 +2084,9 @@ class NullDanmakuRepairTests(unittest.TestCase):
             ),
             patch.object(fetch_rank_data, "_load_upstash_json", side_effect=lambda key: responses.get(key)),
         ):
-            targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers("manbo", "2026-05-28")
+            targets, sources, _payloads = fetch_rank_data.collect_null_danmaku_ids_from_layers(
+                "manbo", "2026-05-28", all_null_danmaku=True,
+            )
 
         self.assertEqual(targets, {"peak-ongoing"})
         self.assertEqual(sources["peak-ongoing"], ["latest", "trend"])

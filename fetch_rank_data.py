@@ -825,11 +825,15 @@ def build_rank_trend_payload(
             or (list_payload or {}).get("generated_at")
             or generated_at
         )
-        dates.add(history_date)
         for drama_id, metric_entry in metric_dramas.items():
             if not isinstance(metric_entry, dict):
                 continue
             drama_id_text = str(drama_id)
+            metric_values = _trend_metrics_from_entry(metric_entry)
+            has_rank_record = rank_sample_captured and bool(rank_badges.get(drama_id_text))
+            has_collected_metric = any(value is not None for value in metric_values.values())
+            if not has_rank_record and not has_collected_metric:
+                continue
             entry = dramas.get(
                 drama_id_text,
                 {
@@ -844,7 +848,7 @@ def build_rank_trend_payload(
             entry.setdefault("samples", {})
             entry["samples"][history_date] = {
                 "generated_at": sample_generated_at,
-                "metrics": _trend_metrics_from_entry(metric_entry),
+                "metrics": metric_values,
                 "ranks": rank_badges.get(drama_id_text, []) if rank_sample_captured else None,
             }
             dramas[drama_id_text] = entry
@@ -1214,6 +1218,30 @@ def collect_manbo_danmaku_target_ids(store: dict) -> set[str]:
     return targets
 
 
+def split_missevan_rank_danmaku_ids(
+    ranks: object,
+    *,
+    rank_keys: set[str] | None = None,
+) -> tuple[set[str], set[str]]:
+    """Split Missevan standard-rank IDs into eligible and deferred danmaku sets."""
+    eligible: set[str] = set()
+    deferred: set[str] = set()
+    if not isinstance(ranks, dict):
+        return eligible, deferred
+
+    for rank_key, (_type, _sub_type, _name, _fetch_limit, danmaku_limit) in MISSEVAN_RANKS.items():
+        if rank_keys is not None and rank_key not in rank_keys:
+            continue
+        rank = ranks.get(rank_key)
+        items = rank.get("items") if isinstance(rank, dict) else None
+        if not isinstance(items, list):
+            continue
+        for position, item in enumerate(items, 1):
+            destination = eligible if position <= danmaku_limit else deferred
+            destination.update(_rank_item_drama_ids(item))
+    return eligible, deferred
+
+
 def extract_ongoing_ids(payload: object) -> set[str]:
     """Extract drama IDs from an ongoing payload."""
     if not isinstance(payload, dict):
@@ -1248,6 +1276,59 @@ def merge_rank_and_ongoing_ids(rank_ids, ongoing_ids) -> set[str]:
     return merged
 
 
+def _load_required_ongoing_payload(platform: str) -> dict:
+    key = ONGOING_KEYS[platform]
+    payload = _load_upstash_json_strict(key)
+    if not isinstance(payload, dict) or not isinstance(payload.get("records"), dict):
+        raise RuntimeError(f"Required ongoing data is missing or invalid: {key}")
+    return payload
+
+
+def collect_current_danmaku_scope_ids(platform: str, latest_payload: dict, ongoing_payload: dict) -> set[str]:
+    """Build the current repair scope from the rank data already stored remotely."""
+    platform_payload = latest_payload.get(platform)
+    ranks = platform_payload.get("ranks") if isinstance(platform_payload, dict) else None
+    if not isinstance(ranks, dict):
+        raise RuntimeError(f"Required rank data is missing or invalid in ranks:latest for {platform}")
+
+    if platform == "missevan":
+        rank_keys = {
+            key
+            for key in MISSEVAN_RANKS
+            if isinstance(ranks.get(key), dict) and isinstance(ranks[key].get("items"), list)
+        }
+        if not rank_keys:
+            raise RuntimeError(f"Required Missevan standard rank data is missing from ranks:latest")
+        eligible, _deferred = split_missevan_rank_danmaku_ids(ranks, rank_keys=rank_keys)
+        scope = merge_rank_and_ongoing_ids(eligible, extract_ongoing_ids(ongoing_payload))
+        dramas = platform_payload.get("dramas") or {}
+        if isinstance(dramas, dict):
+            scope.difference_update(
+                str(drama_id)
+                for drama_id, entry in dramas.items()
+                if isinstance(entry, dict)
+                and is_missevan_danmaku_not_required(entry.get("danmaku_uid_count"))
+            )
+        return scope
+
+    if platform == "manbo":
+        standard_rank_keys = {
+            key
+            for key in MANBO_RANKS
+            if key != "peak"
+            and isinstance(ranks.get(key), dict)
+            and isinstance(ranks[key].get("items"), list)
+        }
+        if not standard_rank_keys:
+            raise RuntimeError("Required Manbo standard rank data is missing from ranks:latest")
+        return merge_rank_and_ongoing_ids(
+            collect_manbo_danmaku_target_ids(latest_payload),
+            extract_ongoing_ids(ongoing_payload),
+        )
+
+    raise ValueError(f"Unsupported platform: {platform}")
+
+
 def classify_missevan_danmaku_ids(
     rank_danmaku_ids: set[str],
     deferred_danmaku_ids: set[str],
@@ -1275,6 +1356,8 @@ def fetch_missevan_ranks(
     all_ids: set[str] = set()
     danmaku_ids: set[str] = set()
     deferred_danmaku_ids: set[str] = set()
+    successful_rank_keys: set[str] = set()
+    rank_items_for_danmaku: dict[str, dict[str, list[object]]] = {}
     ranks = store["missevan"].setdefault("ranks", {})
 
     # Standard ranks
@@ -1298,10 +1381,15 @@ def fetch_missevan_ranks(
         ]
         items = [item_id for _position, item_id in ranked_items]
         ranks[key] = {"name": name, "fetched_at": now_iso(), "items": items}
+        successful_rank_keys.add(key)
+        rank_items_for_danmaku[key] = {"items": items_raw}
         all_ids.update(str(i) for i in items)
-        danmaku_ids.update(str(item_id) for position, item_id in ranked_items if position <= danmaku_limit)
-        deferred_danmaku_ids.update(str(item_id) for position, item_id in ranked_items if position > danmaku_limit)
         print(f"  [missevan] {name}: {len(items)} items")
+
+    danmaku_ids, deferred_danmaku_ids = split_missevan_rank_danmaku_ids(
+        rank_items_for_danmaku,
+        rank_keys=successful_rank_keys,
+    )
 
     # Peak rank
     print("  [missevan] fetching rank: 巅峰榜 ...")
@@ -2427,10 +2515,10 @@ def resolve_repair_history_date(platform: str) -> str:
     ] if isinstance(trend, dict) else []
     if dates:
         return max(dates)
-    latest = _load_upstash_json("ranks:latest")
+    latest = _load_upstash_json_strict("ranks:latest")
     if isinstance(latest, dict):
         return _history_date_from_store_meta(latest)[0]
-    raise RuntimeError(f"No rank trend date or ranks:latest timestamp found for {platform}.")
+    raise RuntimeError(f"No rank trend date or required ranks:latest timestamp found for {platform}.")
 
 
 def _add_repair_source(targets: set[str], sources: dict[str, list[str]], drama_id: str, source: str) -> None:
@@ -2515,12 +2603,17 @@ def _drop_manbo_peak_only_targets(
 def collect_null_danmaku_ids_from_layers(
     platform: str,
     history_date: str,
+    *,
+    all_null_danmaku: bool = False,
 ) -> tuple[set[str], dict[str, list[str]], dict[str, object]]:
     if platform not in PLATFORMS:
         raise ValueError(f"Unsupported platform: {platform}")
 
+    latest = _load_upstash_json_strict("ranks:latest")
+    if not isinstance(latest, dict):
+        raise RuntimeError("Required rank data is missing or invalid: ranks:latest")
     payloads: dict[str, object] = {
-        "latest": _load_upstash_json_strict("ranks:latest"),
+        "latest": latest,
         "trend": _load_normal_trend_v2_strict(platform),
     }
     archived_by_platform = load_archived_drama_ids()
@@ -2531,8 +2624,8 @@ def collect_null_danmaku_ids_from_layers(
             latest_payload,
             archived_by_platform=archived_by_platform,
         )
-    if platform == "manbo":
-        payloads["ongoing"] = _load_upstash_json(ONGOING_KEYS[platform])
+    if platform == "manbo" or not all_null_danmaku:
+        payloads["ongoing"] = _load_required_ongoing_payload(platform)
     targets: set[str] = set()
     sources: dict[str, list[str]] = {}
 
@@ -2562,15 +2655,37 @@ def collect_null_danmaku_ids_from_layers(
             elif is_empty_danmaku_value(metrics_sample.get("danmaku_uid_count")):
                 _add_repair_source(targets, sources, str(drama_id), "trend")
 
-    # Daily trend nulls do not override an explicit latest-layer terminal marker.
-    if platform == "missevan" and isinstance(latest_dramas, dict):
-        for drama_id, entry in latest_dramas.items():
-            if isinstance(entry, dict) and is_missevan_danmaku_not_required(entry.get("danmaku_uid_count")):
-                targets.discard(str(drama_id))
-                sources.pop(str(drama_id), None)
+    if platform == "missevan":
+        not_required_ids: set[str] = set()
+        if isinstance(latest_dramas, dict):
+            not_required_ids.update(
+                str(drama_id)
+                for drama_id, entry in latest_dramas.items()
+                if isinstance(entry, dict)
+                and is_missevan_danmaku_not_required(entry.get("danmaku_uid_count"))
+            )
+        if isinstance(trend_dramas, dict):
+            for drama_id, entry in trend_dramas.items():
+                samples = entry.get("samples") if isinstance(entry, dict) else None
+                sample = samples.get(history_date) if isinstance(samples, dict) else None
+                metrics = sample.get("metrics") if isinstance(sample, dict) else None
+                if isinstance(metrics, dict) and is_missevan_danmaku_not_required(metrics.get("danmaku_uid_count")):
+                    not_required_ids.add(str(drama_id))
+        targets.difference_update(not_required_ids)
+        for drama_id in not_required_ids:
+            sources.pop(drama_id, None)
 
     if platform == "manbo":
         _drop_manbo_peak_only_targets(targets, sources, payloads, history_date)
+
+    if not all_null_danmaku:
+        latest_payload = payloads["latest"]
+        ongoing_payload = payloads.get("ongoing")
+        assert isinstance(latest_payload, dict) and isinstance(ongoing_payload, dict)
+        current_scope = collect_current_danmaku_scope_ids(platform, latest_payload, ongoing_payload)
+        current_scope.difference_update(archived_by_platform.get(platform, set()))
+        targets.intersection_update(current_scope)
+        sources = {drama_id: sources[drama_id] for drama_id in targets}
 
     return targets, sources, payloads
 
@@ -2746,8 +2861,13 @@ def repair_null_danmaku_for_platform(
     *,
     attempts: int = DANMAKU_DRAMA_RETRY_ATTEMPTS,
     dry_run: bool = False,
+    all_null_danmaku: bool = False,
 ) -> dict[str, object]:
-    targets, sources, payloads = collect_null_danmaku_ids_from_layers(platform, history_date)
+    targets, sources, payloads = collect_null_danmaku_ids_from_layers(
+        platform,
+        history_date,
+        all_null_danmaku=all_null_danmaku,
+    )
     sorted_targets = sorted(targets)
     print(f"[repair-null-danmaku] {platform} date={history_date} targets={len(sorted_targets)}")
     for drama_id in sorted_targets:
@@ -2814,6 +2934,7 @@ def repair_null_danmaku_mode(
     platforms: tuple[str, ...] | list[str],
     attempts: int,
     dry_run: bool,
+    all_null_danmaku: bool = False,
 ) -> dict[str, dict[str, object]]:
     results: dict[str, dict[str, object]] = {}
     for platform in platforms:
@@ -2823,6 +2944,7 @@ def repair_null_danmaku_mode(
             history_date,
             attempts=attempts,
             dry_run=dry_run,
+            all_null_danmaku=all_null_danmaku,
         )
     return results
 
@@ -2918,7 +3040,12 @@ def main() -> None:
     parser.add_argument("--benchmark-page-concurrency", type=int, default=MANBO_DANMAKU_PAGE_CONCURRENCY, help="Global page concurrency for Manbo benchmark")
     parser.add_argument("--benchmark-page-size", type=int, default=MANBO_DANMAKU_PAGE_SIZE, help="Page size for Manbo benchmark")
     parser.add_argument("--backfill-missevan-peak-trend-from-latest", action="store_true", help="Backfill Missevan peak view-count trend from ranks:latest")
-    parser.add_argument("--repair-null-danmaku", action="store_true", help="Repair empty danmaku UID counts across Upstash rank layers")
+    parser.add_argument("--repair-null-danmaku", action="store_true", help="Repair empty danmaku UID counts within current rank and ongoing targets")
+    parser.add_argument(
+        "--repair-all-null-danmaku",
+        action="store_true",
+        help="Expand --repair-null-danmaku to all eligible empty entries in latest and trend data",
+    )
     parser.add_argument("--repair-attempts", type=int, default=DANMAKU_DRAMA_RETRY_ATTEMPTS, help="Retry rounds for failed danmaku repairs")
     parser.add_argument("--dry-run", action="store_true", help="List repair targets without fetching or writing")
     parser.add_argument(
@@ -2931,6 +3058,19 @@ def main() -> None:
     platform_group.add_argument("--missevan-only", action="store_true", help="Only process Missevan")
     platform_group.add_argument("--manbo-only", action="store_true", help="Only process Manbo")
     args = parser.parse_args()
+
+    if args.repair_all_null_danmaku and not args.repair_null_danmaku:
+        parser.error("--repair-all-null-danmaku requires --repair-null-danmaku")
+    if args.dry_run and not args.repair_null_danmaku:
+        parser.error("--dry-run requires --repair-null-danmaku")
+    if args.repair_null_danmaku and (
+        args.skip_danmaku
+        or args.only_danmaku
+        or args.force
+        or args.backfill_missevan_peak_trend_from_latest
+        or bool(args.benchmark_manbo_danmaku)
+    ):
+        parser.error("--repair-null-danmaku cannot be combined with another run mode")
 
     do_missevan = not args.manbo_only
     do_manbo = not args.missevan_only
@@ -2946,18 +3086,27 @@ def main() -> None:
             platforms=active_platforms,
             attempts=args.repair_attempts,
             dry_run=args.dry_run,
+            all_null_danmaku=args.repair_all_null_danmaku,
         )
+        repair_failed = False
         for platform, result in results.items():
+            platform_failed = bool(result.get("failed"))
+            repair_failed = repair_failed or platform_failed
+            summary_status = "dry-run" if args.dry_run else "error" if platform_failed else "ok"
             print(
-                f"[ok] repair summary {platform}: "
+                f"[{summary_status}] repair summary {platform}: "
                 f"targets={len(result.get('targets') or [])}, "
                 f"repaired={len(result.get('repaired') or {})}, "
                 f"failed={len(result.get('failed') or [])}"
             )
         repaired_any = any(bool(result.get("repaired")) for result in results.values())
-        if not args.dry_run and repaired_any:
+        if not args.dry_run and repaired_any and not repair_failed:
             clear_418_checkpoint_after_publish(RANK_FETCH_418_CHECKPOINT_PATH)
+        if repair_failed and not args.dry_run:
+            print("[error] one or more danmaku repairs failed; 418 checkpoint retained")
         print("=== Done (repair-null-danmaku) ===")
+        if repair_failed and not args.dry_run:
+            raise SystemExit(1)
         return
 
     if args.backfill_missevan_peak_trend_from_latest:
