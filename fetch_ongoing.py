@@ -6,7 +6,9 @@ import argparse
 import json
 import os
 import re
+from decimal import Decimal
 from datetime import date, datetime, timedelta, timezone
+from html import unescape
 from pathlib import Path
 from typing import Callable
 
@@ -646,23 +648,31 @@ def fetch_missevan_weekly_records(
     return parse_missevan_summerdrama_records(data)
 
 
+def parse_missevan_display_count(value: str) -> int:
+    text = re.sub(r"\s+", "", unescape(value)).replace(",", "")
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([万亿]?)", text)
+    if not match:
+        return 0
+    multiplier = {"": 1, "万": 10_000, "亿": 100_000_000}[match.group(2)]
+    return int(Decimal(match.group(1)) * multiplier)
+
+
 def parse_missevan_sound_entries(html: str) -> list[dict[str, object]]:
     entries: list[dict[str, object]] = []
     pattern = re.compile(
         r'href="/sound/(?P<sound_id>\d+)"'
-        r'(?P<body>.*?vw-frontsound-commentcount\s+floatleft">\s*(?P<comments>[\d,]+)\s*</div>)',
+        r'(?P<body>(?:(?!href="/sound/\d+").)*?'
+        r'vw-frontsound-commentcount\s+floatleft">(?P<comments>[^<]*)</div>)',
         re.DOTALL,
     )
     for match in pattern.finditer(html or ""):
         body = match.group("body")
-        view_match = re.search(r'vw-frontsound-viewcount\s+floatleft">\s*([\d,]+)\s*</div>', body)
-        if not view_match:
-            continue
+        view_match = re.search(r'vw-frontsound-viewcount\s+floatleft">([^<]*)</div>', body)
         entries.append(
             {
                 "soundId": match.group("sound_id"),
-                "viewCount": safe_int(view_match.group(1).replace(",", "")),
-                "commentCount": safe_int(match.group("comments").replace(",", "")),
+                "viewCount": parse_missevan_display_count(view_match.group(1)) if view_match else 0,
+                "commentCount": parse_missevan_display_count(match.group("comments")),
             }
         )
     return entries

@@ -53,6 +53,54 @@ def sound_payload(create_time):
 
 
 class MissevanDailySoundWindowTests(unittest.TestCase):
+    def test_display_counts_support_commas_and_chinese_units(self):
+        for text, expected in [("1,234", 1234), ("1.8 万", 18000),
+                               ("1.25亿", 125000000), ("1.8&nbsp;万", 18000),
+                               ("暂无", 0), ("", 0)]:
+            with self.subTest(text=text):
+                self.assertEqual(fetch_ongoing.parse_missevan_display_count(text), expected)
+
+    def test_fengyue_trailer_is_collected_and_mapped_to_drama(self):
+        html = (
+            '<a href="/sound/13721849">预告✧风月</a>'
+            '<div class="vw-frontsound-viewcount floatleft">1.8 万</div>'
+            '<div class="vw-frontsound-commentcount floatleft">2,272</div>'
+        )
+        requester = FakeRequester({"info": {"drama": {"id": 96513}}})
+        sound_ids = fetch_ongoing.collect_missevan_daily_sound_ids(
+            lambda _page: html, requester=requester, max_pages=1,
+        )
+        self.assertEqual(sound_ids, ["13721849"])
+        self.assertEqual(fetch_ongoing.fetch_missevan_daily_drama_ids(requester, sound_ids), ["96513"])
+
+    def test_each_count_can_independently_trigger_collection(self):
+        html = (
+            '<a href="/sound/1">unknown views</a>'
+            '<div class="vw-frontsound-viewcount floatleft">暂无</div>'
+            '<div class="vw-frontsound-commentcount floatleft">20</div>'
+            '<a href="/sound/2">unknown comments</a>'
+            '<div class="vw-frontsound-viewcount floatleft">100</div>'
+            '<div class="vw-frontsound-commentcount floatleft">暂无</div>'
+            '<a href="/sound/3">missing views</a>'
+            '<div class="vw-frontsound-commentcount floatleft">0.1 万</div>'
+        )
+        sound_ids = fetch_ongoing.collect_missevan_daily_sound_ids(
+            lambda _page: html, max_pages=1,
+        )
+        self.assertEqual(sound_ids, ["1", "2", "3"])
+
+    def test_incomplete_entry_does_not_borrow_counts_from_next_sound(self):
+        html = (
+            '<a href="/sound/1">incomplete</a>'
+            '<div class="vw-frontsound-viewcount floatleft">1.8 万</div>'
+            '<a href="/sound/2">complete</a>'
+            '<div class="vw-frontsound-viewcount floatleft">0</div>'
+            '<div class="vw-frontsound-commentcount floatleft">20</div>'
+        )
+        self.assertEqual(fetch_ongoing.parse_missevan_sound_entries(html), [
+            {"soundId": "2", "viewCount": 0, "commentCount": 20},
+        ])
+
     def test_timestamp_boundary_uses_beijing_date_only(self):
         inside = fetch_ongoing.missevan_timestamp_to_beijing_date(1779984000)
         outside = fetch_ongoing.missevan_timestamp_to_beijing_date(1779983999)
