@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import re
 import sqlite3
+import unicodedata
 from copy import deepcopy
 from dataclasses import dataclass
 from urllib.parse import quote
@@ -373,6 +374,11 @@ def missevan_intro_text_lines(intro: object) -> list[str]:
     return [normalize(line) for line in re.split(r"[\r\n]+", text) if normalize(line)]
 
 
+def extract_missevan_author(abstract: object) -> str:
+    """Reuse credit extraction after converting the drama's HTML abstract to text."""
+    return extract_manbo_author("\n".join(missevan_intro_text_lines(abstract)))
+
+
 def clean_missevan_intro_cv_name(value: object) -> str:
     name = normalize(value)
     if not name:
@@ -417,13 +423,16 @@ def extract_missevan_intro_cv_candidates(intro: object, *, limit: int = 2) -> li
     candidates: list[dict] = []
     in_cv_section = False
     for line in lines:
-        if MISSEVAN_INTRO_CV_SECTION_PATTERN.match(line):
+        # Normalize only heading comparisons; keep role and CV spellings intact.
+        section_line = unicodedata.normalize("NFKC", line)
+        is_cv_heading = bool(MISSEVAN_INTRO_CV_SECTION_PATTERN.match(section_line))
+        if is_cv_heading:
             in_cv_section = True
             continue
         if not in_cv_section:
             continue
         if line.startswith("参与配音") or (
-            MISSEVAN_INTRO_SECTION_PATTERN.match(line) and not MISSEVAN_INTRO_CV_SECTION_PATTERN.match(line)
+            MISSEVAN_INTRO_SECTION_PATTERN.match(section_line) and not is_cv_heading
         ):
             break
         match = MISSEVAN_INTRO_ROLE_CV_PATTERN.match(line)
@@ -936,7 +945,9 @@ def collect_missevan_episode_intro_candidates(
     return candidates
 
 
-def build_missevan_base_node(info: dict, drama_type: int | None) -> tuple[dict, list[dict]]:
+def build_missevan_base_node(
+    info: dict, drama_type: int | None, *, existing_author: object = None,
+) -> tuple[dict, list[dict]]:
     drama = info.get("drama") or {}
     drama_id = str(drama.get("id") or "").strip()
     entries = build_missevan_cv_entries(info)
@@ -954,7 +965,9 @@ def build_missevan_base_node(info: dict, drama_type: int | None) -> tuple[dict, 
         "catalog": None if drama.get("catalog") in (None, "") else int(drama["catalog"]),
         "cover": normalize(drama.get("cover")),
         "createTime": "",
-        "author": normalize(drama.get("author")),
+        "author": existing_author if normalize(existing_author) else (
+            normalize(drama.get("author")) or extract_missevan_author(drama.get("abstract"))
+        ),
         "needpay": safe_int(drama.get("pay_type")) != 0 and safe_int(drama.get("price")) > 0,
         "is_member": missevan_is_member_from_infos(info),
     }, entries
@@ -1218,7 +1231,7 @@ def refresh_missevan(
                 drama_type = resolve_missevan_type(sound_drama.get("type"))
             if not create_month:
                 create_month = pick_first_episode_month(episodes, title_key="name", time_key="create_time", milliseconds=False)
-        updated_node, base_entries = build_missevan_base_node(info, drama_type)
+        updated_node, base_entries = build_missevan_base_node(info, drama_type, existing_author=node.get("author"))
         updated_node["is_member"] = missevan_is_member_from_infos(info, sound_info)
         maincv_preview_sound_infos = preview_sound_infos if used_preview_sound else []
         preview_main_entries = merge_missevan_main_cv_entries(maincv_preview_sound_infos)
@@ -1454,7 +1467,8 @@ def build_manbo_record(record: dict, payload: dict, manbo_cv_name_map: dict[int,
         updated["mainCvNames"] = [UNKNOWN_MAIN_CV_MARKER]
         updated["mainCvRoleNames"] = []
     updated["createTime"] = pick_first_episode_month(data.get("setRespList") or [], title_key="setTitle", time_key="createTime", milliseconds=True)
-    updated["author"] = extract_manbo_author(data.get("desc"))
+    if not normalize(record.get("author")):
+        updated["author"] = extract_manbo_author(data.get("desc"))
     drama_id = str(updated.get("dramaId") or record.get("dramaId") or "").strip()
     pricing_category = classify_manbo_pricing(payload or {})
     updated["needpay"] = drama_id in MANBO_PRICING_EXCLUSIONS or pricing_category not in {"free", "100_redbean"}

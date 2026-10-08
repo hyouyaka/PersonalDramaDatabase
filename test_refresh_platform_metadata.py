@@ -149,6 +149,32 @@ class FirstEpisodeMonthTests(unittest.TestCase):
 
 
 class ManboAuthorTests(unittest.TestCase):
+    def test_existing_author_is_preserved_without_extracting_description(self) -> None:
+        for author in ("手写作者", "  手写作者  "):
+            for desc in ("其他作者原著", "没有作者署名"):
+                with self.subTest(author=author, desc=desc):
+                    record = {"dramaId": "200", "author": author}
+                    with patch.object(refresh_platform_metadata, "extract_manbo_author") as extract:
+                        updated = refresh_platform_metadata.build_manbo_record(record, {"data": {"desc": desc}})
+                    self.assertEqual(updated["author"], author)
+                    self.assertEqual(record["author"], author)
+                    extract.assert_not_called()
+
+    def test_empty_author_is_backfilled_from_description(self) -> None:
+        for record in ({"dramaId": "200"}, {"dramaId": "200", "author": ""},
+                       {"dramaId": "200", "author": None}, {"dramaId": "200", "author": " \n "}):
+            with self.subTest(record=record):
+                updated = refresh_platform_metadata.build_manbo_record(
+                    record, {"data": {"desc": "长佩文学 清明谷雨原作"}},
+                )
+                self.assertEqual(updated["author"], "清明谷雨")
+
+    def test_empty_author_without_credit_remains_empty(self) -> None:
+        updated = refresh_platform_metadata.build_manbo_record(
+            {"dramaId": "200", "author": None}, {"data": {"desc": "欢迎收听"}},
+        )
+        self.assertEqual(updated["author"], "")
+
     def test_narrative_original_work_context_does_not_override_credit_line(self) -> None:
         desc = (
             "步惊都发现这个人正是原著中的死对头魔尊秋慕白！\n"
@@ -168,6 +194,76 @@ class ManboAuthorTests(unittest.TestCase):
             refresh_platform_metadata.extract_manbo_author("鹿从今夜白原著 中文广播剧《测试》"),
             "鹿从今夜白",
         )
+
+
+class MissevanAuthorTests(unittest.TestCase):
+    def test_existing_author_has_priority_over_api_and_abstract(self) -> None:
+        for author in ("手写作者", "  手写作者  "):
+            with self.subTest(author=author):
+                with patch.object(refresh_platform_metadata, "extract_missevan_author") as extract:
+                    node, _entries = refresh_platform_metadata.build_missevan_base_node(
+                        {"drama": {"id": 96486, "author": "接口作者", "abstract": "秦三见原著"}},
+                        4, existing_author=author,
+                    )
+                self.assertEqual(node["author"], author)
+                extract.assert_not_called()
+
+    def test_empty_existing_author_uses_api_then_abstract(self) -> None:
+        for existing in (None, "", " \n "):
+            for remote, expected in (("接口作者", "接口作者"), ("", "秦三见")):
+                with self.subTest(existing=existing, remote=remote):
+                    node, _entries = refresh_platform_metadata.build_missevan_base_node(
+                        {"drama": {"id": 96486, "author": remote, "abstract": "秦三见原著"}},
+                        4, existing_author=existing,
+                    )
+                    self.assertEqual(node["author"], expected)
+
+    def test_force_refresh_preserves_stored_author(self) -> None:
+        store = {"96486": {"dramaId": 96486, "title": "恋爱法则", "type": 3,
+                           "author": "手写作者", "fallbackCvNames": ["主役未知"]}}
+        payload = {"info": {"drama": {"id": 96486, "name": "恋爱法则", "catalog": 93,
+                                      "author": "接口作者", "abstract": "秦三见原著"}}}
+        with (
+            patch.object(refresh_platform_metadata, "load_json", side_effect=[store, {}]),
+            patch.object(refresh_platform_metadata, "MissevanRequester") as requester,
+            patch.object(refresh_platform_metadata, "save_missevan_store"),
+            patch.object(refresh_platform_metadata, "save_json"),
+            patch("builtins.print"),
+        ):
+            requester.return_value.request_json.return_value = payload
+            stats = refresh_platform_metadata.refresh_missevan(force=True, update_counts=False)
+        self.assertEqual(stats["processed"], 1)
+        self.assertEqual(store["96486"]["author"], "手写作者")
+
+    def test_extracts_credits_from_html_abstract(self) -> None:
+        examples = [
+            ("<p>晋江文学城，<strong>淮上</strong>原著，广播剧。</p>", "淮上"),
+            ("<p>长佩文学 清明谷雨原作</p>", "清明谷雨"),
+            ("<p>秦三见原著，煜声工作室出品。</p>", "秦三见"),
+            ("<p>晋江文学城&nbsp;淮上原著</p>", "淮上"),
+            ("<p>故事中他正是原著中的反派。</p><p>秦三见原著。</p>", "秦三见"),
+        ]
+        for abstract, expected in examples:
+            with self.subTest(abstract=abstract):
+                self.assertEqual(refresh_platform_metadata.extract_missevan_author(abstract), expected)
+
+    def test_base_node_prefers_platform_author_and_falls_back_only_when_empty(self) -> None:
+        for author, expected in [("平台作者", "平台作者"), ("", "秦三见"),
+                                 (None, "秦三见"), ("  ", "秦三见")]:
+            with self.subTest(author=author):
+                node, _entries = refresh_platform_metadata.build_missevan_base_node(
+                    {"drama": {"id": 96486, "author": author,
+                               "abstract": "<p>秦三见原著，煜声工作室出品。</p>"}}, 4,
+                )
+                self.assertEqual(node["author"], expected)
+
+    def test_no_credit_keeps_author_empty(self) -> None:
+        for abstract in [None, "", "<p>欢迎收听。</p>", "<p>这个人正是原著中的反派。</p>"]:
+            with self.subTest(abstract=abstract):
+                node, _entries = refresh_platform_metadata.build_missevan_base_node(
+                    {"drama": {"id": 96486, "abstract": abstract}}, 4,
+                )
+                self.assertEqual(node["author"], "")
 
 
 class ManboCvFallbackTests(unittest.TestCase):
@@ -1065,7 +1161,7 @@ class MissevanIntroCvCandidateTests(unittest.TestCase):
         )
 
     def test_extracts_candidates_from_plain_cv_section_titles(self) -> None:
-        for title in ("配音组", "配音：", "CAST", "CV"):
+        for title in ("配音组", "配音：", "CAST", "CV", "✈️𝑪𝑨𝑺𝑻", "ＣＡＳＴ", "𝒄𝒂𝒔𝒕"):
             with self.subTest(title=title):
                 intro = f"""
                 <p>{title}</p>
@@ -1082,6 +1178,26 @@ class MissevanIntroCvCandidateTests(unittest.TestCase):
                         {"role_name": "角色乙", "display_name": "乙声优"},
                     ],
                 )
+
+    def test_96486_styled_cast_extracts_main_roles(self) -> None:
+        intro = (
+            "<p>✈️𝑺𝑻𝑨𝑭𝑭</p><p>统筹：胖大壮</p>"
+            "<p>✈️𝑪𝑨𝑺𝑻</p><p>沈徽明：文森</p><p>索炀：袁铭喆</p>"
+            "<p>江同彦：刘思岑</p><p>参与配音：赵哲豪</p>"
+        )
+        self.assertEqual(refresh_platform_metadata.extract_missevan_intro_cv_candidates(intro), [
+            {"role_name": "沈徽明", "display_name": "文森"},
+            {"role_name": "索炀", "display_name": "袁铭喆"},
+        ])
+
+    def test_styled_staff_heading_stops_cast_without_normalizing_names(self) -> None:
+        intro = (
+            "<p>✈️𝑪𝑨𝑺𝑻</p><p>角色Ａ：声优Ｂ</p>"
+            "<p>✈️𝑺𝑻𝑨𝑭𝑭</p><p>其他职位：制作人员</p>"
+        )
+        self.assertEqual(refresh_platform_metadata.extract_missevan_intro_cv_candidates(intro), [
+            {"role_name": "角色Ａ", "display_name": "声优Ｂ"},
+        ])
 
     def test_extracts_candidates_from_decorated_cv_section_title(self) -> None:
         intro = """
