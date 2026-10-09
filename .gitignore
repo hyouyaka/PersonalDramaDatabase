@@ -50,6 +50,9 @@ PersonalDramaDatabase_architecture.md
 /DramasByCV.sqlite
 /DramasByCV_merged.xlsx
 recovery_backups/
+# Generated local-only restore scripts and Railway audit records
+/recovery_backups/upstash-retired/
+/restore_retired_upstash.py
 /logs/
 backfill_vip_fields.py
 /backfill_cv_avatars.py

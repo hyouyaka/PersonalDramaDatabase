@@ -1,5 +1,39 @@
 # CommenTasks Scripts
 
+## 本地服务器运行与旧 Upstash 数据归档
+
+每日、每周更新由本地服务器运行 `run_daily_update.ps1` 和
+`run_weekly_cv_update.ps1`。本仓库不使用 GitHub Actions；运行记录见
+<http://192.168.0.22:8765/>。
+
+仅备份七个退役的 info v1 / 普通、CV、巅峰聚合趋势 String：
+
+```powershell
+python backup_retired_upstash.py --env-file F:/VSProjects/PersonalDramaDatabase/.env
+```
+
+需要 Python 3.10+，仅使用标准库。环境变量优先于 `.env`。
+工具只读云端，将原始 UTF-8 内容、SHA-256、字节数、TTL 和端点指纹保存到
+`recovery_backups/upstash-retired/<UTC时间戳>/`，并验证远端内容在备份期间没有变化。
+缺失 key、异常类型、损坏 JSON 或写入失败时，不会生成可恢复的完整归档。
+
+每份备份内生成独立的 `restore_retired_upstash.py`；恢复脚本、数据及核验记录
+均被 `.gitignore` 忽略，仅在本机保留。保存整个备份目录，不能只复制恢复脚本。
+进入所选备份目录后运行：
+
+```powershell
+python restore_retired_upstash.py --env-file F:/VSProjects/PersonalDramaDatabase/.env --dry-run
+python restore_retired_upstash.py --env-file F:/VSProjects/PersonalDramaDatabase/.env --apply
+```
+
+默认 dry-run，不写入云端。恢复前校验全部文件及目标端点；仅用 `SET NX` 恢复
+不存在的 key，相同内容及兼容 TTL 跳过，冲突立即停止，不覆盖现有数据。
+永久 key 保持永久；正 TTL 从备份记录的剩余秒数重新计时。
+中断后可重复运行。回退只恢复七个旧 key，不修改 v2、公共 key、归档 key 或
+`ranks:meta`，当前程序继续使用 v2。此工具不提供云端删除或程序版本回退功能。
+
+验证工具：`python -B -m unittest test_backup_retired_upstash test_upstash_v2`。
+
 这个仓库现在把数据维护拆成了 3 段：
 
 1. 更新源库和 `missevan&manbo-cvid-map.json`
