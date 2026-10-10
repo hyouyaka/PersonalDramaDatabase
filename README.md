@@ -85,6 +85,28 @@ python commen_tasks_gui.py
 - 也可以在 GUI 里手动切换 `100% / 125% / 150% / 175% / 200% / 自动`
 - SQLite 页只允许执行 `SELECT` / `WITH` 开头的只读 SQL
 
+## 更新系列信息
+
+脚本：`update_series_info.py`；GUI「批处理」区域的「更新系列」执行完整更新。
+
+```powershell
+python update_series_info.py --dry-run
+python update_series_info.py
+```
+
+读取 `.env` 中的 `UPSTASH_REDIS_REST_URL` 和 `UPSTASH_REDIS_REST_TOKEN`，环境变量优先。
+使用项目已有的 `requests` 依赖，无需新增依赖；需要 Python 3.10+。
+每次从远端下载 `drama:series-info:v1`、`manbo:info:v2`、`missevan:info:v2`。
+同平台、基础标题和类型相同且主役 CV ID 有交集时归类，允许通过 CV 连锁关联，保留日语版等版本标识。
+新建系列至少两部且包含分季、分册或番外等标记；「全一季」不能单独触发新建。
+旧成员及 info 中缺失的 ID 保留，只迁移已确认的「全职高手」「君有疾否」重复项到对应的「广播剧」系列。
+跨平台同名保留原名；同平台多个系列按类别或 CV 姓名区分，歧义或缺少 CV ID 时记录提示。
+
+`--dry-run` 只预览，无写入。默认更新使用 CAS 防止覆盖远端并发修改，上传校验后原子同步
+`drama-series-info.json`；不会覆盖本地平台 info，也不会重建 SQLite 或榜单。
+原始远端快照保存在 `recovery_backups/series-info/<UTC时间戳>/`，旧本地系列文件使用现有备份工具保存。
+无变化时不重复上传；网络、校验或保存失败返回非零退出码，若远端已更新但本地保存失败会明确提示。
+
 ## 1. 追加猫耳 ID
 
 脚本：`append_missevan_ids.py`

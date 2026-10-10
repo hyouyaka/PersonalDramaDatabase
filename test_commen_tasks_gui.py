@@ -6,6 +6,33 @@ import commen_tasks_gui
 
 
 class CommandBuilderTests(unittest.TestCase):
+    def test_update_series_command_and_status(self) -> None:
+        self.assertEqual(
+            commen_tasks_gui.build_update_series_info_command(),
+            [commen_tasks_gui.PYTHON_EXE, "update_series_info.py"],
+        )
+        page = SimpleNamespace(run_command_requested=Mock())
+        commen_tasks_gui.OperationsPage.run_update_series_info(page)
+        page.run_command_requested.emit.assert_called_once_with(
+            [commen_tasks_gui.PYTHON_EXE, "update_series_info.py"], "正在更新系列",
+        )
+
+    def test_update_series_button_runs_and_disables_while_busy(self) -> None:
+        app = commen_tasks_gui.QApplication.instance() or commen_tasks_gui.QApplication([])
+        page = commen_tasks_gui.OperationsPage()
+        calls = []
+        page.run_command_requested.connect(lambda command, status: calls.append((command, status)))
+        button = next(button for button in page.command_buttons if button.text() == "更新系列")
+        button.click()
+        self.assertEqual(calls, [([commen_tasks_gui.PYTHON_EXE, "update_series_info.py"], "正在更新系列")])
+        page.set_running(True)
+        self.assertFalse(button.isEnabled())
+        page.set_running(False)
+        self.assertTrue(button.isEnabled())
+        page.close()
+        page.deleteLater()
+        app.processEvents()
+
     def test_build_sync_remote_libraries_command_downloads_only(self) -> None:
         self.assertEqual(
             commen_tasks_gui.build_sync_remote_libraries_command(),

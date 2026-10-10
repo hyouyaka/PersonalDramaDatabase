@@ -112,6 +112,10 @@ def build_sync_remote_libraries_command() -> list[str]:
     return [PYTHON_EXE, "sync_remote_libraries.py"]
 
 
+def build_update_series_info_command() -> list[str]:
+    return [PYTHON_EXE, "update_series_info.py"]
+
+
 def make_ui_font(size: int = BASE_FONT_SIZE, *, heading: bool = False) -> QFont:
     font = QFont("Segoe UI", size)
     font.setFamilies(["Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "sans-serif"])
@@ -1678,14 +1682,17 @@ class OperationsPage(QWidget):
         clean_button = QPushButton("清理漫播收费")
         rebuild_button = QPushButton("重建 SQLite")
         sync_remote_button = QPushButton("拉取远程数据")
+        update_series_button = QPushButton("更新系列")
         self.export_checkbox = QCheckBox("重建时导出 Excel")
         self.export_checkbox.setChecked(True)
         self.command_buttons.extend([refresh_button, clean_button, rebuild_button, sync_remote_button])
+        self.command_buttons.append(update_series_button)
         batch_layout.addWidget(refresh_button, 0, 0)
         batch_layout.addWidget(clean_button, 0, 1)
         batch_layout.addWidget(self.export_checkbox, 1, 0)
         batch_layout.addWidget(rebuild_button, 1, 1)
         batch_layout.addWidget(sync_remote_button, 2, 0, 1, 2)
+        batch_layout.addWidget(update_series_button, 3, 0, 1, 2)
         left_layout.addWidget(batch_box)
 
         render_box = QGroupBox("出图")
@@ -1750,6 +1757,7 @@ class OperationsPage(QWidget):
         clean_button.clicked.connect(self.run_clean_manbo)
         rebuild_button.clicked.connect(self.run_rebuild)
         sync_remote_button.clicked.connect(self.run_sync_remote_libraries)
+        update_series_button.clicked.connect(self.run_update_series_info)
         fetch_rank_button.clicked.connect(self.run_fetch_rank_data)
         only_danmaku_button.clicked.connect(self.run_only_danmaku)
         weekly_growth_button.clicked.connect(self.run_weekly_growth_ranks)
@@ -1814,6 +1822,9 @@ class OperationsPage(QWidget):
         if QMessageBox.question(self, "确认拉取远程数据", message) != QMessageBox.Yes:
             return
         self.run_command_requested.emit(build_sync_remote_libraries_command(), "正在拉取远程数据")
+
+    def run_update_series_info(self) -> None:
+        self.run_command_requested.emit(build_update_series_info_command(), "正在更新系列")
 
     def _rank_platform_args(self) -> list[str]:
         index = self.rank_platform_box.currentIndex()
