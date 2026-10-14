@@ -167,6 +167,20 @@ class MissevanDailySoundWindowTests(unittest.TestCase):
 
 
 class MissevanOngoingPayTypeTests(unittest.TestCase):
+    def test_daily_sound_mapping_skips_free_dramas_and_deduplicates_paid_dramas(self):
+        requester = FakeSequenceRequester({
+            "1": {"info": {"drama": {"id": 100, "pay_type": 0}}},
+            "2": {"info": {"drama": {"id": 101, "pay_type": "0"}}},
+            "3": {"info": {"drama": {"id": 102, "pay_type": 1}}},
+            "4": {"info": {"drama": {"id": 103, "pay_type": "2"}}},
+            "5": {"info": {"drama": {"id": 102, "pay_type": 1}}},
+        })
+
+        self.assertEqual(
+            fetch_ongoing.fetch_missevan_daily_drama_ids(requester, ["1", "2", "3", "4", "5"]),
+            ["102", "103"],
+        )
+
     def test_timeline_keeps_pay_type_1_and_2_only_skips_0(self):
         payload = {
             "info": [

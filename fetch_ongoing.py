@@ -749,6 +749,8 @@ def fetch_missevan_daily_drama_ids(
         data = requester.request_json(MISSEVAN_SOUND_DRAMA_URL.format(sound_id=sound_id))
         info = data.get("info") or {}
         drama = info.get("drama") if isinstance(info, dict) else {}
+        if safe_int((drama or {}).get("pay_type"), -1) == 0:
+            continue
         drama_id = (drama or {}).get("id")
         if drama_id in (None, ""):
             continue
