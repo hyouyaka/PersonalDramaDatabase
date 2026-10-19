@@ -99,6 +99,26 @@ redis.call('SET', KEYS[3], ARGV[3])
 return 1
 """
 
+# Repair publication must commit latest, the selected trend and their resource
+# metadata together, using the exact snapshots read before the merge.
+REPAIR_RANK_ACTIVATE_SCRIPT = """
+local current_meta = redis.call('HGET', KEYS[2], '__meta__')
+if ARGV[1] == '__missing__' then
+  if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
+elseif not current_meta or current_meta ~= ARGV[1] then return 0 end
+local rank_meta = redis.call('GET', KEYS[3])
+if ARGV[2] == '__missing__' then
+  if rank_meta and rank_meta ~= false then return 0 end
+elseif not rank_meta or redis.sha1hex(rank_meta) ~= ARGV[2] then return 0 end
+local latest = redis.call('GET', KEYS[4])
+if not latest or redis.sha1hex(latest) ~= ARGV[4] then return 0 end
+redis.call('RENAME', KEYS[1], KEYS[2])
+redis.call('PERSIST', KEYS[2])
+redis.call('SET', KEYS[3], ARGV[3])
+redis.call('SET', KEYS[4], ARGV[5])
+return 1
+"""
+
 RANK_STRING_PUBLISH_SCRIPT = """
 local rank_meta = redis.call('GET', KEYS[2])
 if ARGV[3] == '__missing__' then
@@ -735,9 +755,18 @@ def publish_hash_snapshot_atomic(
     upstash: Callable[[list[object]], object],
     expected_meta_raw: str | None,
     chunk_size: int = HASH_WRITE_CHUNK_SIZE,
+    latest_update: tuple[dict, str] | None = None,
 ) -> None:
     if any(str(field) == "__meta__" for field in fields):
         raise ValueError(f"Reserved hash field __meta__ cannot be published to {stable_key}")
+    latest_encoded = None
+    if latest_update is not None:
+        if stable_key not in NORMAL_TREND_V2_KEYS.values() or not isinstance(latest_update[1], str):
+            raise ValueError("Repair publication requires a normal trend and an existing latest snapshot")
+        latest_encoded = json.dumps(latest_update[0], ensure_ascii=False)
+        latest_digest = hashlib.sha1(latest_encoded.encode("utf-8")).hexdigest()
+        latest_bytes = len(latest_encoded.encode("utf-8"))
+        latest_updated_at = str(latest_update[0]["_meta"]["updated_at"])
     staging_key = f"{stable_key}:staging:{uuid.uuid4().hex}"
     meta, raw_fields = decorate_hash_meta(meta, fields)
     encoded_fields = [("__meta__", compact_json(meta)), *sorted(raw_fields.items())]
@@ -780,19 +809,26 @@ def publish_hash_snapshot_atomic(
                 byte_count=byte_count,
                 updated_at=str(meta.get("updated_at") or datetime.now(timezone.utc).isoformat()),
             )
-            result = upstash(
-                [
-                    "EVAL",
-                    HASH_ACTIVATE_WITH_META_SCRIPT,
-                    3,
-                    staging_key,
-                    stable_key,
-                    RANK_META_KEY,
+            if latest_update is not None:
+                rank_meta = build_rank_meta_update(
+                    rank_meta, scope="normal", key="ranks:latest", data_type="string",
+                    content_sha1=latest_digest, byte_count=latest_bytes, updated_at=latest_updated_at,
+                )
+                command = [
+                    "EVAL", REPAIR_RANK_ACTIVATE_SCRIPT, 4,
+                    staging_key, stable_key, RANK_META_KEY, "ranks:latest",
                     expected_meta_raw if expected_meta_raw is not None else "__missing__",
-                    string_cas_token(current_rank_meta),
-                    compact_json(rank_meta),
+                    string_cas_token(current_rank_meta), compact_json(rank_meta),
+                    string_cas_token(latest_update[1]), latest_encoded,
                 ]
-            )
+            else:
+                command = [
+                    "EVAL", HASH_ACTIVATE_WITH_META_SCRIPT, 3,
+                    staging_key, stable_key, RANK_META_KEY,
+                    expected_meta_raw if expected_meta_raw is not None else "__missing__",
+                    string_cas_token(current_rank_meta), compact_json(rank_meta),
+                ]
+            result = upstash(command)
             if int(result or 0) == 1:
                 break
         else:
@@ -818,6 +854,13 @@ def publish_hash_snapshot_atomic(
             byte_count=byte_count,
             updated_at=str(meta.get("updated_at") or ""),
         )
+        if latest_update is not None:
+            if upstash(["GET", "ranks:latest"]) != latest_encoded:
+                raise RuntimeError("Remote payload verification failed for ranks:latest")
+            _verify_rank_resource(
+                upstash(["GET", RANK_META_KEY]), scope="normal", key="ranks:latest",
+                digest=latest_digest, byte_count=latest_bytes, updated_at=latest_updated_at,
+            )
     except Exception:
         try:
             upstash(["EXPIRE", staging_key, STAGING_TTL_SECONDS])
@@ -825,6 +868,29 @@ def publish_hash_snapshot_atomic(
             pass
         raise
     print(f"[ok] published {stable_key} ({len(fields)} entities)")
+
+
+def publish_repaired_rank_snapshot(
+    platform: str,
+    latest_payload: dict,
+    trend_payload: dict,
+    *,
+    source_latest_raw: str,
+    upstash: Callable[[list[object]], object],
+) -> None:
+    """Atomically publish a freshly merged repair, rejecting concurrent data changes."""
+    meta = {
+        **trend_payload.get("_source_meta", {}),
+        "version": 2,
+        "platform": platform,
+        "updated_at": trend_payload["updated_at"],
+        "dates": trend_payload["dates"],
+    }
+    publish_hash_snapshot_atomic(
+        NORMAL_TREND_V2_KEYS[platform], meta, trend_payload["dramas"],
+        upstash=upstash, expected_meta_raw=trend_payload["_source_meta_raw"],
+        latest_update=(latest_payload, source_latest_raw),
+    )
 
 
 def publish_normal_trend_v2(platform: str, payload: dict, *, upstash: Callable[[list[object]], object], force: bool = False) -> None:

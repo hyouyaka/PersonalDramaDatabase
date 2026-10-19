@@ -36,6 +36,7 @@ from upstash_v2 import (
     publish_normal_trend_v2,
     publish_peak_trend_v2,
     publish_rank_string,
+    publish_repaired_rank_snapshot,
     publish_trend_v2_best_effort,
 )
 
@@ -250,6 +251,8 @@ MANBO_WEB_API_BASE_URLS = (
     "https://manbo.kilaaudio.com",
     "https://www.kilamanbo.com",
 )
+# Keep the retired host documented, but never request it during normal fetching.
+MANBO_ACTIVE_WEB_API_BASE_URL = MANBO_WEB_API_BASE_URLS[0]
 MANBO_SET_LIST_FIELDS = (
     "setRespList",
     "radioDramaSetRespList",
@@ -306,20 +309,14 @@ def validate_manbo_web_response(path: str, data: object) -> dict:
 
 
 def request_manbo_web_json(path: str, *, request_json) -> dict:
-    """Request a Manbo Web API path, preferring the current host with legacy fallback."""
-    errors: list[tuple[str, Exception]] = []
+    """Request the current Manbo Web API host without the retired fallback."""
     normalized_path = "/" + path.lstrip("/")
-    for index, base_url in enumerate(MANBO_WEB_API_BASE_URLS):
-        url = f"{base_url}{normalized_path}"
-        try:
-            data = request_json(url)
-            return validate_manbo_web_response(normalized_path, data)
-        except Exception as exc:
-            errors.append((url, exc))
-            if index + 1 < len(MANBO_WEB_API_BASE_URLS):
-                print(f"    [manbo] WARN: Web API unavailable at {base_url}; trying fallback")
-    attempts = "; ".join(f"{url}: {exc}" for url, exc in errors)
-    raise RuntimeError(f"Manbo Web API failed on all configured hosts: {attempts}") from errors[-1][1]
+    url = f"{MANBO_ACTIVE_WEB_API_BASE_URL}{normalized_path}"
+    try:
+        data = request_json(url)
+        return validate_manbo_web_response(normalized_path, data)
+    except Exception as exc:
+        raise RuntimeError(f"Manbo Web API failed: {url}: {exc}") from exc
 
 # ---------------------------------------------------------------------------
 # Upstash helpers (adapted from sync_new_drama_ids.py)
@@ -1727,6 +1724,7 @@ def fetch_manbo_drama_details(
     total = len(drama_ids)
     save_counter = 0
     failed_danmaku_ids: set[str] = set()
+    danmaku_progress: dict[str, dict] = {}
     rejected_ids: set[str] = set()
     for idx, drama_id in enumerate(sorted(drama_ids), 1):
         print(f"  [manbo] ({idx}/{total}) drama {drama_id} ...")
@@ -1755,7 +1753,9 @@ def fetch_manbo_drama_details(
             entry["danmaku_uid_count"] = None
         elif danmaku_ids is None or drama_id in danmaku_ids:
             try:
-                _, uid_count = fetch_one_manbo_danmaku_count(drama_id)
+                _, uid_count = fetch_one_manbo_danmaku_count(
+                    drama_id, progress=danmaku_progress.setdefault(str(drama_id), {})
+                )
                 assign_manbo_danmaku_uid_count(entry, drama_id, uid_count)
             except Exception as exc:
                 print(f"  [manbo] DANMAKU ERROR on {drama_id}: {exc}")
@@ -1773,7 +1773,9 @@ def fetch_manbo_drama_details(
 
     def retry_one_danmaku(drama_id: str) -> None:
         entry = dramas.get(str(drama_id), {})
-        _, uid_count = fetch_one_manbo_danmaku_count(str(drama_id))
+        _, uid_count = fetch_one_manbo_danmaku_count(
+            str(drama_id), progress=danmaku_progress.setdefault(str(drama_id), {})
+        )
         assign_manbo_danmaku_uid_count(entry, str(drama_id), uid_count)
         entry["fetched_at"] = now_iso()
         entry.pop("danmaku_paid_episode_count", None)
@@ -1984,16 +1986,29 @@ def fetch_manbo_paid_danmaku_benchmark(
     retry_delay: float = 0.5,
     short_page_retries: int = MANBO_DANMAKU_SHORT_PAGE_RETRIES,
     short_page_retry_delay: float = MANBO_DANMAKU_SHORT_PAGE_RETRY_DELAY,
+    progress: dict | None = None,
 ) -> dict:
-    """Fetch all paid Manbo danmaku pages through one bounded queue and globally dedupe eids."""
+    """Fetch missing/incomplete pages, retaining complete pages in caller-owned progress."""
     started = time.perf_counter()
-    paid_set_ids = paid_set_id_loader(drama_id, request_json=request_json)
-    users: set[str] = set()
+    state = progress if progress is not None else {}
+    identity = (str(drama_id), page_size)
+    if state and state.get("identity") != identity:
+        raise ValueError("Manbo danmaku progress belongs to another drama or page size")
+    if not state:
+        paid_set_ids = paid_set_id_loader(drama_id, request_json=request_json)
+        state.update(
+            identity=identity,
+            paid_set_ids=paid_set_ids,
+            users=set(),
+            complete_pages={},
+            partial_pages={},
+            totals={},
+        )
+    paid_set_ids = state["paid_set_ids"]
+    complete_pages = state["complete_pages"]
+    partial_pages = state["partial_pages"]
+    total_danmaku_by_set = state["totals"]
     failed_pages: list[dict[str, object]] = []
-    total_pages_by_set: dict[str, int] = {}
-    fetched_pages_by_set: dict[str, int] = {}
-    total_danmaku_by_set: dict[str, int] = {}
-    fetched_danmaku_by_set: dict[str, int] = {}
 
     def fetch_and_extract(
         set_id: str,
@@ -2015,78 +2030,77 @@ def fetch_manbo_paid_danmaku_benchmark(
         expected_entries = expected_manbo_danmaku_page_entries(expected_count, page_no, page_size)
         return set_id, page_no, total_count, total_pages, page_users, entry_count, expected_entries
 
-    workers = max(1, min(page_concurrency, len(paid_set_ids) or 1))
-    first_page_results: list[tuple[str, int, int, int, set[str], int, int]] = []
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_page = {
-            executor.submit(fetch_and_extract, set_id, 1): (set_id, 1)
-            for set_id in paid_set_ids
-        }
-        for future in as_completed(future_to_page):
-            set_id, page_no = future_to_page[future]
-            try:
-                result = future.result()
-            except Exception as exc:
-                failed_pages.append({"set_id": set_id, "page_no": page_no, "error": str(exc)})
-                continue
-            first_page_results.append(result)
-            _, _, total_count, total_pages, page_users, entry_count, expected_entries = result
-            total_danmaku_by_set[set_id] = total_count
-            total_pages_by_set[set_id] = total_pages
-            fetched_pages_by_set[set_id] = fetched_pages_by_set.get(set_id, 0) + 1
-            fetched_danmaku_by_set[set_id] = fetched_danmaku_by_set.get(set_id, 0) + entry_count
-            users.update(page_users)
-            if entry_count < expected_entries:
-                failed_pages.append({
-                    "set_id": set_id,
-                    "page_no": page_no,
-                    "expected_entries": expected_entries,
-                    "actual_entries": entry_count,
-                    "error": (
-                        "incomplete Manbo danmaku page: "
-                        f"page={page_no}, entries={entry_count}/{expected_entries}"
-                    ),
-                })
+    def fetch_pages(pages: list[tuple[str, int]]) -> None:
+        workers = max(1, min(page_concurrency, len(pages) or 1))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_page = {
+                executor.submit(fetch_and_extract, set_id, page_no, total_danmaku_by_set.get(set_id)): (set_id, page_no)
+                for set_id, page_no in pages
+            }
+            for future in as_completed(future_to_page):
+                set_id, page_no = future_to_page[future]
+                key = (set_id, page_no)
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    failed_pages.append({"set_id": set_id, "page_no": page_no, "error": str(exc)})
+                    continue
+                _, _, total_count, _, page_users, entry_count, expected_entries = result
+                # Freeze each set's first observed count across retries, even if
+                # later responses report a lower count alongside a short page.
+                total_danmaku_by_set.setdefault(set_id, total_count)
+                if entry_count < expected_entries:
+                    partial_pages[key] = (page_users, entry_count)
+                    failed_pages.append({
+                        "set_id": set_id,
+                        "page_no": page_no,
+                        "expected_entries": expected_entries,
+                        "actual_entries": entry_count,
+                        "error": (
+                            "incomplete Manbo danmaku page: "
+                            f"page={page_no}, entries={entry_count}/{expected_entries}"
+                        ),
+                    })
+                else:
+                    complete_pages[key] = entry_count
+                    state["users"].update(page_users)
+                    partial_pages.pop(key, None)
+
+    fetch_pages([(set_id, 1) for set_id in paid_set_ids if (set_id, 1) not in complete_pages])
+    total_pages_by_set = {
+        set_id: max(1, (total_count + page_size - 1) // page_size)
+        for set_id, total_count in total_danmaku_by_set.items()
+    }
 
     remaining_pages = [
         (set_id, page_no)
         for set_id, total_pages in total_pages_by_set.items()
         for page_no in range(2, total_pages + 1)
+        if (set_id, page_no) not in complete_pages
     ]
-    workers = max(1, min(page_concurrency, len(remaining_pages) or 1))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_page = {
-            executor.submit(fetch_and_extract, set_id, page_no, total_danmaku_by_set.get(set_id)): (set_id, page_no)
-            for set_id, page_no in remaining_pages
-        }
-        for future in as_completed(future_to_page):
-            set_id, page_no = future_to_page[future]
-            try:
-                result = future.result()
-            except Exception as exc:
-                failed_pages.append({"set_id": set_id, "page_no": page_no, "error": str(exc)})
-                continue
-            _, _, _, _, page_users, entry_count, expected_entries = result
-            fetched_pages_by_set[set_id] = fetched_pages_by_set.get(set_id, 0) + 1
-            fetched_danmaku_by_set[set_id] = fetched_danmaku_by_set.get(set_id, 0) + entry_count
-            users.update(page_users)
-            if entry_count < expected_entries:
-                failed_pages.append({
-                    "set_id": set_id,
-                    "page_no": page_no,
-                    "expected_entries": expected_entries,
-                    "actual_entries": entry_count,
-                    "error": (
-                        "incomplete Manbo danmaku page: "
-                        f"page={page_no}, entries={entry_count}/{expected_entries}"
-                    ),
-                })
+    fetch_pages(remaining_pages)
+
+    # Summaries include the latest partial response for diagnostics. Only full
+    # pages are retained as successful; a replacement never double counts UIDs.
+    users = state["users"].copy()
+    page_counts = dict(complete_pages)
+    for key, (page_users, entry_count) in partial_pages.items():
+        users.update(page_users)
+        page_counts[key] = entry_count
+    fetched_pages_by_set: dict[str, int] = {}
+    fetched_danmaku_by_set: dict[str, int] = {}
+    for (set_id, _), entry_count in page_counts.items():
+        fetched_pages_by_set[set_id] = fetched_pages_by_set.get(set_id, 0) + 1
+        fetched_danmaku_by_set[set_id] = fetched_danmaku_by_set.get(set_id, 0) + entry_count
 
     for set_id, total_pages in total_pages_by_set.items():
         fetched_pages = fetched_pages_by_set.get(set_id, 0)
         expected_count = total_danmaku_by_set.get(set_id, 0)
         fetched_count = fetched_danmaku_by_set.get(set_id, 0)
-        if fetched_pages < total_pages:
+        if fetched_pages < total_pages or (
+            fetched_count < expected_count
+            and not any(page["set_id"] == set_id for page in failed_pages)
+        ):
             failed_pages.append({
                 "set_id": set_id,
                 "page_no": None,
@@ -2119,12 +2133,14 @@ def fetch_one_manbo_danmaku_count(
     drama_id: str,
     *,
     request_json=request_manbo_json,
+    progress: dict | None = None,
 ) -> tuple[str, int]:
     """Return (drama_id, paid_danmaku_uid_count) for one Manbo drama."""
     result = fetch_manbo_paid_danmaku_benchmark(
         drama_id,
         request_json=request_json,
         page_concurrency=MANBO_DANMAKU_PAGE_CONCURRENCY,
+        progress=progress,
     )
     print(
         f"    [danmaku] manbo drama {drama_id}: paid_sets={result.get('paid_set_count', 0)} "
@@ -2135,6 +2151,8 @@ def fetch_one_manbo_danmaku_count(
     failed_pages = result.get("failed_pages") or []
     if failed_pages:
         raise RuntimeError(f"failed Manbo danmaku pages for {drama_id}: {failed_pages!r}")
+    if progress is not None:
+        progress.clear()
     return (
         drama_id,
         int(result.get("unique_user_count") or 0),
@@ -2161,10 +2179,13 @@ def fetch_manbo_danmaku_details(
 
     save_counter = 0
     failed_danmaku_ids: set[str] = set()
+    danmaku_progress: dict[str, dict] = {str(drama_id): {} for drama_id in targets}
     workers = max(1, min(MANBO_DANMAKU_DRAMA_CONCURRENCY, len(targets)))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_drama = {
-            executor.submit(fetch_one_manbo_danmaku_count, drama_id): drama_id
+            executor.submit(
+                fetch_one_manbo_danmaku_count, drama_id, progress=danmaku_progress[str(drama_id)]
+            ): drama_id
             for drama_id in sorted(targets)
         }
         completed = 0
@@ -2194,7 +2215,9 @@ def fetch_manbo_danmaku_details(
 
     def retry_one_danmaku(drama_id: str) -> None:
         entry = manbo_dramas.get(str(drama_id), {})
-        _, uid_count = fetch_one_manbo_danmaku_count(str(drama_id))
+        _, uid_count = fetch_one_manbo_danmaku_count(
+            str(drama_id), progress=danmaku_progress[str(drama_id)]
+        )
         assign_manbo_danmaku_uid_count(entry, str(drama_id), uid_count)
         entry["fetched_at"] = now_iso()
         entry.pop("danmaku_paid_episode_count", None)
@@ -2435,6 +2458,7 @@ def _load_normal_trend_v2_strict(platform: str) -> dict:
         raise RuntimeError(f"Failed to load {key}: expected an HGETALL array")
     fields: dict[str, object] = {}
     meta: dict = {}
+    source_meta_raw: str | None = None
     for index in range(0, len(raw), 2):
         field = str(raw[index])
         value = raw[index + 1]
@@ -2444,6 +2468,7 @@ def _load_normal_trend_v2_strict(platform: str) -> dict:
         if field == "__meta__":
             if isinstance(parsed, dict):
                 meta = parsed
+                source_meta_raw = value
         else:
             fields[field] = parsed
     dates: set[str] = set()
@@ -2457,6 +2482,8 @@ def _load_normal_trend_v2_strict(platform: str) -> dict:
         "updated_at": meta.get("updated_at"),
         "dates": sorted(dates),
         "dramas": fields,
+        "_source_meta": meta,
+        "_source_meta_raw": source_meta_raw,
     }
 
 
@@ -2732,20 +2759,19 @@ def _source_metric_entry(payloads: dict[str, object], platform: str, history_dat
     return merged
 
 
-def _ensure_repair_latest_payload(payload: object, generated_at: str) -> dict:
+def _ensure_repair_latest_payload(payload: object, generated_at: str, platform: str) -> dict:
     result = payload if isinstance(payload, dict) else {}
     result.setdefault("_meta", {})
     if isinstance(result["_meta"], dict):
         result["_meta"]["updated_at"] = generated_at
-    for platform in PLATFORMS:
-        platform_payload = result.get(platform)
-        if not isinstance(platform_payload, dict):
-            platform_payload = {}
-            result[platform] = platform_payload
-        platform_payload.setdefault("ranks", {})
-        platform_payload.setdefault("dramas", {})
-        if not isinstance(platform_payload["dramas"], dict):
-            platform_payload["dramas"] = {}
+    platform_payload = result.get(platform)
+    if not isinstance(platform_payload, dict):
+        platform_payload = {}
+        result[platform] = platform_payload
+    platform_payload.setdefault("ranks", {})
+    platform_payload.setdefault("dramas", {})
+    if not isinstance(platform_payload["dramas"], dict):
+        platform_payload["dramas"] = {}
     return result
 
 
@@ -2763,6 +2789,38 @@ def _ensure_repair_trend_payload(payload: object, platform: str, history_date: s
     return result
 
 
+def _load_repair_publish_sources(platform: str) -> tuple[str, dict, dict]:
+    """Read fresh publication bases after fetching, retaining their CAS versions."""
+    raw = upstash_request(["GET", "ranks:latest"])
+    if not isinstance(raw, str):
+        raise RuntimeError("Required ranks:latest snapshot is missing or invalid")
+    latest = json.loads(raw)
+    if not isinstance(latest, dict):
+        raise RuntimeError("Required ranks:latest snapshot is not an object")
+    return raw, latest, _load_normal_trend_v2_strict(platform)
+
+
+def _repair_danmaku_slot_writable(current: dict, original: dict | None, *, trend: bool = False) -> bool:
+    """Allow a fresh count unless another task has already supplied a newer value."""
+    current_metrics = current.get("metrics") if trend else current
+    original_metrics = original.get("metrics") if trend and isinstance(original, dict) else original
+    current_metrics = current_metrics if isinstance(current_metrics, dict) else {}
+    original_metrics = original_metrics if isinstance(original_metrics, dict) else {}
+    value = current_metrics.get("danmaku_uid_count")
+    if is_missevan_danmaku_not_required(value):
+        return False
+    if is_empty_danmaku_value(value):
+        return True
+    timestamp = "generated_at" if trend else "fetched_at"
+    return (
+        isinstance(original, dict)
+        and value == original_metrics.get("danmaku_uid_count")
+        and current.get(timestamp) == original.get(timestamp)
+        and (current.get("_metric_fetched_at") or {}).get("danmaku_uid_count")
+        == (original.get("_metric_fetched_at") or {}).get("danmaku_uid_count")
+    )
+
+
 def write_repaired_danmaku_layers(
     platform: str,
     history_date: str,
@@ -2771,17 +2829,16 @@ def write_repaired_danmaku_layers(
 ) -> None:
     if not repaired_counts:
         return
+    if platform not in PLATFORMS:
+        raise ValueError(f"Unsupported platform: {platform}")
 
     generated_at = now_iso()
-    latest_payload = _ensure_repair_latest_payload(loaded_payloads.get("latest"), generated_at)
-    raw_archived = loaded_payloads.get("archived")
-    archived_by_platform = raw_archived if isinstance(raw_archived, dict) else load_archived_drama_ids()
-    filter_archived_dramas(
-        latest_payload,
-        archived_by_platform=archived_by_platform,
-    )
+    source_latest_raw, current_latest, current_trend = _load_repair_publish_sources(platform)
+    latest_payload = _ensure_repair_latest_payload(current_latest, generated_at, platform)
+    # Skip newly archived IDs, without filtering or rewriting either platform's ranks.
+    archived_ids = load_archived_drama_ids().get(platform, set())
     trend_payload = _ensure_repair_trend_payload(
-        loaded_payloads.get("trend"),
+        current_trend,
         platform,
         history_date,
         generated_at,
@@ -2789,22 +2846,33 @@ def write_repaired_danmaku_layers(
 
     latest_dramas = latest_payload[platform]["dramas"]
     trend_dramas = trend_payload["dramas"]
+    current_payloads = {"latest": latest_payload, "trend": trend_payload}
+    changed = False
 
     for drama_id, count in sorted(repaired_counts.items()):
-        source_entry = _source_metric_entry(loaded_payloads, platform, history_date, drama_id)
+        if drama_id in archived_ids:
+            continue
+        original_entry = _payload_drama_entry(loaded_payloads, "latest", platform, drama_id)
+        if original_entry is not None and drama_id not in latest_dramas:
+            # Another task deleted the drama while the network fetch was running.
+            continue
+        source_entry = _source_metric_entry(current_payloads, platform, history_date, drama_id)
 
         latest_entry = latest_dramas.setdefault(drama_id, dict(source_entry))
-        if isinstance(latest_entry, dict):
+        if isinstance(latest_entry, dict) and _repair_danmaku_slot_writable(latest_entry, original_entry):
             for field, value in source_entry.items():
                 latest_entry.setdefault(field, value)
             latest_entry["danmaku_uid_count"] = count
             latest_entry["fetched_at"] = generated_at
+            changed = True
 
-        trend_entry = trend_dramas.setdefault(drama_id, {"id": drama_id, "name": source_entry.get("name") or drama_id})
+        trend_entry = trend_dramas.setdefault(drama_id, {"version": 2, "id": drama_id, "name": source_entry.get("name") or drama_id})
         if isinstance(trend_entry, dict):
             trend_entry["id"] = str(trend_entry.get("id") or drama_id)
-            trend_entry["name"] = str(source_entry.get("name") or trend_entry.get("name") or drama_id)
-            _copy_trend_drama_fields(trend_entry, source_entry)
+            trend_entry.setdefault("name", str(source_entry.get("name") or drama_id))
+            for field in TREND_DRAMA_FIELDS:
+                if field in source_entry:
+                    trend_entry.setdefault(field, source_entry[field])
             samples = trend_entry.setdefault("samples", {})
             if not isinstance(samples, dict):
                 samples = {}
@@ -2813,27 +2881,29 @@ def write_repaired_danmaku_layers(
             if not isinstance(sample, dict):
                 sample = {"metrics": {}, "ranks": []}
                 samples[history_date] = sample
-            sample.setdefault("ranks", [])
-            sample["generated_at"] = generated_at
             sample_metrics = sample.setdefault("metrics", {})
             if not isinstance(sample_metrics, dict):
                 sample_metrics = {}
                 sample["metrics"] = sample_metrics
             # This repair fetches only danmaku; cached metrics may belong to another date.
             # Preserve other target-day metrics, including explicit nulls and missing fields.
-            sample_metrics["danmaku_uid_count"] = count
+            original_trend = _payload_drama_entry(loaded_payloads, "trend", platform, drama_id)
+            original_samples = original_trend.get("samples") if isinstance(original_trend, dict) else None
+            original_sample = original_samples.get(history_date) if isinstance(original_samples, dict) else None
+            if _repair_danmaku_slot_writable(sample, original_sample, trend=True):
+                sample.setdefault("ranks", [])
+                sample["generated_at"] = generated_at
+                sample_metrics["danmaku_uid_count"] = count
+                changed = True
 
-    publish_rank_string(
-        "ranks:latest",
-        latest_payload,
-        scope="normal",
-        upstash=upstash_request,
+    if not changed:
+        print(f"[ok] {platform} danmaku already repaired or removed; nothing to publish")
+        return
+    publish_repaired_rank_snapshot(
+        platform, latest_payload, trend_payload,
+        source_latest_raw=source_latest_raw, upstash=upstash_request,
     )
-    print("[ok] repaired ranks:latest")
-    publish_trend_v2_best_effort(
-        NORMAL_TREND_V2_KEYS[platform],
-        lambda: publish_normal_trend_v2(platform, trend_payload, upstash=upstash_request),
-    )
+    print(f"[ok] repaired {platform} latest and trend atomically")
 
 
 def fetch_one_missevan_danmaku_count(drama_id: str, requester: MissevanRequester | None = None) -> tuple[str, int]:
@@ -2847,11 +2917,17 @@ def fetch_one_missevan_danmaku_count(drama_id: str, requester: MissevanRequester
     return str(drama_id), safe_int(entry.get("danmaku_uid_count"))
 
 
-def _repair_one_danmaku(platform: str, drama_id: str, requester: MissevanRequester | None = None) -> tuple[str, int]:
+def _repair_one_danmaku(
+    platform: str,
+    drama_id: str,
+    requester: MissevanRequester | None = None,
+    *,
+    progress: dict | None = None,
+) -> tuple[str, int]:
     if platform == "missevan":
         return fetch_one_missevan_danmaku_count(drama_id, requester)
     if platform == "manbo":
-        return fetch_one_manbo_danmaku_count(drama_id)
+        return fetch_one_manbo_danmaku_count(drama_id, progress=progress)
     raise ValueError(f"Unsupported platform: {platform}")
 
 
@@ -2881,9 +2957,18 @@ def repair_null_danmaku_for_platform(
     requester = MissevanRequester() if platform == "missevan" else None
     repaired: dict[str, int] = {}
     failed: set[str] = set()
+    danmaku_progress: dict[str, dict] = {}
+
+    def fetch_one(drama_id: str) -> tuple[str, int]:
+        if platform == "manbo":
+            return _repair_one_danmaku(
+                platform, drama_id, requester, progress=danmaku_progress.setdefault(drama_id, {})
+            )
+        return _repair_one_danmaku(platform, drama_id, requester)
+
     for idx, drama_id in enumerate(sorted_targets, 1):
         try:
-            _, count = _repair_one_danmaku(platform, drama_id, requester)
+            _, count = fetch_one(drama_id)
             repaired[drama_id] = count
             print(f"  [{platform}] ({idx}/{len(sorted_targets)}) drama {drama_id}: {count} danmaku IDs")
         except RuntimeError as exc:
@@ -2898,7 +2983,7 @@ def repair_null_danmaku_for_platform(
             failed.add(drama_id)
 
     def retry_one_danmaku(drama_id: str) -> None:
-        _, count = _repair_one_danmaku(platform, drama_id, requester)
+        _, count = fetch_one(drama_id)
         repaired[str(drama_id)] = count
 
     try:

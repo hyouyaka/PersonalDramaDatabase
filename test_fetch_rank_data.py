@@ -1,3 +1,4 @@
+import copy
 import json
 import sys
 import tempfile
@@ -10,6 +11,8 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 import fetch_rank_data
+import upstash_v2
+from test_upstash_v2 import FakeUpstash
 
 
 class RankFetch418CheckpointTests(unittest.TestCase):
@@ -1802,7 +1805,12 @@ class NullDanmakuRepairTests(unittest.TestCase):
 
         with (
             patch.object(fetch_rank_data, "upstash_request", return_value=0),
-            patch.object(fetch_rank_data, "publish_rank_string") as publish_latest,
+            patch.object(fetch_rank_data, "_load_repair_publish_sources", side_effect=lambda _platform: (
+                json.dumps(payloads["latest"]), json.loads(json.dumps(payloads["latest"])),
+                json.loads(json.dumps(payloads["trend"])),
+            )),
+            patch.object(fetch_rank_data, "load_archived_drama_ids", return_value=payloads.get("archived", {})),
+            patch.object(fetch_rank_data, "publish_repaired_rank_snapshot") as publish_latest,
             patch.object(fetch_rank_data, "publish_normal_trend_v2") as publish_trend,
             patch.object(fetch_rank_data, "now_iso", return_value="2026-05-28T12:00:00+00:00"),
             patch("builtins.print"),
@@ -1815,7 +1823,7 @@ class NullDanmakuRepairTests(unittest.TestCase):
             )
 
         latest_written = publish_latest.call_args.args[1]
-        trend_written = publish_trend.call_args.args[1]
+        trend_written = publish_latest.call_args.args[2]
         self.assertEqual(latest_written["missevan"]["dramas"]["1"]["danmaku_uid_count"], 42)
         self.assertEqual(
             trend_written["dramas"]["1"]["samples"]["2026-05-28"]["metrics"][
@@ -2165,7 +2173,12 @@ class NullDanmakuRepairTests(unittest.TestCase):
             patch.object(fetch_rank_data, "collect_null_danmaku_ids_from_layers", return_value=({"600"}, {"600": ["metrics", "partial", "latest", "trend"]}, payloads)),
             patch.object(fetch_rank_data, "fetch_one_manbo_danmaku_count", return_value=("600", 42)),
             patch.object(fetch_rank_data, "upstash_request", return_value=0),
-            patch.object(fetch_rank_data, "publish_rank_string") as publish_latest,
+            patch.object(fetch_rank_data, "_load_repair_publish_sources", side_effect=lambda _platform: (
+                json.dumps(payloads["latest"]), json.loads(json.dumps(payloads["latest"])),
+                json.loads(json.dumps(payloads["trend"])),
+            )),
+            patch.object(fetch_rank_data, "load_archived_drama_ids", return_value=payloads.get("archived", {})),
+            patch.object(fetch_rank_data, "publish_repaired_rank_snapshot") as publish_latest,
             patch.object(fetch_rank_data, "publish_normal_trend_v2") as publish_trend,
             patch.object(fetch_rank_data, "now_iso", return_value="2026-05-28T12:00:00+00:00"),
             patch("builtins.print"),
@@ -2174,7 +2187,7 @@ class NullDanmakuRepairTests(unittest.TestCase):
 
         self.assertEqual(result["repaired"], {"600": 42})
         latest_written = publish_latest.call_args.args[1]
-        trend_written = publish_trend.call_args.args[1]
+        trend_written = publish_latest.call_args.args[2]
         self.assertEqual(latest_written["manbo"]["dramas"]["600"]["danmaku_uid_count"], 42)
         trend_metrics = trend_written["dramas"]["600"]["samples"]["2026-05-28"]["metrics"]
         self.assertEqual(trend_metrics["danmaku_uid_count"], 42)
@@ -2243,7 +2256,12 @@ class NullDanmakuRepairTests(unittest.TestCase):
                             patch.object(fetch_rank_data, "collect_null_danmaku_ids_from_layers",
                                          return_value=({"600"}, {"600": ["latest"]}, payloads)),
                             patch.object(fetch_rank_data, "_repair_one_danmaku", return_value=("600", count)),
-                            patch.object(fetch_rank_data, "publish_rank_string") as publish_latest,
+                            patch.object(fetch_rank_data, "_load_repair_publish_sources", side_effect=lambda _platform: (
+                                json.dumps(payloads["latest"]), json.loads(json.dumps(payloads["latest"])),
+                                json.loads(json.dumps(payloads["trend"])),
+                            )),
+                            patch.object(fetch_rank_data, "load_archived_drama_ids", return_value=payloads.get("archived", {})),
+                            patch.object(fetch_rank_data, "publish_repaired_rank_snapshot") as publish_latest,
                             patch.object(fetch_rank_data, "publish_normal_trend_v2") as publish_trend,
                             patch.object(fetch_rank_data, "now_iso", return_value=generated_at),
                             patch.object(fetch_rank_data, "upstash_request", side_effect=AssertionError("offline test")),
@@ -2252,7 +2270,7 @@ class NullDanmakuRepairTests(unittest.TestCase):
                             result = fetch_rank_data.repair_null_danmaku_for_platform(platform, history_date)
 
                         self.assertEqual(result["repaired"], {"600": count})
-                        written_samples = publish_trend.call_args.args[1]["dramas"]["600"]["samples"]
+                        written_samples = publish_latest.call_args.args[2]["dramas"]["600"]["samples"]
                         written_sample = written_samples[history_date]
                         expected_metrics = dict((target_sample or {}).get("metrics") or {})
                         expected_metrics["danmaku_uid_count"] = count
@@ -2294,7 +2312,12 @@ class NullDanmakuRepairTests(unittest.TestCase):
             patch.object(fetch_rank_data, "collect_null_danmaku_ids_from_layers", return_value=({"93038"}, {"93038": ["trend"]}, payloads)),
             patch.object(fetch_rank_data, "fetch_one_missevan_danmaku_count", return_value=("93038", 7)),
             patch.object(fetch_rank_data, "upstash_request", return_value=0),
-            patch.object(fetch_rank_data, "publish_rank_string") as publish_latest,
+            patch.object(fetch_rank_data, "_load_repair_publish_sources", side_effect=lambda _platform: (
+                json.dumps(payloads["latest"]), json.loads(json.dumps(payloads["latest"])),
+                json.loads(json.dumps(payloads["trend"])),
+            )),
+            patch.object(fetch_rank_data, "load_archived_drama_ids", return_value=payloads.get("archived", {})),
+            patch.object(fetch_rank_data, "publish_repaired_rank_snapshot") as publish_latest,
             patch.object(fetch_rank_data, "publish_normal_trend_v2"),
             patch.object(fetch_rank_data, "now_iso", return_value="2026-05-28T12:00:00+00:00"),
             patch("builtins.print"),
@@ -2636,6 +2659,190 @@ class MissevanCvLookupTests(unittest.TestCase):
         self.assertEqual(store, original)
 
 
+class RepairPublicationConcurrencyTests(unittest.TestCase):
+    day = "2026-10-19"
+
+    def seed(self, platform="manbo", fake=None):
+        fake = fake or FakeUpstash()
+        other = "missevan" if platform == "manbo" else "manbo"
+        latest = {
+            "_meta": {"updated_at": "before", "capture_started_at": "keep"},
+            platform: {"ranks": {"hot": {"items": ["600", "601"]}}, "dramas": {
+                "600": {"name": "target", "view_count": 10, "danmaku_uid_count": None},
+                "601": {"name": "untouched", "danmaku_uid_count": 11},
+            }},
+            other: {"ranks": {"peak": {"items": [{"name": "unmapped", "dramaIds": []}]}},
+                    "dramas": {"other": {"danmaku_uid_count": None}}},
+        }
+        trend = {"platform": platform, "dates": [self.day], "dramas": {
+            "600": {"version": 2, "id": "600", "name": "target", "samples": {
+                self.day: {"metrics": {"view_count": 10, "danmaku_uid_count": None},
+                           "ranks": [{"key": "hot", "position": 1}]},
+            }},
+            "601": {"version": 2, "id": "601", "name": "untouched", "lastRank": {"date": "keep"},
+                    "samples": {self.day: {"metrics": {"danmaku_uid_count": 11}, "ranks": []}}},
+        }}
+        payloads = {"latest": copy.deepcopy(latest), "trend": copy.deepcopy(trend)}
+        fake.strings["ranks:latest"] = json.dumps(latest)
+        key = upstash_v2.NORMAL_TREND_V2_KEYS[platform]
+        fake.hashes[key] = {"__meta__": json.dumps({"revision": "before", "dates": [self.day]})}
+        fake.hashes[key].update({k: json.dumps(e) for k, e in trend["dramas"].items()})
+        other_key = upstash_v2.NORMAL_TREND_V2_KEYS[other]
+        fake.hashes[other_key] = {"__meta__": '{"revision":"other"}', "other": "{}"}
+        return fake, payloads, other
+
+    def publish(self, fake, payloads, platform="manbo", archived=None):
+        with (
+            patch.object(fetch_rank_data, "upstash_request", side_effect=fake),
+            patch.object(fetch_rank_data, "load_archived_drama_ids", return_value=archived or {}),
+            patch.object(fetch_rank_data, "now_iso", return_value="2026-10-19T02:00:00+00:00"),
+            patch("builtins.print"),
+        ):
+            fetch_rank_data.write_repaired_danmaku_layers(platform, self.day, {"600": 0}, payloads)
+
+    def test_fresh_other_platform_and_unrelated_target_metrics_survive_repair(self):
+        for platform in fetch_rank_data.PLATFORMS:
+            with self.subTest(platform=platform):
+                fake, payloads, other = self.seed(platform)
+                remote = json.loads(fake.strings["ranks:latest"])
+                remote[other]["new_publication"] = {"peak_count": 50}
+                remote[platform]["dramas"]["600"]["view_count"] = 999
+                remote[platform]["dramas"]["601"]["danmaku_uid_count"] = 88
+                fake.strings["ranks:latest"] = json.dumps(remote)
+                hashes_before = copy.deepcopy(fake.hashes)
+                key = upstash_v2.NORMAL_TREND_V2_KEYS[platform]
+                target = json.loads(fake.hashes[key]["600"])
+                target["samples"][self.day]["metrics"]["view_count"] = 999
+                fake.hashes[key]["600"] = json.dumps(target)
+                self.publish(fake, payloads, platform, archived={other: {"other"}})
+                result = json.loads(fake.strings["ranks:latest"])
+                self.assertEqual(result[other], remote[other])
+                self.assertEqual(result[platform]["ranks"], remote[platform]["ranks"])
+                self.assertEqual(result[platform]["dramas"]["601"], remote[platform]["dramas"]["601"])
+                entry = result[platform]["dramas"]["600"]
+                self.assertEqual((entry["danmaku_uid_count"], entry["view_count"]), (0, 999))
+                self.assertEqual(result["_meta"]["capture_started_at"], "keep")
+                self.assertEqual(fake.hashes[upstash_v2.NORMAL_TREND_V2_KEYS[other]], hashes_before[upstash_v2.NORMAL_TREND_V2_KEYS[other]])
+                self.assertEqual(json.loads(fake.hashes[key]["601"]), json.loads(hashes_before[key]["601"]))
+                metrics = json.loads(fake.hashes[key]["600"])["samples"][self.day]["metrics"]
+                self.assertEqual(metrics, {"view_count": 999, "danmaku_uid_count": 0})
+                resources = json.loads(fake.strings["ranks:meta"])["normal"]["resources"]
+                self.assertIn("ranks:latest", resources)
+                self.assertIn(key, resources)
+
+    def test_already_repaired_values_including_zero_are_not_overwritten(self):
+        for value in (0, 99):
+            with self.subTest(value=value):
+                fake, payloads, _ = self.seed()
+                latest = json.loads(fake.strings["ranks:latest"])
+                latest["manbo"]["dramas"]["600"]["danmaku_uid_count"] = value
+                fake.strings["ranks:latest"] = json.dumps(latest)
+                key = upstash_v2.NORMAL_TREND_V2_KEYS["manbo"]
+                entry = json.loads(fake.hashes[key]["600"])
+                entry["samples"][self.day]["metrics"]["danmaku_uid_count"] = value
+                fake.hashes[key]["600"] = json.dumps(entry)
+                before_strings, before_hashes = copy.deepcopy(fake.strings), copy.deepcopy(fake.hashes)
+                self.publish(fake, payloads)
+                self.assertEqual(fake.strings, before_strings)
+                self.assertEqual(fake.hashes, before_hashes)
+                self.assertFalse(any(c[0] == "EVAL" for c in fake.commands))
+
+    def test_archived_or_concurrently_deleted_drama_is_not_recreated(self):
+        for deleted in (False, True):
+            with self.subTest(deleted=deleted):
+                fake, payloads, _ = self.seed()
+                if deleted:
+                    latest = json.loads(fake.strings["ranks:latest"])
+                    del latest["manbo"]["dramas"]["600"]
+                    fake.strings["ranks:latest"] = json.dumps(latest)
+                before = (copy.deepcopy(fake.strings), copy.deepcopy(fake.hashes))
+                self.publish(fake, payloads, archived={} if deleted else {"manbo": {"600"}})
+                self.assertEqual((fake.strings, fake.hashes), before)
+
+    def test_repair_refreshes_unchanged_cached_latest_when_only_trend_was_empty(self):
+        fake, payloads, _ = self.seed()
+        latest = json.loads(fake.strings["ranks:latest"])
+        latest["manbo"]["dramas"]["600"].update(danmaku_uid_count=10, fetched_at="old")
+        payloads["latest"] = copy.deepcopy(latest)
+        fake.strings["ranks:latest"] = json.dumps(latest)
+        self.publish(fake, payloads)
+        self.assertEqual(json.loads(fake.strings["ranks:latest"])["manbo"]["dramas"]["600"]["danmaku_uid_count"], 0)
+
+    def test_repair_preserves_same_count_with_newer_capture_time(self):
+        fake, payloads, _ = self.seed()
+        payloads["latest"]["manbo"]["dramas"]["600"].update(danmaku_uid_count=10, fetched_at="old")
+        latest = copy.deepcopy(payloads["latest"])
+        latest["manbo"]["dramas"]["600"]["fetched_at"] = "newer"
+        fake.strings["ranks:latest"] = json.dumps(latest)
+        key = upstash_v2.NORMAL_TREND_V2_KEYS["manbo"]
+        entry = json.loads(fake.hashes[key]["600"])
+        entry["samples"][self.day].update(generated_at="newer")
+        entry["samples"][self.day]["metrics"]["danmaku_uid_count"] = 10
+        payloads["trend"]["dramas"]["600"]["samples"][self.day].update(generated_at="old")
+        payloads["trend"]["dramas"]["600"]["samples"][self.day]["metrics"]["danmaku_uid_count"] = 10
+        fake.hashes[key]["600"] = json.dumps(entry)
+        before = (copy.deepcopy(fake.strings), copy.deepcopy(fake.hashes))
+        self.publish(fake, payloads)
+        self.assertEqual((fake.strings, fake.hashes), before)
+
+    def test_latest_or_trend_race_rejects_both_writes(self):
+        for resource in ("latest", "trend"):
+            with self.subTest(resource=resource):
+                class RacingUpstash(FakeUpstash):
+                    raced = False
+
+                    def __call__(self, command):
+                        if command[:2] == ["EVAL", upstash_v2.REPAIR_RANK_ACTIVATE_SCRIPT] and not self.raced:
+                            self.raced = True
+                            if resource == "latest":
+                                latest = json.loads(self.strings["ranks:latest"])
+                                latest["missevan"]["newer"] = True
+                                self.strings["ranks:latest"] = json.dumps(latest)
+                            else:
+                                self.hashes[upstash_v2.NORMAL_TREND_V2_KEYS["manbo"]]["__meta__"] = '{"revision":"newer"}'
+                        return super().__call__(command)
+
+                fake, payloads, _ = self.seed(fake=RacingUpstash())
+                old_latest = fake.strings["ranks:latest"]
+                key = upstash_v2.NORMAL_TREND_V2_KEYS["manbo"]
+                before_trend = copy.deepcopy(fake.hashes[key])
+                with self.assertRaisesRegex(RuntimeError, "Concurrent update"):
+                    self.publish(fake, payloads)
+                latest = json.loads(fake.strings["ranks:latest"])
+                self.assertIsNone(latest["manbo"]["dramas"]["600"]["danmaku_uid_count"])
+                self.assertNotIn("ranks:meta", fake.strings)
+                self.assertEqual(fake.hashes[key]["600"], before_trend["600"])
+                if resource == "latest":
+                    self.assertTrue(latest["missevan"]["newer"])
+                    self.assertEqual(fake.hashes[key], before_trend)
+                else:
+                    self.assertEqual(fake.strings["ranks:latest"], old_latest)
+                    self.assertEqual(fake.hashes[key]["__meta__"], '{"revision":"newer"}')
+
+    def test_metadata_race_retries_without_losing_other_resources(self):
+        class RacingMetaUpstash(FakeUpstash):
+            raced = False
+
+            def __call__(self, command):
+                if command[:2] == ["EVAL", upstash_v2.REPAIR_RANK_ACTIVATE_SCRIPT] and not self.raced:
+                    self.raced = True
+                    self.strings["ranks:meta"] = json.dumps({"cv": {"resources": {"newer": {"value": 1}}}})
+                return super().__call__(command)
+
+        fake, payloads, _ = self.seed(fake=RacingMetaUpstash())
+        self.publish(fake, payloads)
+        meta = json.loads(fake.strings["ranks:meta"])
+        self.assertEqual(meta["cv"]["resources"]["newer"], {"value": 1})
+        self.assertEqual(json.loads(fake.strings["ranks:latest"])["manbo"]["dramas"]["600"]["danmaku_uid_count"], 0)
+
+    def test_fresh_source_read_failure_never_writes(self):
+        fake, payloads, _ = self.seed()
+        fake.strings.pop("ranks:latest")
+        with self.assertRaisesRegex(RuntimeError, "snapshot is missing"):
+            self.publish(fake, payloads)
+        self.assertFalse(any(c[0] in ("EVAL", "HSET", "SET") for c in fake.commands))
+
+
 class QueueDramaIdValidationTests(unittest.TestCase):
     def test_atomic_append_filters_invalid_inputs_and_cleans_existing_values_in_lua(self) -> None:
         upstash = Mock(return_value='{"missevan":["100"],"manbo":["200"]}')
@@ -2662,61 +2869,23 @@ class ManboDanmakuStabilityTests(unittest.TestCase):
             "https://manbo.kilaaudio.com/web_manbo/example?value=1"
         )
 
-    def test_manbo_web_api_falls_back_to_legacy_host(self) -> None:
-        def request_json(url: str) -> dict:
-            if url.startswith("https://manbo.kilaaudio.com"):
-                raise RuntimeError("current host unavailable")
-            return {"code": 200, "data": {}}
-
-        requester = Mock(side_effect=request_json)
-        with patch("builtins.print"):
-            result = fetch_rank_data.request_manbo_web_json(
-                "web_manbo/example",
-                request_json=requester,
-            )
-
-        self.assertEqual(result["code"], 200)
-        self.assertEqual(
-            [call.args[0] for call in requester.call_args_list],
-            [
-                "https://manbo.kilaaudio.com/web_manbo/example",
-                "https://www.kilamanbo.com/web_manbo/example",
-            ],
-        )
-
-    def test_manbo_web_api_falls_back_on_business_failure(self) -> None:
-        requester = Mock(
-            side_effect=[
-                {"code": 400, "msg": "bad request", "data": {}},
-                {"code": 200, "data": {}},
-            ]
-        )
-
-        with patch("builtins.print"):
-            result = fetch_rank_data.request_manbo_web_json(
-                "/web_manbo/example",
-                request_json=requester,
-            )
-
-        self.assertEqual(result["code"], 200)
-        self.assertEqual(requester.call_count, 2)
-
-    def test_manbo_web_api_falls_back_on_invalid_danmaku_structure(self) -> None:
-        requester = Mock(
-            side_effect=[
-                {"code": 200, "data": {}},
-                {"code": 200, "data": {"count": 0, "list": []}},
-            ]
-        )
-
-        with patch("builtins.print"):
-            result = fetch_rank_data.request_manbo_web_json(
-                "/web_manbo/getDanmaKuPgList?pageSize=200&dramaSetId=1&pageNo=1",
-                request_json=requester,
-            )
-
-        self.assertEqual(result["data"], {"count": 0, "list": []})
-        self.assertEqual(requester.call_count, 2)
+    def test_manbo_web_api_never_requests_retired_host(self) -> None:
+        self.assertIn("https://www.kilamanbo.com", fetch_rank_data.MANBO_WEB_API_BASE_URLS)
+        for response in (
+            RuntimeError("current host unavailable"),
+            {"code": 400, "msg": "bad request", "data": {}},
+            {"code": 200, "data": {}},
+        ):
+            with self.subTest(response=response):
+                requester = Mock(side_effect=[response])
+                with self.assertRaisesRegex(RuntimeError, "Manbo Web API failed"):
+                    fetch_rank_data.request_manbo_web_json(
+                        "/web_manbo/getDanmaKuPgList?pageSize=200&dramaSetId=1&pageNo=1",
+                        request_json=requester,
+                    )
+                requester.assert_called_once_with(
+                    "https://manbo.kilaaudio.com/web_manbo/getDanmaKuPgList?pageSize=200&dramaSetId=1&pageNo=1"
+                )
 
     def test_manbo_drama_detail_accepts_all_compatible_set_list_fields(self) -> None:
         for field in ("radioDramaSetRespList", "dramaSetRespList", "sets"):
@@ -2935,6 +3104,143 @@ class ManboDanmakuStabilityTests(unittest.TestCase):
 
         self.assertEqual(fetch_count.call_count, 2)
         self.assertEqual(store["manbo"]["dramas"]["600"]["danmaku_uid_count"], 601)
+
+    def test_manbo_retry_keeps_complete_pages_and_discovers_failed_set_pages(self) -> None:
+        progress = {}
+        loader = Mock(return_value=["set-a", "set-b"])
+        pages = {
+            ("set-a", 1): {"data": {"count": 3, "list": [{"eid": "1"}, {"eid": "2"}]}},
+            ("set-a", 2): {"data": {"count": 3, "list": [{"eid": "3"}]}},
+            ("set-b", 1): {"data": {"count": 3, "list": [{"eid": "2"}, {"eid": "4"}]}},
+            ("set-b", 2): {"data": {"count": 3, "list": [{"eid": "5"}]}},
+        }
+        calls = {}
+
+        def requester(url):
+            query = parse_qs(urlparse(url).query)
+            key = (query["dramaSetId"][0], int(query["pageNo"][0]))
+            calls[key] = calls.get(key, 0) + 1
+            if key == ("set-a", 1) and calls[key] <= 3:
+                raise requests.exceptions.ConnectTimeout("temporary")
+            return pages[key]
+
+        def fetch():
+            return fetch_rank_data.fetch_manbo_paid_danmaku_benchmark(
+                "600", request_json=requester, paid_set_id_loader=loader,
+                page_size=2, retry_delay=0, progress=progress,
+            )
+
+        first = fetch()
+        self.assertGreater(first["failed_page_count"], 0)
+        self.assertEqual(first["fetched_pages"], 2)
+        self.assertNotIn(("set-a", 2), calls)
+        second = fetch()
+        self.assertEqual(second["failed_page_count"], 0)
+        self.assertEqual(second["fetched_pages"], 4)
+        self.assertEqual(second["fetched_danmaku"], 6)
+        self.assertEqual(second["unique_user_count"], 5)
+        self.assertEqual(calls, {("set-a", 1): 4, ("set-a", 2): 1, ("set-b", 1): 1, ("set-b", 2): 1})
+        loader.assert_called_once()
+
+    def test_manbo_retry_replaces_short_page_without_double_counting_or_lowering_total(self) -> None:
+        progress = {}
+        calls = {}
+
+        def requester(url):
+            page = int(parse_qs(urlparse(url).query)["pageNo"][0])
+            calls[page] = calls.get(page, 0) + 1
+            if page == 1:
+                return {"data": {"count": 4, "list": [{"eid": "1"}, {"eid": "2"}]}}
+            if calls[page] == 1:
+                return {"data": {"count": 4, "list": [{"eid": "partial-only"}]}}
+            if calls[page] == 2:
+                return {"data": {"count": 2, "list": []}}
+            return {"data": {"count": 4, "list": [{"eid": "2"}, {"eid": "3"}]}}
+
+        def fetch():
+            return fetch_rank_data.fetch_manbo_paid_danmaku_benchmark(
+                "600", request_json=requester,
+                paid_set_id_loader=lambda *_args, **_kwargs: ["set-a"],
+                page_size=2, short_page_retries=1, progress=progress,
+            )
+
+        self.assertGreater(fetch()["failed_page_count"], 0)
+        second = fetch()
+        self.assertGreater(second["failed_page_count"], 0)
+        self.assertEqual(second["total_danmaku"], 4)
+        self.assertEqual(second["failed_pages"][0]["expected_entries"], 2)
+        third = fetch()
+        self.assertEqual(third["failed_page_count"], 0)
+        self.assertEqual(third["fetched_danmaku"], 4)
+        self.assertEqual(third["unique_user_count"], 3)
+        self.assertEqual(calls, {1: 1, 2: 3})
+
+    def test_manbo_retry_of_short_first_page_preserves_original_total(self) -> None:
+        progress = {}
+        requester = Mock(side_effect=[
+            {"data": {"count": 4, "list": [{"eid": "partial"}]}},
+            {"data": {"count": 4, "list": [{"eid": "3"}, {"eid": "4"}]}},
+            {"data": {"count": 0, "list": []}},
+        ])
+        for _ in range(2):
+            result = fetch_rank_data.fetch_manbo_paid_danmaku_benchmark(
+                "600", request_json=requester,
+                paid_set_id_loader=lambda *_args, **_kwargs: ["set-a"],
+                page_size=2, short_page_retries=1, progress=progress,
+            )
+            self.assertGreater(result["failed_page_count"], 0)
+        self.assertEqual(result["total_danmaku"], 4)
+        self.assertEqual(requester.call_count, 3)
+        self.assertEqual(result["failed_pages"][0]["page_no"], 1)
+        self.assertEqual(result["failed_pages"][0]["expected_entries"], 2)
+
+    def test_manbo_page_progress_is_shared_by_all_refresh_entry_points(self) -> None:
+        benchmark = fetch_rank_data.fetch_manbo_paid_danmaku_benchmark
+        for mode in ("daily", "only-danmaku", "repair"):
+            for persistent_failure in (False, True):
+                with self.subTest(mode=mode, persistent_failure=persistent_failure):
+                    calls = {}
+                    loader = Mock(return_value=["set-a"])
+
+                    def requester(url):
+                        page = int(parse_qs(urlparse(url).query)["pageNo"][0])
+                        calls[page] = calls.get(page, 0) + 1
+                        if page == 2 and (persistent_failure or calls[page] <= 3):
+                            raise requests.exceptions.ReadTimeout("temporary")
+                        entries = [{"eid": "1"}, {"eid": "2"}] if page == 1 else [{"eid": "2"}]
+                        return {"data": {"count": 3, "list": entries}}
+
+                    def fetch_benchmark(drama_id, **kwargs):
+                        kwargs.update(
+                            request_json=requester, paid_set_id_loader=loader,
+                            page_size=2, retry_delay=0,
+                        )
+                        return benchmark(drama_id, **kwargs)
+
+                    store = {"manbo": {"dramas": {"600": {"danmaku_uid_count": None}}}}
+                    with (
+                        patch.object(fetch_rank_data, "fetch_manbo_paid_danmaku_benchmark", side_effect=fetch_benchmark),
+                        patch.object(fetch_rank_data, "_fetch_one_manbo"),
+                        patch.object(fetch_rank_data, "save_json"),
+                        patch.object(fetch_rank_data, "collect_null_danmaku_ids_from_layers", return_value=({"600"}, {"600": ["latest"]}, {})),
+                        patch.object(fetch_rank_data, "write_repaired_danmaku_layers") as write_layers,
+                        patch("builtins.print"),
+                    ):
+                        if mode == "daily":
+                            fetch_rank_data.fetch_manbo_drama_details({"600"}, store, skip_danmaku=False)
+                        elif mode == "only-danmaku":
+                            fetch_rank_data.fetch_manbo_danmaku_details({"600"}, store, force=True)
+                        else:
+                            result = fetch_rank_data.repair_null_danmaku_for_platform("manbo", "2026-10-18")
+                    self.assertEqual(calls[1], 1)
+                    self.assertEqual(calls[2], 12 if persistent_failure else 4)
+                    loader.assert_called_once()
+                    if mode == "repair":
+                        self.assertEqual(result["repaired"], {} if persistent_failure else {"600": 2})
+                        self.assertEqual(result["failed"], ["600"] if persistent_failure else [])
+                        self.assertEqual(write_layers.call_count, 0 if persistent_failure else 1)
+                    else:
+                        self.assertEqual(store["manbo"]["dramas"]["600"]["danmaku_uid_count"], None if persistent_failure else 2)
 
     def test_manbo_low_value_within_two_percent_is_allowed(self) -> None:
         store = {

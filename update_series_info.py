@@ -25,7 +25,7 @@ from upstash_v2 import string_cas_token
 
 KEYS = (SERIES_INFO_KEY, MANBO_INFO_KEY, MISSEVAN_INFO_KEY)
 MIGRATIONS = {
-    "猫耳:全职高手": "猫耳:全职高手广播剧",
+    "猫耳:全职高手广播剧": "猫耳:全职高手",
     "猫耳:君有疾否": "猫耳:君有疾否广播剧",
 }
 CAS_SCRIPT = """

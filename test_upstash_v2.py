@@ -32,6 +32,25 @@ class FakeUpstash:
                 result.extend([field, value])
             return result
         if operation == "EVAL":
+            if command[1] == upstash_v2.REPAIR_RANK_ACTIVATE_SCRIPT:
+                source, target, rank_key, latest_key = map(str, command[3:7])
+                expected_trend, expected_rank, new_rank, expected_latest, new_latest = map(str, command[7:12])
+                current_trend = self.hashes.get(target, {}).get("__meta__")
+                if expected_trend == "__missing__":
+                    if target in self.hashes:
+                        return 0
+                elif current_trend != expected_trend:
+                    return 0
+                if upstash_v2.string_cas_token(self.strings.get(rank_key)) != expected_rank:
+                    return 0
+                if upstash_v2.string_cas_token(self.strings.get(latest_key)) != expected_latest:
+                    return 0
+                self.hashes[target] = self.hashes.pop(source)
+                self.ttls.pop(source, None)
+                self.ttls.pop(target, None)
+                self.strings[rank_key] = new_rank
+                self.strings[latest_key] = new_latest
+                return 1
             if command[1] == upstash_v2.JSON_WITH_META_PUBLISH_SCRIPT:
                 data_key = str(command[3])
                 meta_key = str(command[4])

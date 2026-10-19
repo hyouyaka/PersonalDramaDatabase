@@ -280,6 +280,15 @@ class GroupingTests(unittest.TestCase):
         self.assertIn('猫耳:作品（同名、甲）', result)
         self.assertIn('猫耳:作品（同名、乙）', result)
 
+    def test_quanzhi_series_preserves_peak_rank_name(self):
+        old = existing(**{'猫耳:全职高手': entry('全职高手', ['1', '2'])})
+        rows = [drama(1, '全职高手广播剧第一季 上'), drama(2, '全职高手广播剧第一季 下')]
+        result, _ = self.update(rows, old)
+        self.assertIn('猫耳:全职高手', result)
+        self.assertNotIn('猫耳:全职高手广播剧', result)
+        self.assertEqual(result['猫耳:全职高手']['series title'], '全职高手')
+        self.assertEqual(result['猫耳:全职高手']['dramaIds'], ['1', '2'])
+
     def test_migrations_union_and_idempotence(self):
         for source, target in series.MIGRATIONS.items():
             old = existing(**{source: entry(source.split(':')[1], ['1', '9'], custom=True),
