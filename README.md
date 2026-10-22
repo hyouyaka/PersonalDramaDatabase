@@ -1,5 +1,12 @@
 # CommenTasks Scripts
 
+## 人工排除的作品
+
+不再收录的作品统一维护在 `platform_sync.py` 的 `DRAMA_EXCLUSIONS`，按平台和
+`dramaId` 区分，并保留标题供核对。ongoing 输出、新剧队列读取与写入、追加 ID
+及榜单发布都会过滤这些 ID，防止删除后被自动重新收录。修改名单后仍需清理
+已经存在的源库、ongoing、队列、播放量和榜单趋势数据；名单本身不执行历史删除。
+
 ## 本地服务器运行与旧 Upstash 数据归档
 
 每日、每周更新由本地服务器运行 `run_daily_update.ps1` 和

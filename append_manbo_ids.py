@@ -4,6 +4,7 @@ import sys
 
 from cvid_map_tools import BestEffortAvatarLookup, CvAvatarLookup, update_combined_cvid_map
 from platform_sync import is_numeric_drama_id, load_json, MANBO_INFO_PATH, MISSEVAN_INFO_PATH
+from platform_sync import is_excluded_drama
 from refresh_platform_metadata import upsert_manbo_drama_ids
 from sync_new_drama_ids import (
     MANBO_INFO_KEY,
@@ -24,6 +25,12 @@ def main(argv: list[str]) -> int:
     if invalid_ids:
         print("Invalid 漫播 dramaId (ASCII digits required):", ", ".join(invalid_ids))
         return 1
+    excluded = [value for value in drama_ids if is_excluded_drama("manbo", value)]
+    if excluded:
+        print("Skipped excluded 漫播 dramaIds:", ", ".join(excluded))
+        drama_ids = [value for value in drama_ids if not is_excluded_drama("manbo", value)]
+        if not drama_ids:
+            return 0
     load_env_file(ROOT / ".env")
     download_info_file(MANBO_INFO_KEY, MANBO_INFO_PATH)
     target_drama_ids = set(drama_ids)

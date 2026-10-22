@@ -1161,7 +1161,7 @@ class MissevanIntroCvCandidateTests(unittest.TestCase):
         )
 
     def test_extracts_candidates_from_plain_cv_section_titles(self) -> None:
-        for title in ("配音组", "配音：", "CAST", "CV", "✈️𝑪𝑨𝑺𝑻", "ＣＡＳＴ", "𝒄𝒂𝒔𝒕"):
+        for title in ("配音组", "配音：", "演员组", "演员", "演员组：", "演员：", "CAST", "CV", "✈️𝑪𝑨𝑺𝑻", "ＣＡＳＴ", "𝒄𝒂𝒔𝒕"):
             with self.subTest(title=title):
                 intro = f"""
                 <p>{title}</p>
@@ -1177,6 +1177,44 @@ class MissevanIntroCvCandidateTests(unittest.TestCase):
                         {"role_name": "角色甲", "display_name": "甲声优", "account_name": "alias"},
                         {"role_name": "角色乙", "display_name": "乙声优"},
                     ],
+                )
+
+    def test_94831_actor_section_extracts_main_roles_from_preview(self) -> None:
+        intro = """
+        <p>► 制作组 ◅</p>
+        <p>制片人/总导演：青什</p>
+        <p>配音导演：刘溪桐</p>
+        <p>► 演员组 ◅</p>
+        <p>金旭：刘一鸣</p>
+        <p>尚扬：马洋</p>
+        <p>小刘：张恩泽</p>
+        <p>尚扬母亲：陈景妍</p>
+        <p>参与配音：阿步 李哎 刘姝辰</p>
+        """
+        rows = [{
+            "sound_id": 13513360,
+            "title": "徐徐图之原著|广播剧《金嘉轩去了哪里》第一季 先导剧场：一个人的七夕",
+            "intro": intro,
+        }]
+
+        self.assertEqual(
+            refresh_platform_metadata.collect_missevan_episode_intro_candidates(rows, method="preview"),
+            [
+                {"role_name": "金旭", "display_name": "刘一鸣"},
+                {"role_name": "尚扬", "display_name": "马洋"},
+            ],
+        )
+
+    def test_actor_section_stops_at_production_heading(self) -> None:
+        for title in ("► 演员组 ◅", "► 演员 ◅"):
+            with self.subTest(title=title):
+                intro = (
+                    f"<p>{title}</p><p>金旭：刘一鸣</p>"
+                    "<p>► 制作组 ◅</p><p>其他职位：制作人员</p>"
+                )
+                self.assertEqual(
+                    refresh_platform_metadata.extract_missevan_intro_cv_candidates(intro, limit=100),
+                    [{"role_name": "金旭", "display_name": "刘一鸣"}],
                 )
 
     def test_96486_styled_cast_extracts_main_roles(self) -> None:

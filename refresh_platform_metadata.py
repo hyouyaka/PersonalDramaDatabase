@@ -41,6 +41,8 @@ from platform_sync import (
     infer_type_from_labels,
     is_narrator_role,
     is_numeric_drama_id,
+    is_excluded_drama,
+    match_first_episode,
     is_target_catalog,
     iter_missevan_nodes,
     load_cache,
@@ -70,7 +72,7 @@ from refresh_watch_counts import run_archive_retry_queue
 MISSEVAN_BLOCKLIST = {"47639", "25812"}
 MISSEVAN_ARCHIVED_INFO_PATH = MISSEVAN_INFO_PATH.with_name("missevan-archived-drama.json")
 MISSEVAN_INTRO_CV_SECTION_PATTERN = re.compile(
-    r"^(?:[^A-Za-z0-9\u4e00-\u9fff]{0,20})?(?:配音组|配音|CAST|CV)(?:[^A-Za-z0-9\u4e00-\u9fff]{0,20})?$",
+    r"^(?:[^A-Za-z0-9\u4e00-\u9fff]{0,20})?(?:配音组|配音|演员组|演员|CAST|CV)(?:[^A-Za-z0-9\u4e00-\u9fff]{0,20})?$",
     re.I,
 )
 MISSEVAN_INTRO_SECTION_PATTERN = re.compile(
@@ -79,7 +81,8 @@ MISSEVAN_INTRO_SECTION_PATTERN = re.compile(
     r"(?:[^A-Za-z0-9\u4e00-\u9fff：:]{0,20})?(?:[：:]\s*)?$",
     re.I,
 )
-MISSEVAN_INTRO_ROLE_CV_PATTERN = re.compile(r"^(?P<role>[^：:\n]{1,40})[：:](?P<cv>.+)$")
+# Double-dash credits may put the CV first; only add the single-dash format.
+MISSEVAN_INTRO_ROLE_CV_PATTERN = re.compile(r"^(?P<role>[^：:—\n]{1,40})(?:[：:]|—(?!—))(?P<cv>.+)$")
 MISSEVAN_CV_SUFFIX_PATTERN = re.compile(r"\s*(?:@|＠|【|\[|（|\(|<|《).*$")
 MISSEVAN_CV_ACCOUNT_END_PATTERN = re.compile(r"[\s、，,；;【\[（\(<《]")
 MISSEVAN_INTRO_STAFF_ROLE_NAMES = {
@@ -137,6 +140,13 @@ MANBO_MAINCV_OVERRIDES = {
     },
 }
 MISSEVAN_MAINCV_OVERRIDES = {
+    "72383": {  # 捡到男鬼后脱单了 第二季：沿用第一、三季主役
+        "ids": [1040, 1312],
+        "extras": {
+            1040: {"display_name": "赵毅", "role_name": "皮修"},
+            1312: {"display_name": "林予曦", "role_name": "文熙"},
+        },
+    },
     "71321": [1759, 2048, 3177, 6957, 3349, 3427, 4940],  # 再世权臣 第一季
     "79826": [1759, 3349, 4940, 6957, 2048, 3427, 3177],  # 再世权臣 第二季
     "86827": [1759, 3427, 3349, 4940, 2048, 3177, 6957],  # 再世权臣 第三季（上）
@@ -928,6 +938,8 @@ def collect_missevan_episode_intro_candidates(
         selected = [row for row in rows if "声展" in normalize(row.get("title"))][:2]
     elif method == "preview":
         selected = [row for row in rows if is_missevan_preview_intro_title(row.get("title"))]
+    elif method == "first_episode":
+        selected = [row for row in rows if match_first_episode(row.get("title"))][:1]
     else:
         raise ValueError(f"Unsupported Missevan intro method: {method}")
 
@@ -1122,7 +1134,7 @@ def refresh_missevan(
 
     for idx, (series_title, season_key, node) in enumerate(pending_nodes, start=1):
         drama_id = str(node.get("dramaId") or "").strip()
-        if not drama_id or drama_id in MISSEVAN_BLOCKLIST:
+        if not drama_id or drama_id in MISSEVAN_BLOCKLIST or is_excluded_drama("missevan", drama_id):
             continue
         if target_drama_ids is not None and drama_id not in target_drama_ids:
             continue
@@ -1310,6 +1322,24 @@ def refresh_missevan(
                         cv_upgrade_ambiguities=cv_upgrade_ambiguities,
                         existing_entries_first=True,
                     )
+                if len(missevan_main_cv_entries(updated_node)) < target_main_cv_count:
+                    used_names = {
+                        normalize_match(entry["display_name"])
+                        for entry in missevan_main_cv_entries(updated_node)
+                        if normalize_match(entry["display_name"])
+                    }
+                    first_episode_candidates = collect_missevan_episode_intro_candidates(
+                        intro_rows, method="first_episode", excluded_names=used_names,
+                        candidate_limit=target_main_cv_count - len(missevan_main_cv_entries(updated_node)),
+                    )
+                    updated_node = apply_missevan_intro_cv_fallback(
+                        updated_node, drama_id, first_episode_candidates,
+                        search_cv=lambda cv_name: search_missevan_cv(cv_name, requester),
+                        generated_cv_id_allocator=generated_cv_id_allocator,
+                        generated_id_replacements=generated_id_replacements,
+                        cv_upgrade_ambiguities=cv_upgrade_ambiguities,
+                        existing_entries_first=True,
+                    )
             except Exception:
                 save_missevan_store(MISSEVAN_INFO_PATH, store)
                 save_json(MISSEVAN_ARCHIVED_INFO_PATH, archive)
@@ -1387,6 +1417,9 @@ def upsert_missevan_drama_ids(
     generated_id_replacements: dict[int, int] | None = None,
     cv_upgrade_ambiguities: list[str] | None = None,
 ) -> dict:
+    excluded = [str(value) for value in drama_ids if is_excluded_drama("missevan", value)]
+    if excluded:
+        raise ValueError(f"Excluded 猫耳 dramaIds: {', '.join(excluded)}")
     store = load_json(MISSEVAN_INFO_PATH, {})
     existing_ids = {str(node.get("dramaId") or "").strip() for _series_title, _season_key, node in iter_missevan_nodes(store)}
     for drama_id in drama_ids:
@@ -1505,7 +1538,7 @@ def refresh_manbo(*, target_drama_ids: set[str] | None = None, force: bool = Tru
 
     for idx, record in enumerate(records, start=1):
         drama_id = str(record.get("dramaId") or "").strip()
-        if not drama_id:
+        if not drama_id or is_excluded_drama("manbo", drama_id):
             continue
         if target_drama_ids is not None and drama_id not in target_drama_ids:
             continue
@@ -1583,6 +1616,9 @@ def refresh_manbo(*, target_drama_ids: set[str] | None = None, force: bool = Tru
 
 
 def upsert_manbo_drama_ids(drama_ids: list[str], *, force: bool = True) -> dict:
+    excluded = [str(value) for value in drama_ids if is_excluded_drama("manbo", value)]
+    if excluded:
+        raise ValueError(f"Excluded 漫播 dramaIds: {', '.join(excluded)}")
     invalid_ids = [str(item) for item in drama_ids if not is_numeric_drama_id(item)]
     if invalid_ids:
         raise ValueError(f"Invalid 漫播 dramaId (ASCII digits required): {', '.join(invalid_ids)}")

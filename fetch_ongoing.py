@@ -19,6 +19,7 @@ from platform_sync import (
     MISSEVAN_HEADERS,
     MissevanRequester,
     is_numeric_drama_id,
+    is_excluded_drama,
     normalize,
     request_manbo_json,
 )
@@ -209,7 +210,11 @@ def build_payload(platform: str, records: dict[str, dict[str, object]], *, gener
         "version": 1,
         "updatedAt": generated_at or now_iso(),
         "platform": platform,
-        "records": records,
+        "records": {
+            key: record for key, record in records.items()
+            if not is_excluded_drama(platform, key)
+            and not is_excluded_drama(platform, record.get("dramaId", key))
+        },
     }
 
 

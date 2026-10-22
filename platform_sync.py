@@ -41,6 +41,34 @@ MANBO_CATALOG_NAME_ALIASES = {"有声书": "有声剧"}
 MANBO_COVER_FIELDS = ("coverPic", "largePic", "cover", "sharePicUrl")
 UNKNOWN_MAIN_CV_MARKER = "主役未知"
 UNKNOWN_MAIN_CV_DISPLAY = "暂无"
+# Explicit collection decisions. Keep IDs platform-scoped so crawlers cannot
+# re-import removed works through ongoing feeds or public rankings.
+DRAMA_EXCLUSIONS = {
+    "missevan": {
+        "83940": "梅有烦恼事务所",
+        "96614": "蛊真人",
+        "47577": "浮沉",
+        "85168": "苍岐",
+        "93412": "天桥摆摊，客户竟是阎王",
+        "93622": "ขังรักในกรงรัตติกาล",
+        "96415": "轮回审判者【第1季】",
+        "44577": "一步之遥",
+        "88641": "纸飞机",
+    },
+    "manbo": {
+        "1896908912553099327": "scc7000遥昇歌曲翻唱大合集",
+    },
+}
+
+
+def excluded_drama_ids(platform: str) -> frozenset[str]:
+    return frozenset(DRAMA_EXCLUSIONS[platform])
+
+
+def is_excluded_drama(platform: str, drama_id: object) -> bool:
+    return str(drama_id).strip() in DRAMA_EXCLUSIONS[platform]
+
+
 MANBO_CATALOG_OVERRIDES = {
     "奇洛李维斯回信": {"catalog": 5, "catalogName": "有声剧"},
 }

@@ -11,6 +11,7 @@ from cvid_map_tools import (
     update_combined_cvid_map,
 )
 from platform_sync import (
+    is_excluded_drama,
     COMBINED_CVID_MAP_PATH,
     load_json,
     MANBO_INFO_PATH,
@@ -35,6 +36,12 @@ def main(argv: list[str]) -> int:
     if not drama_ids:
         print("Usage: python append_missevan_ids.py <drama_id> [<drama_id> ...]")
         return 1
+    excluded = [value for value in drama_ids if is_excluded_drama("missevan", value)]
+    if excluded:
+        print("Skipped excluded 猫耳 dramaIds:", ", ".join(excluded))
+        drama_ids = [value for value in drama_ids if not is_excluded_drama("missevan", value)]
+        if not drama_ids:
+            return 0
     load_env_file(ROOT / ".env")
     download_info_file(MISSEVAN_INFO_KEY, MISSEVAN_INFO_PATH)
     download_support_files()

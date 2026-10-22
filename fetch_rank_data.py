@@ -24,6 +24,8 @@ from platform_sync import (
     load_json,
     manbo_main_cv_display_names,
     is_numeric_drama_id,
+    is_excluded_drama,
+    excluded_drama_ids,
     is_target_catalog,
     missevan_main_cv_entries,
     normalize,
@@ -376,8 +378,10 @@ def append_new_drama_ids_atomic(missevan_ids: list[str], manbo_ids: list[str]) -
             f"missevan={invalid_missevan}",
             f"manbo={invalid_manbo}",
         )
-    missevan_ids = [str(value) for value in missevan_ids if is_numeric_drama_id(value)]
-    manbo_ids = [str(value) for value in manbo_ids if is_numeric_drama_id(value)]
+    missevan_ids = [str(value) for value in missevan_ids if is_numeric_drama_id(value) and not is_excluded_drama("missevan", value)]
+    manbo_ids = [str(value) for value in manbo_ids if is_numeric_drama_id(value) and not is_excluded_drama("manbo", value)]
+    if not missevan_ids and not manbo_ids:
+        return
     script = r'''
 local raw = redis.call("GET", KEYS[1])
 local queue = {missevan = {}, manbo = {}}
@@ -387,19 +391,23 @@ if raw and raw ~= false and raw ~= "" then
   queue["manbo"] = queue["manbo"] or {}
 end
 
-local function merge(field, additions_json)
+local function merge(field, additions_json, exclusions_json)
+  local blocked = {}
+  for _, value in ipairs(cjson.decode(exclusions_json)) do
+    blocked[tostring(value)] = true
+  end
   local seen = {}
   local merged = {}
   for _, value in ipairs(queue[field] or {}) do
     local text = tostring(value)
-    if string.match(text, "^%d+$") and not seen[text] then
+    if string.match(text, "^%d+$") and not seen[text] and not blocked[text] then
       seen[text] = true
       table.insert(merged, text)
     end
   end
   for _, value in ipairs(cjson.decode(additions_json)) do
     local text = tostring(value)
-    if string.match(text, "^%d+$") and not seen[text] then
+    if string.match(text, "^%d+$") and not seen[text] and not blocked[text] then
       seen[text] = true
       table.insert(merged, text)
     end
@@ -407,8 +415,8 @@ local function merge(field, additions_json)
   queue[field] = merged
 end
 
-merge("missevan", ARGV[1])
-merge("manbo", ARGV[2])
+merge("missevan", ARGV[3], ARGV[1])
+merge("manbo", ARGV[4], ARGV[2])
 local payload = cjson.encode(queue)
 redis.call("SET", KEYS[1], payload)
 return payload
@@ -418,6 +426,8 @@ return payload
         script,
         1,
         QUEUE_KEY,
+        json.dumps(sorted(excluded_drama_ids("missevan"))),
+        json.dumps(sorted(excluded_drama_ids("manbo"))),
         json.dumps([str(value) for value in missevan_ids], ensure_ascii=False),
         json.dumps([str(value) for value in manbo_ids], ensure_ascii=False),
     ])
@@ -1261,7 +1271,7 @@ def extract_ongoing_ids(payload: object) -> set[str]:
 def load_ongoing_drama_ids(platform: str) -> set[str]:
     """Load ongoing drama IDs for one platform from Upstash."""
     key = ONGOING_KEYS[platform]
-    return extract_ongoing_ids(_load_upstash_json(key))
+    return extract_ongoing_ids(_load_upstash_json(key)) - excluded_drama_ids(platform)
 
 
 def merge_rank_and_ongoing_ids(rank_ids, ongoing_ids) -> set[str]:
@@ -1306,7 +1316,7 @@ def collect_current_danmaku_scope_ids(platform: str, latest_payload: dict, ongoi
                 if isinstance(entry, dict)
                 and is_missevan_danmaku_not_required(entry.get("danmaku_uid_count"))
             )
-        return scope
+        return scope - excluded_drama_ids(platform)
 
     if platform == "manbo":
         standard_rank_keys = {
@@ -1321,7 +1331,7 @@ def collect_current_danmaku_scope_ids(platform: str, latest_payload: dict, ongoi
         return merge_rank_and_ongoing_ids(
             collect_manbo_danmaku_target_ids(latest_payload),
             extract_ongoing_ids(ongoing_payload),
-        )
+        ) - excluded_drama_ids(platform)
 
     raise ValueError(f"Unsupported platform: {platform}")
 
@@ -2337,6 +2347,13 @@ def filter_archived_dramas(
     """Remove archived dramas before rank outputs are allowed to publish."""
     if archived_by_platform is None:
         archived_by_platform = load_archived_drama_ids()
+    for platform in PLATFORMS:
+        blocked = excluded_drama_ids(platform)
+        dramas = (store.get(platform) or {}).get("dramas")
+        if isinstance(dramas, dict):
+            for drama_id in blocked:
+                dramas.pop(drama_id, None)
+        remove_drama_ids_from_rank_items(store, platform, blocked)
     for platform, archived_ids in archived_by_platform.items():
         if not archived_ids:
             continue
@@ -2714,6 +2731,8 @@ def collect_null_danmaku_ids_from_layers(
         targets.intersection_update(current_scope)
         sources = {drama_id: sources[drama_id] for drama_id in targets}
 
+    targets.difference_update(excluded_drama_ids(platform))
+    sources = {drama_id: sources[drama_id] for drama_id in targets}
     return targets, sources, payloads
 
 

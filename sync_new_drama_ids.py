@@ -33,6 +33,7 @@ from platform_sync import (
     SERIES_INFO_PATH,
     iter_missevan_nodes,
     is_numeric_drama_id,
+    is_excluded_drama,
     is_target_catalog,
     load_json,
     manbo_has_unknown_main_cv,
@@ -208,8 +209,8 @@ def load_queue() -> dict[str, list[str]]:
     if invalid_manbo or invalid_missevan:
         print(f"[warn] ignored invalid queue IDs: manbo={invalid_manbo} missevan={invalid_missevan}")
     return {
-        "manbo": [value for value in raw_manbo if is_numeric_drama_id(value)],
-        "missevan": [value for value in raw_missevan if is_numeric_drama_id(value)],
+        "manbo": [value for value in raw_manbo if is_numeric_drama_id(value) and not is_excluded_drama("manbo", value)],
+        "missevan": [value for value in raw_missevan if is_numeric_drama_id(value) and not is_excluded_drama("missevan", value)],
     }
 
 
@@ -1042,8 +1043,8 @@ def prune_queue(queue: dict[str, list[str]]) -> dict[str, list[str]]:
 def save_queue(queue: dict[str, list[str]]) -> None:
     payload = json.dumps(
         {
-            "manbo": normalize_ids(queue.get("manbo") or []),
-            "missevan": normalize_ids(queue.get("missevan") or []),
+            platform: [value for value in normalize_ids(queue.get(platform) or []) if not is_excluded_drama(platform, value)]
+            for platform in ("manbo", "missevan")
         },
         ensure_ascii=False,
     )
