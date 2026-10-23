@@ -1324,6 +1324,77 @@ class MissevanIntroCvCandidateTests(unittest.TestCase):
 
 
 class MissevanBatchIntroTests(unittest.TestCase):
+    def test_first_episode_intro_matches_drama_title_in_soundstr(self) -> None:
+        for soundstr in ("一条大河波浪宽", "原创广播剧《一条大河波浪宽》全一期"):
+            with self.subTest(soundstr=soundstr):
+                rows = [{"sound_id": 13768778, "title": soundstr,
+                         "intro": "<p>=CAST=</p><p>张满仓：唱油条@唱油条</p>"
+                                  "<p>何水生：卡修@卡道长</p>"}]
+
+                candidates = refresh_platform_metadata.collect_missevan_episode_intro_candidates(
+                    rows, method="first_episode", drama_title="一条大河波浪宽",
+                )
+
+                self.assertEqual(candidates, [
+                    {"role_name": "张满仓", "display_name": "唱油条"},
+                    {"role_name": "何水生", "display_name": "卡修", "account_name": "卡道长"},
+                ])
+
+    def test_drama_title_matching_requires_nonempty_matching_title_and_cast_section(self) -> None:
+        for drama_title, intro in (
+            ("", "<p>CAST</p><p>角色：CV甲</p>"),
+            ("另一部剧", "<p>CAST</p><p>角色：CV甲</p>"),
+            ("一条大河波浪宽", "<p>角色：CV甲</p>"),
+        ):
+            with self.subTest(drama_title=drama_title, intro=intro):
+                candidates = refresh_platform_metadata.collect_missevan_episode_intro_candidates(
+                    [{"sound_id": 1, "title": "一条大河波浪宽", "intro": intro}],
+                    method="first_episode", drama_title=drama_title,
+                )
+                self.assertEqual(candidates, [])
+
+    def test_96794_refresh_extracts_full_episode_without_extra_title_request(self) -> None:
+        store = {"96794": {"dramaId": 96794, "title": "一条大河波浪宽", "type": 4,
+                           "createTime": "2026.10", "maincvs": [], "cvnames": {}, "cvroles": {}}}
+        requester = Mock()
+        requester.request_json.side_effect = [
+            {"info": {"drama": {"id": 96794, "name": "一条大河波浪宽", "catalog": 89},
+                      "cvs": [], "episodes": {"episode": [
+                          {"name": "全一期", "soundstr": "一条大河波浪宽", "sound_id": 13768778},
+                      ]}}},
+            {"info": {"Datas": [
+                {"id": 13768778, "soundstr": "一条大河波浪宽",
+                 "intro": "<p>=CAST=</p><p>张满仓：唱油条</p><p>何水生：卡修@卡道长</p>"},
+                {"id": 13772669, "soundstr": "一条大河波浪宽番外-今生",
+                 "intro": "<p>=CAST=</p><p>番外角色：其他CV</p>"},
+            ]}},
+        ]
+        combined_map = {name: {"missevanCvId": cv_id, "displayName": name}
+                        for name, cv_id in (("唱油条", 1096), ("卡修", 1166))}
+        with (
+            patch.object(refresh_platform_metadata, "load_json", side_effect=[store, {}]),
+            patch.object(refresh_platform_metadata, "MissevanRequester", return_value=requester),
+            patch.object(refresh_platform_metadata, "load_combined_map", return_value=combined_map),
+            patch.object(refresh_platform_metadata, "_get_missevan_cv_name_map", return_value={}),
+            patch.object(refresh_platform_metadata, "save_missevan_store"),
+            patch.object(refresh_platform_metadata, "save_json"),
+            patch.object(refresh_platform_metadata, "save_combined_map"),
+            patch.object(refresh_platform_metadata, "search_missevan_cv") as search,
+            patch("builtins.print"),
+        ):
+            stats = refresh_platform_metadata.refresh_missevan(
+                target_drama_ids={"96794"}, force=True, update_counts=False,
+            )
+
+        self.assertEqual(stats["processed"], 1)
+        self.assertEqual(store["96794"]["maincvs"], [1096, 1166])
+        self.assertEqual(store["96794"]["cvroles"], {"1096": "张满仓", "1166": "何水生"})
+        self.assertEqual([call.args[0] for call in requester.request_json.call_args_list], [
+            "https://www.missevan.com/dramaapi/getdrama?drama_id=96794",
+            "https://www.missevan.com/dramaapi/getdramaepisodedetails?drama_id=96794&p=1&page_size=100",
+        ])
+        search.assert_not_called()
+
     def test_target_count_is_four_only_for_all_age(self) -> None:
         self.assertEqual(refresh_platform_metadata.missevan_target_main_cv_count(3), 4)
         self.assertEqual(refresh_platform_metadata.missevan_target_main_cv_count(4), 2)

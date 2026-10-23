@@ -931,6 +931,7 @@ def collect_missevan_episode_intro_candidates(
     rows: list[dict],
     *,
     method: str,
+    drama_title: str = "",
     excluded_names: set[str] | None = None,
     candidate_limit: int = 2,
 ) -> list[dict]:
@@ -939,7 +940,12 @@ def collect_missevan_episode_intro_candidates(
     elif method == "preview":
         selected = [row for row in rows if is_missevan_preview_intro_title(row.get("title"))]
     elif method == "first_episode":
-        selected = [row for row in rows if match_first_episode(row.get("title"))][:1]
+        title_key = normalize_match(drama_title)
+        selected = [
+            row for row in rows
+            if match_first_episode(row.get("title"))
+            or (title_key and title_key in normalize_match(row.get("title")))
+        ][:1]
     else:
         raise ValueError(f"Unsupported Missevan intro method: {method}")
 
@@ -1330,6 +1336,7 @@ def refresh_missevan(
                     }
                     first_episode_candidates = collect_missevan_episode_intro_candidates(
                         intro_rows, method="first_episode", excluded_names=used_names,
+                        drama_title=remote_title,
                         candidate_limit=target_main_cv_count - len(missevan_main_cv_entries(updated_node)),
                     )
                     updated_node = apply_missevan_intro_cv_fallback(

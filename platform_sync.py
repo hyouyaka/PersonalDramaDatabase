@@ -45,6 +45,7 @@ UNKNOWN_MAIN_CV_DISPLAY = "暂无"
 # re-import removed works through ongoing feeds or public rankings.
 DRAMA_EXCLUSIONS = {
     "missevan": {
+        "1598": "有你纵使海角天涯",
         "83940": "梅有烦恼事务所",
         "96614": "蛊真人",
         "47577": "浮沉",
