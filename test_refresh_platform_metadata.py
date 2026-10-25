@@ -267,6 +267,46 @@ class MissevanAuthorTests(unittest.TestCase):
 
 
 class ManboCvFallbackTests(unittest.TestCase):
+    def test_fixed_audio_dramas_keep_unknown_cvs_across_repeated_refreshes(self) -> None:
+        payload = {"data": {
+            "title": "平台改名后的作品", "category": 1,
+            "radioDramaCategoryResp": {"name": "广播剧"},
+            "cvRespList": [{"dramaRoleType": 2, "platUid": 1001,
+                            "cvResp": {"id": 1001, "nickname": "平台主役"}, "role": "饰:角色"}],
+        }}
+        for drama_id in ("2241266599933771973", "2274226385121706088"):
+            with self.subTest(drama_id=drama_id):
+                record = {"dramaId": drama_id}
+                for _ in range(2):
+                    record = refresh_platform_metadata.build_manbo_record(record, payload)
+                    self.assertEqual((record["catalog"], record["catalogName"]), (5, "有声剧"))
+                    self.assertEqual(record["mainCvIds"], [])
+                    self.assertEqual(record["mainCvRoleNames"], [])
+                    self.assertEqual(platform_sync.manbo_main_cv_display_names(record), ["暂无"])
+
+    def test_fixed_audio_drama_overrides_apply_even_when_refresh_is_skipped(self) -> None:
+        drama_id = "2241266599933771973"
+        record = {"dramaId": drama_id, "name": "三国演义有声剧", "catalog": 1,
+                  "catalogName": "广播剧", "createTime": "2026.07", "mainCvIds": [1001],
+                  "mainCvNames": ["平台主役"], "author": "罗贯中", "needpay": True, "vipFree": 1}
+        with (
+            patch.object(refresh_platform_metadata, "load_json", return_value={"records": [record]}),
+            patch.object(refresh_platform_metadata, "load_cache", return_value={
+                "counts": {drama_id: {"view_count": 123}}, "_meta": {},
+            }),
+            patch.object(refresh_platform_metadata, "build_manbo_cv_name_map", return_value={}),
+            patch.object(refresh_platform_metadata, "request_manbo_json") as request,
+            patch.object(refresh_platform_metadata, "save_json"),
+            patch.object(refresh_platform_metadata, "save_cache"),
+        ):
+            stats = refresh_platform_metadata.refresh_manbo(force=False)
+
+        self.assertEqual(stats["skipped"], 1)
+        request.assert_not_called()
+        self.assertEqual((record["catalog"], record["catalogName"]), (5, "有声剧"))
+        self.assertEqual(record["mainCvIds"], [])
+        self.assertEqual(platform_sync.manbo_main_cv_display_names(record), ["暂无"])
+
     def test_manual_unknown_cv_marker_overrides_platform_cvs(self) -> None:
         record = refresh_platform_metadata.build_manbo_record(
             {

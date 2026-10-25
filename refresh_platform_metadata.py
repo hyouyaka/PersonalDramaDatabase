@@ -33,6 +33,7 @@ from platform_sync import (
     SQLITE_PATH,
     UNKNOWN_MAIN_CV_MARKER,
     all_sound_ids,
+    apply_manbo_record_field_overrides,
     build_manbo_cv_entries,
     build_missevan_main_cv_entries,
     build_missevan_cv_entries,
@@ -1513,7 +1514,7 @@ def build_manbo_record(record: dict, payload: dict, manbo_cv_name_map: dict[int,
     pricing_category = classify_manbo_pricing(payload or {})
     updated["needpay"] = drama_id in MANBO_PRICING_EXCLUSIONS or pricing_category not in {"free", "100_redbean"}
     updated["vipFree"] = manbo_vip_free_from_payload(payload)
-    return updated
+    return apply_manbo_record_field_overrides(updated)
 
 
 def manbo_vip_free_from_payload(payload: dict) -> int:
@@ -1523,6 +1524,7 @@ def manbo_vip_free_from_payload(payload: dict) -> int:
 
 def finalize_manbo_records(records: list[dict]) -> None:
     for record in records:
+        record.update(apply_manbo_record_field_overrides(record))
         catalog_name = normalize_manbo_catalog_name(record.get("catalogName"))
         if not catalog_name and record.get("catalog") not in (None, ""):
             record["catalogName"] = normalize_manbo_catalog_name(MANBO_CATALOG_NAME_BY_ID.get(int(record["catalog"]), ""))

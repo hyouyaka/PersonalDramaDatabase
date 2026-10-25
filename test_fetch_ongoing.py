@@ -928,6 +928,18 @@ class ManboOngoingPayTypeTests(unittest.TestCase):
 
 
 class ManboOngoingCatalogTests(unittest.TestCase):
+    def test_fixed_audio_dramas_use_daily_category_despite_stale_api_category(self):
+        for drama_id in ("2241266599933771973", "2274226385121706088"):
+            for id_field in ("radioDramaIdStr", "radioDramaId"):
+                with self.subTest(drama_id=drama_id, id_field=id_field):
+                    item = {
+                        "updateSetTitle": "第一集", "workUpdateTimeFormat": "18:00",
+                        "radioDramaResp": {id_field: drama_id if id_field.endswith("Str") else int(drama_id),
+                                           "title": "平台改名后的作品", "category": 1, "price": 100},
+                    }
+                    records = fetch_ongoing.collect_manbo_records_from_items([item])
+                    self.assertEqual(records, {drama_id: {"dramaId": drama_id, "updateType": "daily"}})
+
     def test_uses_title_override_when_time_page_category_is_stale(self):
         item = {
             "updateSetTitle": "🎂·陈挽day·04",

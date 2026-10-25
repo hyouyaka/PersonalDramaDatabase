@@ -16,6 +16,7 @@ import requests
 
 from platform_sync import (
     MANBO_CATALOG_OVERRIDES,
+    MANBO_RECORD_FIELD_OVERRIDES,
     MISSEVAN_HEADERS,
     MissevanRequester,
     is_numeric_drama_id,
@@ -825,6 +826,10 @@ def manbo_item_allowed(item: dict) -> bool:
 
 def manbo_ongoing_category(item: dict) -> int:
     drama = item.get("radioDramaResp") or {}
+    drama_id = drama.get("radioDramaIdStr") or drama.get("radioDramaId")
+    record_override = MANBO_RECORD_FIELD_OVERRIDES.get(str(drama_id or ""))
+    if record_override is not None:
+        return safe_int(record_override.get("catalog"))
     title = normalize(drama.get("title"))
     override = MANBO_CATALOG_OVERRIDES.get(title) if title else None
     if override is not None:

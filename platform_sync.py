@@ -73,6 +73,24 @@ def is_excluded_drama(platform: str, drama_id: object) -> bool:
 MANBO_CATALOG_OVERRIDES = {
     "奇洛李维斯回信": {"catalog": 5, "catalogName": "有声剧"},
 }
+MANBO_RECORD_FIELD_OVERRIDES = {
+    drama_id: {
+        "catalog": 5,
+        "catalogName": "有声剧",
+        "mainCvIds": [],
+        "mainCvNicknames": [UNKNOWN_MAIN_CV_MARKER],
+        "mainCvNames": [UNKNOWN_MAIN_CV_MARKER],
+        "mainCvRoleNames": [],
+    }
+    for drama_id in ("2241266599933771973", "2274226385121706088")
+}
+
+
+def apply_manbo_record_field_overrides(record: dict) -> dict:
+    override = MANBO_RECORD_FIELD_OVERRIDES.get(str(record.get("dramaId") or "").strip())
+    return {**record, **deepcopy(override)} if override else record
+
+
 CATALOG_SUFFIX_BY_NAME = {
     "广播剧": "广播剧",
     "有声剧": "有声剧",
