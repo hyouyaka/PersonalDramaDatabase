@@ -854,6 +854,31 @@ class MissevanWeekdayCacheTests(unittest.TestCase):
 
 
 class ManboOngoingPayTypeTests(unittest.TestCase):
+    def test_keeps_welfare_mini_theater_and_birthday_updates(self):
+        for title in ("福利音频", "小剧场·番外", "赵声阁生日快乐（2026ver.）"):
+            with self.subTest(title=title):
+                item = {
+                    "updateSetTitle": title, "workUpdateTimeFormat": "18:00",
+                    "radioDramaResp": {"radioDramaIdStr": "1955825512983036032",
+                                       "title": "奇洛李维斯回信", "category": 1, "price": 2340},
+                }
+                self.assertEqual(fetch_ongoing.collect_manbo_records_from_items([item]), {
+                    "1955825512983036032": {"dramaId": "1955825512983036032", "updateType": "daily"},
+                })
+
+    def test_special_update_titles_still_require_payment_time_and_non_single_episode(self):
+        cases = (
+            ("18:00", 0, [], False),
+            ("21:00", 100, [], False),
+            ("18:00", 100, [{"name": "全一期"}], False),
+            ("18:00", 100, [], True),
+        )
+        for time, price, labels, expected in cases:
+            with self.subTest(time=time, price=price, labels=labels):
+                item = {"updateSetTitle": "生日小剧场福利", "workUpdateTimeFormat": time,
+                        "radioDramaResp": {"price": price, "categoryLabels": labels}}
+                self.assertEqual(fetch_ongoing.manbo_item_allowed(item), expected)
+
     def test_does_not_treat_timeline_item_id_as_drama_id(self):
         item = {
             "id": 201,

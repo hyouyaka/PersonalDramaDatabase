@@ -43,7 +43,6 @@ MANBO_TIME_DETAIL_URL = (
     "https://api.kilamanbo.com/api/v530/radio/drama/new/time/detail"
     "?date={timestamp}&pageNo=1&pageSize=100&type=105"
 )
-BLOCKED_UPDATE_TITLE_WORDS = ("福利", "小剧场", "生日")
 MISSEVAN_DAILY_VIEW_THRESHOLD = 100
 MISSEVAN_DAILY_COMMENT_THRESHOLD = 20
 MISSEVAN_WEEKDAY_BY_LABEL = {
@@ -816,9 +815,6 @@ def manbo_update_time_allowed(value: object) -> bool:
 
 
 def manbo_item_allowed(item: dict) -> bool:
-    title = str(item.get("updateSetTitle") or "")
-    if any(word in title for word in BLOCKED_UPDATE_TITLE_WORDS):
-        return False
     if "全一期" in manbo_labels(item):
         return False
     return is_paid_manbo_ongoing_item(item) and manbo_update_time_allowed(item.get("workUpdateTimeFormat"))
