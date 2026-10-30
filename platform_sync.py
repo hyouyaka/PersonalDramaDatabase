@@ -808,6 +808,10 @@ def finalize_series_titles(records: list[dict], *, title_key: str, catalog_key: 
 
 
 class MissevanRequester:
+    # Retry temporary transport/server failures here, separately from the
+    # caller's 403 archive checks. All retries share the same bounded budget.
+    RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
     def __init__(self, *, base_delay: float = 2.6, jitter: float = 1.2, max_retries: int = 3) -> None:
         self.base_delay = base_delay
         self.jitter = jitter
@@ -822,12 +826,18 @@ class MissevanRequester:
             self.request_count += 1
             try:
                 response = requests.get(url, headers=MISSEVAN_HEADERS, timeout=30)
-            except requests.RequestException:
+                if response.status_code in self.RETRYABLE_HTTP_STATUSES:
+                    response.raise_for_status()
+            except requests.RequestException as exc:
                 attempt += 1
                 if attempt > self.max_retries:
                     raise
                 backoff = min(120.0, 12.0 * (2 ** (attempt - 1)) + random.random() * 5.0)
                 self.last_backoff_seconds = backoff
+                print(
+                    f"[猫耳] {type(exc).__name__}: {exc}; "
+                    f"{backoff:.1f}秒后重试 ({attempt}/{self.max_retries})"
+                )
                 time.sleep(backoff)
                 continue
             if response.status_code != 418:

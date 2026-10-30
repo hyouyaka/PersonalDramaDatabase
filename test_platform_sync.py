@@ -109,6 +109,77 @@ class ManboCvEntryTests(unittest.TestCase):
 
 
 class MissevanRequesterRetryTests(unittest.TestCase):
+    @staticmethod
+    def response(status: int) -> requests.Response:
+        response = requests.Response()
+        response.status_code = status
+        response.url = "https://www.missevan.com/dramaapi/getdrama?drama_id=39622"
+        response._content = b'{"ok": true}'
+        return response
+
+    def test_temporary_http_errors_retry_then_return_payload(self) -> None:
+        for status in (408, 429, 500, 502, 503, 504):
+            with self.subTest(status=status):
+                requester = platform_sync.MissevanRequester(base_delay=0, jitter=0)
+                with (
+                    patch.object(platform_sync.time, "sleep") as sleep,
+                    patch.object(platform_sync.random, "random", return_value=0),
+                    patch.object(platform_sync.requests, "get", side_effect=[self.response(status), self.response(200)]) as get,
+                    patch("builtins.print") as log,
+                ):
+                    self.assertEqual(requester.request_json("https://example.test"), {"ok": True})
+
+                self.assertEqual(get.call_count, 2)
+                self.assertEqual(requester.request_count, 2)
+                self.assertEqual(requester.last_backoff_seconds, 0)
+                self.assertEqual([args.args[0] for args in sleep.call_args_list], [0, 12, 0])
+                self.assertIn(str(status), log.call_args.args[0])
+
+    def test_persistent_504_stops_after_three_retries_and_preserves_http_error(self) -> None:
+        requester = platform_sync.MissevanRequester(base_delay=0, jitter=0)
+        response = self.response(504)
+        with (
+            patch.object(platform_sync.time, "sleep") as sleep,
+            patch.object(platform_sync.random, "random", return_value=0),
+            patch.object(platform_sync.requests, "get", return_value=response) as get,
+            patch("builtins.print"),
+        ):
+            with self.assertRaises(requests.HTTPError) as raised:
+                requester.request_json(response.url)
+
+        self.assertIs(raised.exception.response, response)
+        self.assertEqual(get.call_count, 4)
+        self.assertEqual(requester.request_count, 4)
+        self.assertEqual([args.args[0] for args in sleep.call_args_list], [0, 12, 0, 24, 0, 48, 0])
+
+    def test_permanent_http_errors_do_not_retry_in_requester(self) -> None:
+        for status in (400, 401, 403, 404, 501):
+            with self.subTest(status=status):
+                requester = platform_sync.MissevanRequester(base_delay=0, jitter=0)
+                with (
+                    patch.object(platform_sync.time, "sleep") as sleep,
+                    patch.object(platform_sync.requests, "get", return_value=self.response(status)) as get,
+                ):
+                    with self.assertRaises(requests.HTTPError):
+                        requester.request_json("https://example.test")
+
+                self.assertEqual(get.call_count, 1)
+                sleep.assert_called_once_with(0)
+
+    def test_mixed_connection_http_and_418_failures_share_retry_budget(self) -> None:
+        requester = platform_sync.MissevanRequester(base_delay=0, jitter=0)
+        with (
+            patch.object(platform_sync.time, "sleep"),
+            patch.object(platform_sync.requests, "get", side_effect=[
+                requests.ConnectionError("dns"), self.response(504), self.response(418), self.response(418),
+            ]) as get,
+            patch("builtins.print"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "^HTTP_418$"):
+                requester.request_json("https://example.test")
+
+        self.assertEqual(get.call_count, 4)
+
     def test_request_json_retries_transient_connection_errors(self) -> None:
         requester = platform_sync.MissevanRequester(base_delay=0, jitter=0, max_retries=2)
         response = Mock()

@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
+import requests
+
 import refresh_watch_counts
 
 
@@ -191,6 +193,21 @@ class RefreshWatchCountsCliTests(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 refresh_watch_counts.main([])
+
+    def test_parallel_http_failure_does_not_publish_incomplete_refresh(self) -> None:
+        response = requests.Response()
+        response.status_code = 504
+        error = requests.HTTPError("Gateway Time-out", response=response)
+        with (
+            patch.object(refresh_watch_counts, "sync_remote_watchcount_if_newer"),
+            patch.object(refresh_watch_counts, "run_missevan_refresh", side_effect=error),
+            patch.object(refresh_watch_counts, "run_manbo_refresh", return_value={"processed": 380}),
+            patch.object(refresh_watch_counts, "publish_refresh_results") as publish,
+        ):
+            with self.assertRaises(requests.HTTPError):
+                refresh_watch_counts.main(["--refresh-all"])
+
+        publish.assert_not_called()
 
     def test_default_all_mode_syncs_and_uploads_both_watchcount_platforms(self) -> None:
         with (
@@ -577,6 +594,41 @@ class ArchiveRetryQueueTests(unittest.TestCase):
 
 
 class InfoRefreshTests(unittest.TestCase):
+    def test_exhausted_504_saves_completed_progress_without_archiving_failed_drama(self) -> None:
+        store = {
+            "100": {"dramaId": "100", "title": "已完成", "createTime": "2026-01"},
+            "39622": {"dramaId": "39622", "title": "网关超时", "createTime": "2026-01"},
+        }
+        cache = {"_meta": {}, "counts": {
+            "39622": {"name": "网关超时", "view_count": 123, "fetched_at": "2026-10-22T00:00:00+00:00"},
+        }}
+        previous = dict(cache["counts"]["39622"])
+        success = requests.Response()
+        success.status_code = 200
+        success._content = b'{"info": {"drama": {"name": "completed", "view_count": 10}}}'
+        failure = requests.Response()
+        failure.status_code = 504
+        failure.url = "https://www.missevan.com/dramaapi/getdrama?drama_id=39622"
+        with (
+            patch.object(refresh_watch_counts, "load_json", return_value=store),
+            patch.object(refresh_watch_counts, "load_cache", return_value=cache),
+            patch.object(refresh_watch_counts, "save_cache") as save_counts,
+            patch.object(refresh_watch_counts, "save_missevan_store") as save_info,
+            patch.object(refresh_watch_counts, "apply_local_archive_candidates") as archive,
+            patch("platform_sync.time.sleep"),
+            patch("platform_sync.requests.get", side_effect=[success, failure, failure, failure, failure]) as get,
+            patch("builtins.print"),
+        ):
+            with self.assertRaises(requests.HTTPError):
+                refresh_watch_counts.refresh_missevan_watch_counts(refresh_all=True)
+
+        self.assertEqual(get.call_count, 5)
+        self.assertEqual(cache["counts"]["100"]["view_count"], 10)
+        self.assertEqual(cache["counts"]["39622"], previous)
+        save_counts.assert_called_once_with(refresh_watch_counts.MISSEVAN_COUNTS_PATH, cache)
+        save_info.assert_called_once_with(refresh_watch_counts.MISSEVAN_INFO_PATH, store)
+        archive.assert_not_called()
+
     def test_refresh_all_backfills_missing_missevan_create_time_and_records_observation(self) -> None:
         store = {"100": {"dramaId": "100", "title": "猫耳测试", "createTime": ""}}
         requester = Mock()
