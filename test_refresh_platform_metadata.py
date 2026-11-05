@@ -1,10 +1,12 @@
 import unittest
+from copy import deepcopy
 from unittest.mock import Mock, patch
 
 import refresh_platform_metadata
 import platform_sync
 
 
+@patch.dict(refresh_platform_metadata.ARCHIVE_ENABLED, {"missevan": False})
 class Missevan403FallbackTests(unittest.TestCase):
     @staticmethod
     def http_error(status: int) -> Exception:
@@ -29,7 +31,7 @@ class Missevan403FallbackTests(unittest.TestCase):
             patch.object(refresh_platform_metadata, "load_cache", return_value=cache),
             patch.object(refresh_platform_metadata, "MissevanRequester", return_value=requester),
             patch.object(refresh_platform_metadata, "ARCHIVE_RETRY_DELAYS", (0, 0, 0)),
-            patch.object(refresh_platform_metadata, "archive_missevan_node") as archive_node,
+            patch.object(refresh_platform_metadata, "apply_local_archive_candidates") as archive_node,
             patch.object(refresh_platform_metadata, "remove_missevan_node") as remove_node,
             patch.object(refresh_platform_metadata, "save_missevan_store"),
             patch.object(refresh_platform_metadata, "save_json"),
@@ -87,6 +89,202 @@ class Missevan403FallbackTests(unittest.TestCase):
         self.assertEqual(request_ids, ["100", "101", "100", "100", "100"])
         self.assertEqual(stats["processed"], 1)
         self.assertEqual(stats["failed"], 1)
+
+
+class MissevanPvMainCvRegressionTests(unittest.TestCase):
+    def test_96920_pv_refresh_preserves_all_four_main_cvs(self) -> None:
+        cast = [
+            (4084, "三石", "温青", 1),
+            (3349, "赵成晨", "云霁", 1),
+            (3790, "史泽鲲", "宋遥临", 1),
+            (3363, "刘一鸣", "沈翊", 1),
+            (4940, "余昊威", "旁白", 2),
+        ]
+        cvs = [{"cv_info": {"id": cv_id, "name": name}, "character": role, "main": main}
+               for cv_id, name, role, main in cast]
+        for create_time in ("", "2026.10"):
+            with self.subTest(create_time=create_time):
+                store = {"96920": {
+                    "dramaId": 96920, "title": "当我被迫剖丹后", "type": 4,
+                    "createTime": create_time, "maincvs": [4084, 3349],
+                    "cvnames": {"4084": "三石", "3349": "赵成晨"},
+                }}
+                requester = Mock(request_count=2, last_backoff_seconds=0)
+                requester.request_json.side_effect = [
+                    {"info": {
+                        "drama": {"id": 96920, "name": "当我被迫剖丹后", "catalog": 93},
+                        "cvs": cvs,
+                        "episodes": {"episode": [{
+                            "sound_id": 13840641, "soundstr": "《当我被迫剖丹后》| 概念PV",
+                            "name": "【PV】",
+                        }]},
+                    }},
+                    {"info": {"drama": {"id": 96920}, "cvs": cvs}},
+                ]
+                with (
+                    patch.object(refresh_platform_metadata, "load_json", side_effect=[store, {}]),
+                    patch.object(refresh_platform_metadata, "MissevanRequester", return_value=requester),
+                    patch.object(refresh_platform_metadata, "_get_missevan_cv_name_map", return_value={}),
+                    patch.object(refresh_platform_metadata, "save_missevan_store") as save_store,
+                    patch.object(refresh_platform_metadata, "save_json"),
+                    patch.object(refresh_platform_metadata, "fetch_missevan_episode_intro_rows") as intro,
+                    patch("builtins.print"),
+                ):
+                    stats = refresh_platform_metadata.refresh_missevan(
+                        target_drama_ids={"96920"}, force=True, update_counts=False,
+                    )
+
+                self.assertEqual(stats["processed"], 1)
+                self.assertEqual(requester.request_json.call_count, 2)
+                self.assertEqual(requester.request_json.call_args.args[0],
+                                 "https://www.missevan.com/dramaapi/getdramabysound?sound_id=13840641")
+                self.assertEqual(store["96920"]["maincvs"], [4084, 3349, 3790, 3363])
+                self.assertEqual(store["96920"]["cvnames"],
+                                 {str(cv_id): name for cv_id, name, _, main in cast if main == 1})
+                self.assertEqual(store["96920"]["cvroles"],
+                                 {str(cv_id): role for cv_id, _, role, main in cast if main == 1})
+                self.assertEqual(save_store.call_args.args[1]["96920"]["maincvs"],
+                                 [4084, 3349, 3790, 3363])
+                intro.assert_not_called()
+
+
+class MissevanIdentityAndMainCvTests(unittest.TestCase):
+    @staticmethod
+    def cvs(rows):
+        return [{"cv_info": {"id": cv_id, "name": name}, "character": role, "main": main}
+                for cv_id, name, role, main in rows]
+
+    def refresh(self, store, payloads, *, raises=False, intro_rows=None):
+        drama_id = next(iter(store))
+        cache = {"_meta": {}, "counts": {drama_id: {"name": "原记录", "view_count": 123}}}
+        requester = Mock(request_count=len(payloads), last_backoff_seconds=0)
+        requester.request_json.side_effect = payloads
+        with (
+            patch.object(refresh_platform_metadata, "load_json", side_effect=[store, {}]),
+            patch.object(refresh_platform_metadata, "load_cache", return_value=cache),
+            patch.object(refresh_platform_metadata, "MissevanRequester", return_value=requester),
+            patch.object(refresh_platform_metadata, "_get_missevan_cv_name_map", return_value={}),
+            patch.object(refresh_platform_metadata, "load_combined_map", return_value={}),
+            patch.object(refresh_platform_metadata, "save_combined_map"),
+            patch.object(refresh_platform_metadata, "save_missevan_store") as save_store,
+            patch.object(refresh_platform_metadata, "save_json"),
+            patch.object(refresh_platform_metadata, "save_cache"),
+            patch.object(refresh_platform_metadata, "apply_local_archive_candidates") as archive,
+            patch.object(refresh_platform_metadata, "fetch_missevan_episode_intro_rows",
+                         return_value=intro_rows or []) as intro,
+            patch.object(refresh_platform_metadata, "search_missevan_cv",
+                         side_effect=AssertionError("Unexpected CV search")),
+            patch("builtins.print"),
+        ):
+            if raises:
+                with self.assertRaisesRegex(RuntimeError, "ResponseDramaMismatch"):
+                    refresh_platform_metadata.refresh_missevan(target_drama_ids={drama_id})
+            else:
+                stats = refresh_platform_metadata.refresh_missevan(target_drama_ids={drama_id})
+                self.assertEqual(stats["processed"], 1)
+        archive.assert_not_called()
+        return requester, cache, save_store, intro
+
+    def test_41163_merges_all_previews_and_first_episode_in_all_genres(self):
+        cast = {
+            929: ("谢添天", "司马懿"), 936: ("吴磊", "曹操"), 1111: ("斑马", "刘协"),
+            928: ("沈磊", "荀彧"), 2431: ("杨天翔", "孙权"), 1013: ("阿杰", "周瑜"),
+            1019: ("季冠霖", "孙尚香"), 942: ("夏磊", "诸葛亮"), 1025: ("赵岭", "刘备"),
+            3058: ("赵乾景", "曹丕"), 1183: ("苏尚卿", "曹植"), 1417: ("彭尧", "关羽"),
+            1040: ("赵毅", "张飞"), 3349: ("赵成晨", "吕蒙"),
+            632: ("山新", "小乔"), 2723: ("刘琮", "夏侯惇"),
+        }
+        preview_ids = list(cast)[:12]
+        first_ids = [929, 942, 1040, 1025, 1013, 3349, 632, 936, 2723, 1111]
+
+        def entries(ids):
+            return self.cvs([(i, *cast[i], 1) for i in ids])
+
+        for genre in (3, 4, 6):
+            with self.subTest(genre=genre):
+                store = {"41163": {"dramaId": 41163, "title": "三分星野 第二季",
+                                   "type": genre, "createTime": "2021.10", "maincvs": first_ids[:]}}
+                payloads = [
+                    {"info": {"drama": {"id": 41163, "name": "三分星野 第二季", "catalog": 89},
+                              "cvs": entries(list(cast)), "episodes": {"episode": [
+                                  {"sound_id": 3971646, "soundstr": "剧情先导PV"},
+                                  {"sound_id": 3971647, "soundstr": "预告二"},
+                                  {"sound_id": 4000000, "soundstr": "前采①"},
+                                  {"sound_id": 4067809, "soundstr": "第一集"},
+                              ]}}},
+                    {"info": {"drama": {"id": "41163"}, "cvs": entries(preview_ids)}},
+                    {"info": {"drama": {"id": 41163}, "cvs": entries([929, 936, 929])}},
+                    {"info": {"drama": {"id": 41163}, "cvs": entries(first_ids)
+                              + self.cvs([(999, "非主役", "旁白", 2)])}},
+                ]
+                requester, _cache, saved, intro = self.refresh(store, payloads)
+                node = store["41163"]
+                self.assertEqual(node["maincvs"], list(cast))
+                self.assertEqual(node["cvnames"], {str(i): name for i, (name, _) in cast.items()})
+                self.assertEqual(node["cvroles"], {str(i): role for i, (_, role) in cast.items()})
+                self.assertEqual(saved.call_args.args[1]["41163"]["maincvs"], list(cast))
+                self.assertEqual([c.args[0] for c in requester.request_json.call_args_list], [
+                    "https://www.missevan.com/dramaapi/getdrama?drama_id=41163",
+                    "https://www.missevan.com/dramaapi/getdramabysound?sound_id=3971646",
+                    "https://www.missevan.com/dramaapi/getdramabysound?sound_id=3971647",
+                    "https://www.missevan.com/dramaapi/getdramabysound?sound_id=4067809",
+                ])
+                intro.assert_not_called()
+
+    def test_missing_or_wrong_detail_preview_or_first_episode_id_preserves_record(self):
+        cvs = self.cvs([(21, "主役甲", "角色甲", 1), (22, "主役乙", "角色乙", 1)])
+        for stage in range(4):
+            for returned_id in (None, 15326):
+                with self.subTest(stage=stage, returned_id=returned_id):
+                    store = {"100": {"dramaId": 100, "title": "原剧", "type": 4,
+                                     "createTime": "2026.01", "maincvs": [21, 22],
+                                     "cvnames": {"21": "主役甲", "22": "主役乙"},
+                                     "cvroles": {"21": "角色甲", "22": "角色乙"}}}
+                    original = deepcopy(store)
+                    payloads = [
+                        {"info": {"drama": {"id": 100, "name": "目标剧", "catalog": 89},
+                                  "cvs": cvs, "episodes": {"episode": [
+                                      {"sound_id": 11, "soundstr": "预告"},
+                                      {"sound_id": 13, "soundstr": "预告二"},
+                                      {"sound_id": 12, "soundstr": "第一集"},
+                                  ]}}},
+                        {"info": {"drama": {"id": 100}, "cvs": cvs}},
+                        {"info": {"drama": {"id": 100}, "cvs": cvs}},
+                        {"info": {"drama": {"id": 100}, "cvs": cvs}},
+                    ]
+                    if returned_id is None:
+                        payloads[stage]["info"]["drama"].pop("id")
+                    else:
+                        payloads[stage]["info"]["drama"]["id"] = returned_id
+                    requester, cache, saved, intro = self.refresh(store, payloads, raises=True)
+                    self.assertEqual(store, original)
+                    self.assertEqual(cache["counts"]["100"], {"name": "原记录", "view_count": 123})
+                    self.assertEqual(saved.call_args.args[1], original)
+                    self.assertEqual(requester.request_json.call_count, stage + 1)
+                    intro.assert_not_called()
+
+    def test_first_sound_reused_for_date_and_main_cvs_without_duplicate_request(self):
+        store = {"100": {"dramaId": 100, "title": "目标剧", "type": 4, "createTime": ""}}
+        cvs = self.cvs([(21, "甲", "角色甲", 1), (22, "乙", "角色乙", 1)])
+        requester, _cache, _saved, intro = self.refresh(store, [
+            {"info": {"drama": {"id": 100, "name": "目标剧", "catalog": 89},
+                      "cvs": cvs, "episodes": {"episode": [{"sound_id": 12, "soundstr": "第一集"}]}}},
+            {"info": {"drama": {"id": 100}, "cvs": cvs}},
+        ])
+        self.assertEqual(requester.request_json.call_count, 2)
+        self.assertEqual(store["100"]["maincvs"], [21, 22])
+        intro.assert_not_called()
+
+    def test_intro_fallback_ignores_sounds_outside_validated_drama(self):
+        store = {"100": {"dramaId": 100, "title": "目标剧", "type": 4, "createTime": "2026.01"}}
+        requester, _cache, _saved, intro = self.refresh(store, [
+            {"info": {"drama": {"id": 100, "name": "目标剧", "catalog": 89},
+                      "episodes": {"episode": [{"sound_id": 11, "soundstr": "普通内容"}]}}},
+        ], intro_rows=[{"sound_id": 99, "title": "声展 · 外剧角色",
+                        "intro": "<p>CAST</p><p>外剧角色：外剧CV</p>"}])
+        self.assertEqual(store["100"]["maincvs"], [])
+        self.assertEqual(requester.request_json.call_count, 1)
+        intro.assert_called_once()
 
 
 class FirstEpisodeMonthTests(unittest.TestCase):
@@ -274,7 +472,7 @@ class ManboCvFallbackTests(unittest.TestCase):
             "cvRespList": [{"dramaRoleType": 2, "platUid": 1001,
                             "cvResp": {"id": 1001, "nickname": "平台主役"}, "role": "饰:角色"}],
         }}
-        for drama_id in ("2241266599933771973", "2274226385121706088"):
+        for drama_id in ("2241266599933771973",):
             with self.subTest(drama_id=drama_id):
                 record = {"dramaId": drama_id}
                 for _ in range(2):
@@ -283,6 +481,38 @@ class ManboCvFallbackTests(unittest.TestCase):
                     self.assertEqual(record["mainCvIds"], [])
                     self.assertEqual(record["mainCvRoleNames"], [])
                     self.assertEqual(platform_sync.manbo_main_cv_display_names(record), ["暂无"])
+
+    def test_hongloumeng_preserves_three_canonical_cvs_across_repeated_refreshes(self) -> None:
+        identities = [
+            (7783, 2344848470068, "刘蕊", "刘蕊R-L", "林黛玉"),
+            (1111, 1920970620966, "斑马", "配音演员斑马", "贾宝玉"),
+            (3954, 3129033830432, "刘颐诺", "颐诺是溜溜晴儿", "薛宝钗"),
+        ]
+        combined_map = {
+            name: {"missevanCvId": cat_id, "manboCvId": manbo_id,
+                   "displayName": name, "aliases": [nickname]}
+            for cat_id, manbo_id, name, nickname, _role in identities
+        }
+        payload = {"data": {
+            "title": "红楼梦有声剧", "category": 1,
+            "categoryLabels": [{"name": "全年龄"}],
+            "cvRespList": [
+                {"dramaRoleType": 2, "cvNickname": nickname,
+                 "cvResp": {"id": manbo_id, "nickname": nickname}, "role": f"饰:{role}"}
+                for _cat_id, manbo_id, _name, nickname, role in identities
+            ],
+        }}
+        record = {"dramaId": "2274226385121706088"}
+        with patch.object(refresh_platform_metadata, "load_combined_map", return_value=combined_map):
+            name_map = refresh_platform_metadata.build_manbo_cv_name_map()
+        for _ in range(2):
+            record = refresh_platform_metadata.build_manbo_record(record, payload, name_map)
+            refresh_platform_metadata.finalize_manbo_records([record])
+            self.assertEqual((record["catalog"], record["catalogName"]), (5, "有声剧"))
+            self.assertEqual(record["mainCvIds"], [row[1] for row in identities])
+            self.assertEqual(record["mainCvNames"], [row[2] for row in identities])
+            self.assertEqual(record["mainCvNicknames"], [row[3] for row in identities])
+            self.assertEqual(record["mainCvRoleNames"], [row[4] for row in identities])
 
     def test_fixed_audio_drama_overrides_apply_even_when_refresh_is_skipped(self) -> None:
         drama_id = "2241266599933771973"
@@ -1510,11 +1740,27 @@ class MissevanBatchIntroTests(unittest.TestCase):
             excluded_names={refresh_platform_metadata.normalize_match("已有CV")},
         )
 
-        self.assertEqual([item["display_name"] for item in candidates], ["CV乙", "CV丙"])
+        self.assertEqual([item["display_name"] for item in candidates], ["CV丙", "CV丁"])
+
+    def test_theme_song_is_not_a_preview_intro(self) -> None:
+        self.assertFalse(refresh_platform_metadata.is_missevan_preview_intro_title("《作品》主题曲"))
+        candidates = refresh_platform_metadata.collect_missevan_episode_intro_candidates(
+            [{"sound_id": 20, "title": "主题曲", "intro": "<p>配音组</p><p>角色乙：CV乙</p>"}],
+            method="preview",
+        )
+        self.assertEqual(candidates, [])
 
     def test_preview_title_matches_kv_case_insensitively(self) -> None:
         self.assertTrue(refresh_platform_metadata.is_missevan_preview_intro_title("角色KV"))
         self.assertTrue(refresh_platform_metadata.is_missevan_preview_intro_title("角色kv"))
+
+    def test_preview_intro_and_sound_selection_share_title_rules(self) -> None:
+        for title in ("概念PV", "【pv】", "角色KV", "角色kv", "先导篇", "主题曲", "预告", "Preview", "第一集"):
+            with self.subTest(title=title):
+                self.assertEqual(
+                    refresh_platform_metadata.is_missevan_preview_intro_title(title),
+                    platform_sync.is_missevan_preview_title(title),
+                )
 
     def test_all_age_keeps_direct_cvs_then_fills_showcase_and_preview_to_four(self) -> None:
         combined_map = {}

@@ -6,6 +6,39 @@ import append_missevan_ids
 
 
 class AppendInfoBackupTests(unittest.TestCase):
+    def test_missevan_publishes_metadata_archives_before_merging_fresh_info(self) -> None:
+        candidates = {"100": {"archivedAt": "2026-11-05T00:00:00+00:00", "archivedReason": "HTTP_403"}}
+        calls = Mock()
+        with (
+            patch.object(append_missevan_ids, "load_env_file"),
+            patch.object(append_missevan_ids, "download_info_file"),
+            patch.object(append_missevan_ids, "download_support_files"),
+            patch.object(append_missevan_ids, "seed_generated_missevan_cvid_registry", return_value=0),
+            patch.object(append_missevan_ids, "load_generated_missevan_cvid_replacements", return_value={}),
+            patch.object(append_missevan_ids, "upsert_missevan_drama_ids", return_value={
+                "processed": 1, "request_count": 5, "last_backoff_seconds": 0,
+                "archive_candidates": candidates,
+            }),
+            patch.object(append_missevan_ids, "publish_archive_candidates") as publish,
+            patch.object(append_missevan_ids, "load_json", return_value={}),
+            patch.object(append_missevan_ids, "update_combined_cvid_map", return_value={
+                "updated": 0, "created": 0, "unchanged": 0, "ambiguous_count": 0,
+                "ambiguous_samples": [], "missevan_generated_replacements": {},
+            }),
+            patch.object(append_missevan_ids, "merge_and_upload_info_file") as merge,
+            patch("builtins.print"),
+        ):
+            calls.attach_mock(publish, "publish")
+            calls.attach_mock(merge, "merge")
+            self.assertEqual(append_missevan_ids.main(["append_missevan_ids.py", "100", "101"]), 0)
+
+        self.assertEqual(calls.mock_calls, [
+            call.publish("missevan", candidates, upstash=append_missevan_ids.upstash_request,
+                         sync_local_watchcount=False, sync_local_info=False),
+            call.merge(append_missevan_ids.MISSEVAN_INFO_KEY, append_missevan_ids.MISSEVAN_INFO_PATH,
+                       ["100", "101"]),
+        ])
+
     def test_append_manbo_rejects_non_numeric_id_before_any_remote_work(self) -> None:
         with (
             patch.object(append_manbo_ids, "load_env_file") as load_env,

@@ -26,6 +26,7 @@ from platform_sync import (
     MISSEVAN_INFO_PATH,
     MissevanRequester,
     all_sound_ids,
+    checked_missevan_info,
     first_main_episode_sound_id,
     iter_missevan_nodes,
     load_cache,
@@ -152,7 +153,9 @@ def missevan_create_time_observation(info: dict, requester: MissevanRequester) -
     payload = requester.request_json(
         f"https://www.missevan.com/dramaapi/getdramabysound?sound_id={sound_id}"
     )
-    sound_info = (payload or {}).get("info") or {}
+    sound_info = checked_missevan_info(
+        payload, normalize((info.get("drama") or {}).get("id")), sound_id=sound_id,
+    )
     return missevan_episode_create_month(
         (sound_info.get("episodes") or {}).get("episode") or []
     )
@@ -463,7 +466,7 @@ def refresh_missevan_watch_counts(
     def on_success(drama_id: str, payload: dict) -> None:
         nonlocal processed, pricing_skipped
         nonlocal create_time_checked, create_time_updated, create_time_still_missing
-        info = (payload or {}).get("info") or {}
+        info = checked_missevan_info(payload, drama_id)
         drama = info.get("drama") or {}
         pricing_fields, pricing_complete = missevan_pricing_observation(drama)
         info_fields = dict(pricing_fields)

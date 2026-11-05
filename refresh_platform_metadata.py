@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from urllib.parse import quote
 
 from clean_manbo_pricing import MANBO_PRICING_EXCLUSIONS, classify_manbo_pricing
-from archive_manager import ARCHIVE_ENABLED, ARCHIVE_RETRY_DELAYS
+from archive_manager import ARCHIVE_ENABLED, ARCHIVE_RETRY_DELAYS, apply_local_archive_candidates
 from cvid_map_tools import (
     ensure_generated_missevan_cv_entry,
     ensure_name_only_cv_entry,
@@ -37,12 +37,14 @@ from platform_sync import (
     build_manbo_cv_entries,
     build_missevan_main_cv_entries,
     build_missevan_cv_entries,
+    checked_missevan_info,
     finalize_series_titles,
     first_main_episode_sound_id,
     infer_type_from_labels,
     is_narrator_role,
     is_numeric_drama_id,
     is_excluded_drama,
+    is_missevan_preview_title,
     match_first_episode,
     is_target_catalog,
     iter_missevan_nodes,
@@ -71,7 +73,6 @@ from refresh_watch_counts import run_archive_retry_queue
 
 
 MISSEVAN_BLOCKLIST = {"47639", "25812"}
-MISSEVAN_ARCHIVED_INFO_PATH = MISSEVAN_INFO_PATH.with_name("missevan-archived-drama.json")
 MISSEVAN_INTRO_CV_SECTION_PATTERN = re.compile(
     r"^(?:[^A-Za-z0-9\u4e00-\u9fff]{0,20})?(?:配音组|配音|演员组|演员|CAST|CV)(?:[^A-Za-z0-9\u4e00-\u9fff]{0,20})?$",
     re.I,
@@ -921,11 +922,7 @@ def fetch_missevan_episode_intro_rows(
 
 
 def is_missevan_preview_intro_title(title: object) -> bool:
-    text = normalize(title)
-    lowered = text.casefold()
-    return any(keyword in text for keyword in ("预告", "先导", "主题曲")) or any(
-        keyword in lowered for keyword in ("pv", "kv")
-    )
+    return is_missevan_preview_title(title)
 
 
 def collect_missevan_episode_intro_candidates(
@@ -1044,9 +1041,6 @@ def merge_missevan_min_two_main_cv_entries(
         merge_missevan_main_cv_entries(preview_sound_infos),
         seen_cv_ids,
     )
-    if len(merged) >= 2:
-        return merged
-
     append_unique_missevan_main_cv_entries(
         merged,
         build_missevan_main_cv_entries(first_episode_sound_info),
@@ -1102,14 +1096,6 @@ def resolve_missevan_type(raw_type: object) -> int:
         return 3
 
 
-def archive_missevan_node(archive: dict, series_title: str, season_key: str, node: dict, watch_count: dict | None) -> None:
-    archived_node = deepcopy(node)
-    archived_node["archivedReason"] = "HTTP_403"
-    archived_node["archivedAt"] = utc_now()
-    archived_node["archivedWatchCount"] = deepcopy(watch_count)
-    archive.setdefault(series_title, {})[season_key] = archived_node
-
-
 def remove_missevan_node(store: dict, series_title: str, season_key: str) -> None:
     remove_missevan_store_node(store, series_title, season_key)
 
@@ -1125,7 +1111,6 @@ def refresh_missevan(
     cv_upgrade_ambiguities: list[str] | None = None,
 ) -> dict:
     store = load_json(MISSEVAN_INFO_PATH, {})
-    archive = load_json(MISSEVAN_ARCHIVED_INFO_PATH, {})
     cache = load_cache(MISSEVAN_COUNTS_PATH) if update_counts else {"_meta": {"updated_at": None}, "counts": {}}
     requester = MissevanRequester()
     unknown_catalogs: set[int] = set()
@@ -1134,6 +1119,7 @@ def refresh_missevan(
     skipped = 0
     archived = 0
     failed = 0
+    archive_candidates: dict[str, dict[str, str]] = {}
     rejected: list[dict[str, str]] = []
 
     pending_nodes = list(iter_missevan_nodes(store))
@@ -1173,14 +1159,17 @@ def refresh_missevan(
         print(f"[猫耳] 正在刷新 ID={drama_id}，请求 {request_number}/4")
         return requester.request_json(f"https://www.missevan.com/dramaapi/getdrama?drama_id={drama_id}")
 
-    def on_archive(context: tuple[int, str, str, dict, str, bool], _reason: str) -> None:
+    def on_archive(context: tuple[int, str, str, dict, str, bool], reason: str) -> None:
         nonlocal archived, failed
         _idx, series_title, season_key, node, drama_id, _manual_unknown_main_cv = context
         if ARCHIVE_ENABLED["missevan"]:
-            watch_count = (cache.get("counts") or {}).get(drama_id)
-            archive_missevan_node(archive, series_title, season_key, node, watch_count)
-            remove_missevan_node(store, series_title, season_key)
-            cache.get("counts", {}).pop(drama_id, None)
+            candidate = {"archivedAt": utc_now(), "archivedReason": reason}
+            # Disabling count refresh must not discard the existing count
+            # when the drama itself is moved into the archive.
+            archive_cache = cache if update_counts else load_cache(MISSEVAN_COUNTS_PATH)
+            apply_local_archive_candidates("missevan", store, archive_cache, {drama_id: candidate})
+            save_cache(MISSEVAN_COUNTS_PATH, archive_cache)
+            archive_candidates[drama_id] = candidate
             archived += 1
             message = "403归档"
         else:
@@ -1193,7 +1182,6 @@ def refresh_missevan(
             failed += 1
             message = "4次HTTP 403，统计失败并记录null"
         save_missevan_store(MISSEVAN_INFO_PATH, store)
-        save_json(MISSEVAN_ARCHIVED_INFO_PATH, archive)
         if update_counts:
             save_cache(MISSEVAN_COUNTS_PATH, cache)
         print(f"[猫耳] {message} ID={drama_id} {season_key} title={normalize(node.get('title') or series_title)}")
@@ -1205,7 +1193,7 @@ def refresh_missevan(
         nonlocal missing_catalog, processed
         idx, series_title, season_key, node, drama_id, manual_unknown_main_cv = context
 
-        info = (drama_payload or {}).get("info") or {}
+        info = checked_missevan_info(drama_payload, drama_id)
         drama = info.get("drama") or {}
         remote_title = normalize(drama.get("name"))
         remote_catalog = drama.get("catalog")
@@ -1228,19 +1216,23 @@ def refresh_missevan(
         create_month = normalize(node.get("createTime"))
         sound_info: dict = {}
         preview_sound_infos: list[dict] = []
+        sound_infos_by_id: dict[str, dict] = {}
+
+        def fetch_sound_info(fetch_sound_id: str) -> dict:
+            if fetch_sound_id not in sound_infos_by_id:
+                payload = requester.request_json(
+                    f"https://www.missevan.com/dramaapi/getdramabysound?sound_id={fetch_sound_id}"
+                )
+                sound_infos_by_id[fetch_sound_id] = checked_missevan_info(
+                    payload, drama_id, sound_id=fetch_sound_id,
+                )
+            return sound_infos_by_id[fetch_sound_id]
+
         should_fetch_sound = bool(sound_id) and (used_preview_sound or drama_type is None or not create_month)
         if should_fetch_sound and sound_id:
             target_sound_ids = preview_sound_id_list if used_preview_sound and preview_sound_id_list else [sound_id]
             for fetch_sound_id in target_sound_ids:
-                try:
-                    sound_payload = requester.request_json(f"https://www.missevan.com/dramaapi/getdramabysound?sound_id={fetch_sound_id}")
-                except RuntimeError:
-                    save_missevan_store(MISSEVAN_INFO_PATH, store)
-                    save_json(MISSEVAN_ARCHIVED_INFO_PATH, archive)
-                    if update_counts:
-                        save_cache(MISSEVAN_COUNTS_PATH, cache)
-                    raise
-                fetched_sound_info = (sound_payload or {}).get("info") or {}
+                fetched_sound_info = fetch_sound_info(fetch_sound_id)
                 if not sound_info:
                     sound_info = fetched_sound_info
                 preview_sound_infos.append(fetched_sound_info)
@@ -1253,25 +1245,11 @@ def refresh_missevan(
         updated_node, base_entries = build_missevan_base_node(info, drama_type, existing_author=node.get("author"))
         updated_node["is_member"] = missevan_is_member_from_infos(info, sound_info)
         maincv_preview_sound_infos = preview_sound_infos if used_preview_sound else []
-        preview_main_entries = merge_missevan_main_cv_entries(maincv_preview_sound_infos)
         should_fill_two_maincvs = int(drama_type or 0) in (4, 6)
         episode_sound_info: dict = {}
-        has_sound_maincvs = bool(preview_main_entries)
-        should_try_first_episode_maincvs = not manual_unknown_main_cv and bool(first_episode_sound_id) and (
-            (should_fill_two_maincvs and len(preview_main_entries) < 2) or (not used_preview_sound or not has_sound_maincvs)
-        )
+        should_try_first_episode_maincvs = not manual_unknown_main_cv and bool(first_episode_sound_id)
         if should_try_first_episode_maincvs:
-            episode_sound_info = sound_info if first_episode_sound_id == sound_id and sound_info else {}
-            if not episode_sound_info:
-                try:
-                    episode_sound_payload = requester.request_json(f"https://www.missevan.com/dramaapi/getdramabysound?sound_id={first_episode_sound_id}")
-                except RuntimeError:
-                    save_missevan_store(MISSEVAN_INFO_PATH, store)
-                    save_json(MISSEVAN_ARCHIVED_INFO_PATH, archive)
-                    if update_counts:
-                        save_cache(MISSEVAN_COUNTS_PATH, cache)
-                    raise
-                episode_sound_info = (episode_sound_payload or {}).get("info") or {}
+            episode_sound_info = fetch_sound_info(first_episode_sound_id)
         if manual_unknown_main_cv:
             updated_node["maincvs"] = []
             updated_node["cvroles"] = {}
@@ -1282,12 +1260,16 @@ def refresh_missevan(
             merged_main_entries = merge_missevan_min_two_main_cv_entries(maincv_preview_sound_infos, episode_sound_info, base_entries, drama_type)
             updated_node = apply_missevan_main_cv_entries(updated_node, drama_id, base_entries, merged_main_entries)
         else:
-            updated_node = apply_missevan_merged_sound_maincvs(updated_node, drama_id, base_entries, maincv_preview_sound_infos) if used_preview_sound else updated_node
-            updated_node = apply_missevan_sound_maincvs(updated_node, drama_id, base_entries, episode_sound_info)
+            updated_node = apply_missevan_merged_sound_maincvs(
+                updated_node, drama_id, base_entries,
+                [*maincv_preview_sound_infos, episode_sound_info],
+            )
         target_main_cv_count = missevan_target_main_cv_count(drama_type)
         if not manual_unknown_main_cv and len(missevan_main_cv_entries(updated_node)) < target_main_cv_count:
             try:
                 intro_rows = fetch_missevan_episode_intro_rows(requester, drama_id)
+                allowed_sound_ids = set(all_sound_ids(info))
+                intro_rows = [row for row in intro_rows if str(row["sound_id"]) in allowed_sound_ids]
                 existing_names = {
                     normalize_match(entry["display_name"])
                     for entry in missevan_main_cv_entries(updated_node)
@@ -1350,7 +1332,6 @@ def refresh_missevan(
                     )
             except Exception:
                 save_missevan_store(MISSEVAN_INFO_PATH, store)
-                save_json(MISSEVAN_ARCHIVED_INFO_PATH, archive)
                 if update_counts:
                     save_cache(MISSEVAN_COUNTS_PATH, cache)
                 raise
@@ -1373,7 +1354,6 @@ def refresh_missevan(
         processed += 1
         if processed % 10 == 0 or idx == len(pending_nodes):
             save_missevan_store(MISSEVAN_INFO_PATH, store)
-            save_json(MISSEVAN_ARCHIVED_INFO_PATH, archive)
             if update_counts:
                 save_cache(MISSEVAN_COUNTS_PATH, cache)
 
@@ -1389,7 +1369,6 @@ def refresh_missevan(
         )
     except Exception as exc:
         save_missevan_store(MISSEVAN_INFO_PATH, store)
-        save_json(MISSEVAN_ARCHIVED_INFO_PATH, archive)
         if update_counts:
             save_cache(MISSEVAN_COUNTS_PATH, cache)
         print(
@@ -1399,7 +1378,6 @@ def refresh_missevan(
         raise
 
     save_missevan_store(MISSEVAN_INFO_PATH, store)
-    save_json(MISSEVAN_ARCHIVED_INFO_PATH, archive)
     if update_counts:
         save_cache(MISSEVAN_COUNTS_PATH, cache)
     return {
@@ -1409,6 +1387,7 @@ def refresh_missevan(
         "unknown_catalogs": sorted(unknown_catalogs),
         "missing_catalog": missing_catalog,
         "archived": archived,
+        "archive_candidates": deepcopy(archive_candidates),
         "failed": failed,
         "last_backoff_seconds": requester.last_backoff_seconds,
         "request_count": requester.request_count,

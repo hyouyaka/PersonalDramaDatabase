@@ -517,6 +517,7 @@ class ArchiveRetryQueueTests(unittest.TestCase):
             patch.object(refresh_watch_counts, "load_json", return_value=store),
             patch.object(refresh_watch_counts, "load_cache", return_value=cache),
             patch.object(refresh_watch_counts, "MissevanRequester", return_value=requester),
+            patch.dict(refresh_watch_counts.ARCHIVE_ENABLED, {"missevan": False}),
             patch.object(refresh_watch_counts, "ARCHIVE_RETRY_DELAYS", (0, 0, 0)),
             patch.object(refresh_watch_counts, "apply_local_archive_candidates") as apply_archive,
             patch.object(refresh_watch_counts, "save_cache"),
@@ -532,6 +533,38 @@ class ArchiveRetryQueueTests(unittest.TestCase):
         self.assertEqual(cache["counts"]["100"]["name"], "旧名称")
         self.assertIn("100", store)
         apply_archive.assert_not_called()
+
+    def test_enabled_missevan_archive_receives_four_403_candidate(self) -> None:
+        self.assertTrue(refresh_watch_counts.ARCHIVE_ENABLED["missevan"])
+        store = {"100": {"dramaId": 100, "title": "已下架剧"}}
+        cache = {"_meta": {}, "counts": {"100": {"view_count": 123}}}
+        requester = Mock()
+        requester.request_json.side_effect = [self.http_error(403) for _ in range(4)]
+        requester.request_count = 4
+        requester.last_backoff_seconds = 0
+
+        with (
+            patch.object(refresh_watch_counts, "load_json", return_value=store),
+            patch.object(refresh_watch_counts, "load_cache", return_value=cache),
+            patch.object(refresh_watch_counts, "MissevanRequester", return_value=requester),
+            patch.object(refresh_watch_counts, "ARCHIVE_RETRY_DELAYS", (0, 0, 0)),
+            patch.object(refresh_watch_counts, "apply_local_archive_candidates") as apply_archive,
+            patch.object(refresh_watch_counts, "save_cache"),
+            patch.object(refresh_watch_counts, "save_missevan_store"),
+            patch("builtins.print"),
+        ):
+            stats = refresh_watch_counts.refresh_missevan_watch_counts(refresh_all=True)
+
+        self.assertEqual(requester.request_json.call_count, 4)
+        self.assertEqual(stats["failed"], 0)
+        self.assertEqual(stats["archived"], 1)
+        self.assertEqual(stats["archive_retry_requests"], 3)
+        candidate = stats["archive_candidates"]["100"]
+        self.assertEqual(candidate["archivedReason"], "HTTP_403")
+        self.assertTrue(candidate["archivedAt"])
+        apply_archive.assert_called_once_with(
+            "missevan", store, cache, stats["archive_candidates"]
+        )
 
     def test_manbo_archive_signal_requires_both_code_and_message(self) -> None:
         self.assertEqual(
@@ -594,6 +627,116 @@ class ArchiveRetryQueueTests(unittest.TestCase):
 
 
 class InfoRefreshTests(unittest.TestCase):
+    def test_wrong_or_missing_drama_id_preserves_watchcount_and_info(self) -> None:
+        for returned_id in (None, 15326):
+            with self.subTest(returned_id=returned_id):
+                store = {"100": {"dramaId": 100, "title": "原剧", "createTime": "",
+                                 "maincvs": [11], "cover": "原封面"}}
+                cache = {"_meta": {}, "counts": {"100": {"name": "原剧", "view_count": 123}}}
+                original_store = json.loads(json.dumps(store))
+                original_counts = json.loads(json.dumps(cache["counts"]))
+                drama = {"name": "错误响应", "view_count": 999, "cover": "错误封面"}
+                if returned_id is not None:
+                    drama["id"] = returned_id
+                requester = Mock(request_count=1, last_backoff_seconds=0)
+                requester.request_json.return_value = {"info": {"drama": drama}}
+                with (
+                    patch.object(refresh_watch_counts, "load_json", return_value=store),
+                    patch.object(refresh_watch_counts, "load_cache", return_value=cache),
+                    patch.object(refresh_watch_counts, "MissevanRequester", return_value=requester),
+                    patch.object(refresh_watch_counts, "save_cache"),
+                    patch.object(refresh_watch_counts, "save_missevan_store"),
+                    patch("builtins.print"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "ResponseDramaMismatch"):
+                        refresh_watch_counts.refresh_missevan_watch_counts(refresh_all=True)
+                self.assertEqual(store, original_store)
+                self.assertEqual(cache["counts"], original_counts)
+                requester.request_json.assert_called_once()
+
+    def test_wrong_or_missing_sound_drama_id_does_not_fill_create_time(self) -> None:
+        for returned_id in (None, 15326):
+            with self.subTest(returned_id=returned_id):
+                store = {"100": {"dramaId": 100, "title": "目标剧", "createTime": ""}}
+                cache = {"_meta": {}, "counts": {}}
+                sound_drama = {} if returned_id is None else {"id": returned_id}
+                requester = Mock(request_count=2, last_backoff_seconds=0)
+                requester.request_json.side_effect = [
+                    {"info": {"drama": {"id": 100, "name": "目标剧", "view_count": 456},
+                              "episodes": {"episode": [{"sound_id": 12, "name": "第一集"}]}}},
+                    {"info": {"drama": sound_drama, "episodes": {"episode": [{
+                        "name": "第一集", "create_time": 1785542400,
+                    }]}}},
+                ]
+                with (
+                    patch.object(refresh_watch_counts, "load_json", return_value=store),
+                    patch.object(refresh_watch_counts, "load_cache", return_value=cache),
+                    patch.object(refresh_watch_counts, "MissevanRequester", return_value=requester),
+                    patch.object(refresh_watch_counts, "save_cache"),
+                    patch.object(refresh_watch_counts, "save_missevan_store"),
+                    patch("builtins.print"),
+                ):
+                    stats = refresh_watch_counts.refresh_missevan_watch_counts(refresh_all=True)
+                self.assertEqual(store["100"]["createTime"], "")
+                self.assertNotIn("createTime", stats["info_observations"]["100"])
+                self.assertEqual(stats["create_time_still_missing"], 1)
+                self.assertEqual(cache["counts"]["100"]["view_count"], 456)
+                self.assertEqual(requester.request_json.call_count, 2)
+
+    def test_weekly_refresh_never_refreshes_cvs_even_when_filling_create_time(self) -> None:
+        import refresh_platform_metadata
+
+        for create_time in ("2025.01", ""):
+            with self.subTest(create_time=create_time):
+                cv_fields = {
+                    "maincvs": [11, 12], "cvnames": {"11": "原主役甲", "12": "原主役乙"},
+                    "cvroles": {"11": "原角色甲", "12": "原角色乙"},
+                    "fallbackCvNames": ["姓名主役"], "fallbackCvRoles": {"姓名主役": "其他角色"},
+                }
+                store = {"100": {"dramaId": 100, "title": "测试剧", "createTime": create_time,
+                                 **json.loads(json.dumps(cv_fields))}}
+                cache = {"_meta": {}, "counts": {}}
+                api_cvs = [{"cv_info": {"id": 99, "name": "接口其他CV"},
+                            "main": 1, "character": "接口其他角色"}]
+                responses = [{"info": {
+                    "drama": {"id": 100, "name": "测试剧", "view_count": 456,
+                              "pay_type": 1, "price": 10, "vip": 1, "cover": "https://cover.test/new.jpg"},
+                    "cvs": api_cvs, "episodes": {"episode": [
+                        {"sound_id": 201, "soundstr": "预告"},
+                        {"sound_id": 202, "soundstr": "预告二"},
+                        {"sound_id": 203, "soundstr": "第一集", "name": "第一集"},
+                    ]},
+                }}]
+                if not create_time:
+                    responses.append({"info": {"drama": {"id": 100}, "cvs": api_cvs,
+                                               "episodes": {"episode": [{
+                                                   "name": "第一集", "create_time": 1785542400,
+                                               }]}}})
+                requester = Mock(request_count=len(responses), last_backoff_seconds=0)
+                requester.request_json.side_effect = responses
+                with (
+                    patch.object(refresh_watch_counts, "load_json", return_value=store),
+                    patch.object(refresh_watch_counts, "load_cache", return_value=cache),
+                    patch.object(refresh_watch_counts, "MissevanRequester", return_value=requester),
+                    patch.object(refresh_watch_counts, "save_cache"),
+                    patch.object(refresh_watch_counts, "save_missevan_store"),
+                    patch.object(refresh_platform_metadata, "refresh_missevan",
+                                 side_effect=AssertionError("Weekly refresh entered CV metadata refresh")),
+                    patch.object(refresh_platform_metadata, "MissevanRequester",
+                                 side_effect=AssertionError("Weekly refresh created a CV requester")),
+                    patch("builtins.print"),
+                ):
+                    stats = refresh_watch_counts.refresh_missevan_watch_counts(refresh_all=True)
+                expected_urls = ["https://www.missevan.com/dramaapi/getdrama?drama_id=100"]
+                if not create_time:
+                    expected_urls.append("https://www.missevan.com/dramaapi/getdramabysound?sound_id=203")
+                self.assertEqual([c.args[0] for c in requester.request_json.call_args_list], expected_urls)
+                self.assertEqual({k: store["100"][k] for k in cv_fields}, cv_fields)
+                self.assertTrue(set(stats["info_observations"]["100"]) <= {
+                    "needpay", "is_member", "cover", "soundIds", "createTime",
+                })
+                self.assertEqual(cache["counts"]["100"]["view_count"], 456)
+
     def test_exhausted_504_saves_completed_progress_without_archiving_failed_drama(self) -> None:
         store = {
             "100": {"dramaId": "100", "title": "已完成", "createTime": "2026-01"},
@@ -605,7 +748,7 @@ class InfoRefreshTests(unittest.TestCase):
         previous = dict(cache["counts"]["39622"])
         success = requests.Response()
         success.status_code = 200
-        success._content = b'{"info": {"drama": {"name": "completed", "view_count": 10}}}'
+        success._content = b'{"info": {"drama": {"id": 100, "name": "completed", "view_count": 10}}}'
         failure = requests.Response()
         failure.status_code = 504
         failure.url = "https://www.missevan.com/dramaapi/getdrama?drama_id=39622"
@@ -635,12 +778,13 @@ class InfoRefreshTests(unittest.TestCase):
         requester.request_json.side_effect = [
             {
                 "info": {
-                    "drama": {"name": "猫耳测试", "view_count": 10, "pay_type": 0, "price": 0},
+                    "drama": {"id": 100, "name": "猫耳测试", "view_count": 10, "pay_type": 0, "price": 0},
                     "episodes": {"episode": [{"sound_id": "300", "name": "预告"}]},
                 }
             },
             {
                 "info": {
+                    "drama": {"id": 100},
                     "episodes": {
                         "episode": [
                             {
@@ -712,12 +856,13 @@ class InfoRefreshTests(unittest.TestCase):
         requester.request_json.side_effect = [
             {
                 "info": {
-                    "drama": {"name": "仅预告", "view_count": 10, "pay_type": 0, "price": 0},
+                    "drama": {"id": 100, "name": "仅预告", "view_count": 10, "pay_type": 0, "price": 0},
                     "episodes": {"episode": [{"sound_id": "300", "name": "预告"}]},
                 }
             },
             {
                 "info": {
+                    "drama": {"id": 100},
                     "episodes": {
                         "episode": [
                             {
@@ -751,7 +896,7 @@ class InfoRefreshTests(unittest.TestCase):
         requester = Mock()
         requester.request_json.return_value = {
             "info": {
-                "drama": {"name": "已有日期", "view_count": 10, "pay_type": 0, "price": 0},
+                "drama": {"id": 100, "name": "已有日期", "view_count": 10, "pay_type": 0, "price": 0},
                 "episodes": {"episode": [{"sound_id": "300", "name": "预告"}]},
             }
         }
@@ -776,7 +921,7 @@ class InfoRefreshTests(unittest.TestCase):
         requester.request_json.side_effect = [
             {
                 "info": {
-                    "drama": {"name": "补全失败", "view_count": 10, "pay_type": 0, "price": 0},
+                    "drama": {"id": 100, "name": "补全失败", "view_count": 10, "pay_type": 0, "price": 0},
                     "episodes": {"episode": [{"sound_id": "300", "name": "预告"}]},
                 }
             },
@@ -807,7 +952,7 @@ class InfoRefreshTests(unittest.TestCase):
         requester.request_json.side_effect = [
             {
                 "info": {
-                    "drama": {"name": "触发限流", "view_count": 10, "pay_type": 0, "price": 0},
+                    "drama": {"id": 100, "name": "触发限流", "view_count": 10, "pay_type": 0, "price": 0},
                     "episodes": {"episode": [{"sound_id": "300", "name": "预告"}]},
                 }
             },
@@ -828,7 +973,7 @@ class InfoRefreshTests(unittest.TestCase):
     def test_refresh_all_bypasses_recent_cache_for_both_platforms(self) -> None:
         missevan_requester = Mock()
         missevan_requester.request_json.return_value = {
-            "info": {"drama": {"name": "猫耳", "view_count": 10, "pay_type": 0, "price": 0}}
+            "info": {"drama": {"id": 100, "name": "猫耳", "view_count": 10, "pay_type": 0, "price": 0}}
         }
         missevan_requester.request_count = 1
         missevan_requester.last_backoff_seconds = 0
@@ -868,6 +1013,7 @@ class InfoRefreshTests(unittest.TestCase):
             {
                 "info": {
                     "drama": {
+                        "id": 100,
                         "name": "已完成",
                         "cover": "https://cover.test/missevan-completed.jpg",
                         "view_count": 10,
@@ -920,6 +1066,7 @@ class InfoRefreshTests(unittest.TestCase):
         requester.request_json.return_value = {
             "info": {
                 "drama": {
+                    "id": 100,
                     "name": "测试",
                     "cover": "https://cover.test/missevan-new.jpg",
                     "view_count": 10,
@@ -971,7 +1118,7 @@ class InfoRefreshTests(unittest.TestCase):
                 requester = Mock()
                 requester.request_json.return_value = {
                     "info": {
-                        "drama": {"name": "测试", "view_count": 10, "pay_type": 0, "price": 0},
+                        "drama": {"id": 100, "name": "测试", "view_count": 10, "pay_type": 0, "price": 0},
                         **info_extra,
                     }
                 }
@@ -1055,6 +1202,7 @@ class InfoRefreshTests(unittest.TestCase):
             "info": {
                 "drama": {
                     "name": "测试",
+                    "id": 100,
                     "cover": "",
                     "view_count": 10,
                     "pay_type": 0,
@@ -1176,6 +1324,9 @@ class InfoRefreshTests(unittest.TestCase):
                 "100": {
                     "dramaId": 100,
                     "title": "并发新标题",
+                    "maincvs": [777],
+                    "cvnames": {"777": "并发更新的主役"},
+                    "cvroles": {"777": "并发更新的角色"},
                     "needpay": False,
                     "soundIds": ["old"],
                     "createTime": "2026.09",
@@ -1227,6 +1378,9 @@ class InfoRefreshTests(unittest.TestCase):
         self.assertEqual(stats["cover_changed"], 1)
         self.assertEqual(stats["create_time_changed"], 0)
         self.assertEqual(saved["100"]["title"], "并发新标题")
+        self.assertEqual(saved["100"]["maincvs"], [777])
+        self.assertEqual(saved["100"]["cvnames"], {"777": "并发更新的主役"})
+        self.assertEqual(saved["100"]["cvroles"], {"777": "并发更新的角色"})
         self.assertTrue(saved["100"]["needpay"])
         self.assertEqual(saved["100"]["cover"], "https://cover.test/missevan-remote.jpg")
         self.assertEqual(saved["100"]["soundIds"], ["2002", "2001"])

@@ -18,7 +18,7 @@
 
 - 双平台主役 CV 统一映射
 - 漫播收费规则清理
-- 猫耳 403 剧目归档实现（当前因伪风控暂停自动执行）
+- 猫耳 403 剧目自动归档（连续四次响应复核）
 - SQLite/Excel 导出
 - 榜单抓取、ongoing 保活、弹幕 UID 统计
 - 小红书风格榜单图与明细图渲染
@@ -190,6 +190,11 @@ flowchart LR
 - `upsert_manbo_drama_ids()`：为指定漫播 `dramaId` 建占位记录并刷新详情
 - 补齐/修正 `catalog`、`catalogName`、`type`、`genre`、`createTime`、`author`、`needpay`
 - 抽取主役 CV、角色名、`seriesTitle`
+
+猫耳详情、预告及首集响应先通过公共 `checked_missevan_info()` 校验目标剧集 ID，
+缺失或不符时停止并保留原记录。CV 信息刷新合并全部预告和首集的 `main=1` 人员，按 CV ID
+去重；声音详情按 soundId 缓存，人工覆盖规则最后应用。简介兜底限制在已验证详情的 soundId 集合内。
+播放量刷新仅复用公共 ID 校验，不调用上述 CV 刷新、预告遍历或主役合并逻辑。
 - 在 metadata 请求时顺手写入对应平台的 watch count 条目
 
 这个脚本本身的 `main()` 目前是一个“辅助补刷入口”：
@@ -240,9 +245,11 @@ flowchart LR
 - 猫耳命中 418 时会先保存并发布已完成剧目的当前进度，再以退出码 `2` 退出
 - 猫耳 HTTP 403、漫播 HTTP 200 响应体中的 `code=400` 且 `msg=作品已下架` 使用 30/60/120 秒延迟重试，共最多 4 次请求
 - 重试使用延迟队列，等待期间继续抓取其他作品
-- 猫耳连续 4 次 HTTP 403 时不生成归档候选：活跃 info 保持不变，latest 的 `view_count` 写为 `null`，history 不追加当日点
+- 猫耳连续 4 次 HTTP 403 后生成归档候选；该规则依赖状态码，403 也可能来自风控，播放量为 0 本身不构成下架依据
 - CV 榜将显式 `view_count: null` 按 0 汇总并保留作品项；完全缺失 watchcount 条目的剧目仍不参与
-- 猫耳归档实现保留在 `ARCHIVE_ENABLED["missevan"]` 开关之后，当前为关闭；漫播明确下架信号仍会生成归档候选
+- `ARCHIVE_ENABLED["missevan"]` 已开启；漫播明确下架信号仍会生成归档候选
+- 猫耳 metadata 刷新也使用 `apply_local_archive_candidates()`，返回归档候选；关闭播放量刷新时仍迁移已有缓存，归档不再写入旧的顶层嵌套格式
+- `append_missevan_ids.py` 在合并 metadata 前发布归档候选，以 CAS/Lua 迁移远端 latest/history，同时保留本轮本地 info/watchcount 工作副本
 - 启用归档时，info、latest、history 与 archive key 通过单次 Upstash CAS/Lua 原子迁移；旧日期快照不重写
 - watchcount 发布会同时从 latest 与 history 排除全部 archive ID，避免本地缓存残留令已归档剧目复活
 

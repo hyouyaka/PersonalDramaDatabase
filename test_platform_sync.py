@@ -79,6 +79,47 @@ class MissevanLogicalMainCvTests(unittest.TestCase):
         self.assertEqual(store["100"]["cvnames"]["1234"], "林风")
         self.assertEqual(store["100"]["cvroles"]["1234"], "角色甲")
 
+class MissevanPreviewSoundTests(unittest.TestCase):
+    def test_first_main_episode_excludes_numbered_pre_and_post_interviews(self) -> None:
+        for title in ("前采①", "后采1", "剧组前采第1期", "后采·第一集"):
+            with self.subTest(title=title):
+                info = {"episodes": {"episode": [
+                    {"sound_id": 1, "soundstr": title},
+                    {"sound_id": 2, "soundstr": "第一集"},
+                ]}}
+                self.assertFalse(platform_sync.match_main_episode(title))
+                self.assertFalse(platform_sync.match_first_episode(title))
+                self.assertEqual(platform_sync.first_main_episode_sound_id(info), "2")
+
+    def test_preview_titles_select_sound_for_structured_main_cvs(self) -> None:
+        for title in ("概念PV", "【pv】", "角色KV", "角色kv", "先导篇", "预告", "Preview"):
+            with self.subTest(title=title):
+                info = {"episodes": {"episode": [
+                    {"sound_id": 1, "soundstr": "第一集"},
+                    {"sound_id": 2, "soundstr": title},
+                ]}}
+
+                self.assertEqual(platform_sync.preview_sound_ids(info), ["2"])
+                self.assertEqual(platform_sync.preferred_sound_id(info), ("2", True))
+
+    def test_main_episode_remains_non_preview(self) -> None:
+        info = {"episodes": {"episode": [{"sound_id": 1, "soundstr": "第一集"}]}}
+
+        self.assertEqual(platform_sync.preview_sound_ids(info), [])
+        self.assertEqual(platform_sync.preferred_sound_id(info), ("1", False))
+
+    def test_theme_song_is_not_selected_as_preview(self) -> None:
+        info = {"episodes": {"episode": [
+            {"sound_id": 1, "soundstr": "第一集"},
+            {"sound_id": 2, "soundstr": "《作品》主题曲"},
+            {"sound_id": 3, "soundstr": "概念PV"},
+        ]}}
+
+        self.assertFalse(platform_sync.is_missevan_preview_title("《作品》主题曲"))
+        self.assertEqual(platform_sync.preview_sound_ids(info), ["3"])
+        self.assertEqual(platform_sync.preferred_sound_id(info), ("3", True))
+
+
 class ManboCvEntryTests(unittest.TestCase):
     def test_build_manbo_cv_entries_uses_top_level_cv_id_when_profile_id_missing(self) -> None:
         entries = platform_sync.build_manbo_cv_entries(

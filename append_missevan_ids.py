@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 
+from archive_manager import publish_archive_candidates
 from cvid_map_tools import (
     BestEffortAvatarLookup,
     CvAvatarLookup,
@@ -58,6 +59,16 @@ def main(argv: list[str]) -> int:
         generated_id_replacements=generated_id_replacements,
         cv_upgrade_ambiguities=cv_upgrade_ambiguities,
     )
+    if stats.get("archive_candidates"):
+        # Archive from the authoritative remote resources, but keep fresh
+        # local metadata/counts for the subsequent merge and publication.
+        publish_archive_candidates(
+            "missevan",
+            stats["archive_candidates"],
+            upstash=upstash_request,
+            sync_local_watchcount=False,
+            sync_local_info=False,
+        )
     map_stats = update_combined_cvid_map(
         load_json(MISSEVAN_INFO_PATH, {}),
         load_json(MANBO_INFO_PATH, {"records": []}),

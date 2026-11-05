@@ -1,8 +1,63 @@
 import unittest
+import json
+import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 
 class WeeklyCvUpdateScriptTests(unittest.TestCase):
+    def execute_weekly(self, refresh_exit_code=0):
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        if not powershell:
+            self.skipTest("PowerShell is required to execute the weekly wrapper")
+        script = Path(__file__).with_name("run_weekly_cv_update.ps1").resolve()
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "commands.jsonl"
+            env = {
+                **os.environ, "DRAMA_DB_ROOT": tmp,
+                "WEEKLY_TEST_SCRIPT": str(script), "WEEKLY_TEST_COMMAND_LOG": str(log),
+                "WEEKLY_TEST_REFRESH_EXIT_CODE": str(refresh_exit_code),
+            }
+            command = r'''
+function global:python {
+    $NativeArgs = @($args | ForEach-Object { $_ })
+    $Line = ConvertTo-Json -InputObject $NativeArgs -Compress
+    [System.IO.File]::AppendAllText($env:WEEKLY_TEST_COMMAND_LOG, $Line + [Environment]::NewLine)
+    $global:LASTEXITCODE = if ($NativeArgs[3] -eq 'refresh_watch_counts.py') {
+        [int]$env:WEEKLY_TEST_REFRESH_EXIT_CODE
+    } else { 0 }
+}
+& $env:WEEKLY_TEST_SCRIPT
+'''
+            result = subprocess.run(
+                [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+                env=env, capture_output=True, encoding="utf-8", errors="replace", timeout=30,
+            )
+            calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        return result, calls
+
+    def test_executed_weekly_script_only_dispatches_counts_and_rank_jobs(self) -> None:
+        result, calls = self.execute_weekly()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([c[:3] for c in calls], [["-X", "utf8", "-u"]] * 5)
+        self.assertEqual([c[3] for c in calls], [
+            "refresh_watch_counts.py", "build_cv_ranks.py", "build_weekly_growth_ranks.py",
+            "update_rank_meta.py", "update_rank_meta.py",
+        ])
+        self.assertEqual(calls[0][4:], ["--refresh-all"])
+        self.assertEqual(calls[1][4:], [])
+        self.assertEqual(calls[2][4], "--expected-end-date")
+        self.assertRegex(calls[2][5], r"^\d{4}-\d{2}-\d{2}$")
+        self.assertEqual(calls[3][4:], ["cv"])
+        self.assertEqual(calls[4][4:], ["watchcountGrowth"])
+
+    def test_failed_watchcount_refresh_skips_all_rank_jobs(self) -> None:
+        result, calls = self.execute_weekly(refresh_exit_code=1)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(calls, [["-X", "utf8", "-u", "refresh_watch_counts.py", "--refresh-all"]])
+
     def test_weekly_script_refreshes_counts_before_building_ranks(self) -> None:
         script = Path(__file__).with_name("run_weekly_cv_update.ps1").read_text(encoding="utf-8")
 

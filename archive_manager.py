@@ -42,12 +42,10 @@ ARCHIVE_SIGNALS = {
         "payloadMessage": "作品已下架",
     },
 }
-# Missevan currently returns HTTP 403 for some anti-abuse challenges that do
-# not mean the drama was removed. Keep the archive implementation available,
-# but do not move Missevan records automatically until that signal is reliable
-# again. Manbo's explicit response-body signal remains enabled.
+# Both platforms use the delayed four-response confirmation queue before
+# moving active info and watchcount data into the archive.
 ARCHIVE_ENABLED = {
-    "missevan": False,
+    "missevan": True,
     "manbo": True,
 }
 ARCHIVE_RETRY_DELAYS = (30.0, 60.0, 120.0)
@@ -386,6 +384,7 @@ def publish_archive_candidates(
     upstash: Callable[[list[object]], object] = upstash_request,
     max_attempts: int = ARCHIVE_PUBLISH_MAX_ATTEMPTS,
     sync_local_watchcount: bool = True,
+    sync_local_info: bool = True,
 ) -> dict[str, int]:
     if not candidates:
         return {"archived": 0}
@@ -490,7 +489,8 @@ def publish_archive_candidates(
         verified_watch_archive = decode_archive_payload(
             upstash(["GET", watch_archive_key]), platform, key=watch_archive_key
         )
-        save_json(ACTIVE_INFO_PATHS[platform], verified_active)
+        if sync_local_info:
+            save_json(ACTIVE_INFO_PATHS[platform], verified_active)
         if sync_local_watchcount:
             save_json(ACTIVE_WATCHCOUNT_PATHS[platform], verified_latest)
         save_local_archives(platform, verified_info_archive, verified_watch_archive)

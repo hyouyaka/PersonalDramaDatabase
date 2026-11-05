@@ -74,15 +74,18 @@ MANBO_CATALOG_OVERRIDES = {
     "奇洛李维斯回信": {"catalog": 5, "catalogName": "有声剧"},
 }
 MANBO_RECORD_FIELD_OVERRIDES = {
-    drama_id: {
+    "2241266599933771973": {
         "catalog": 5,
         "catalogName": "有声剧",
         "mainCvIds": [],
         "mainCvNicknames": [UNKNOWN_MAIN_CV_MARKER],
         "mainCvNames": [UNKNOWN_MAIN_CV_MARKER],
         "mainCvRoleNames": [],
-    }
-    for drama_id in ("2241266599933771973", "2274226385121706088")
+    },
+    "2274226385121706088": {
+        "catalog": 5,
+        "catalogName": "有声剧",
+    },
 }
 
 
@@ -133,6 +136,8 @@ NON_MAIN_EPISODE_KEYWORDS = (
     "番外",
     "花絮",
     "采访",
+    "前采",
+    "后采",
     "小剧场",
     "幕后",
     "企划",
@@ -538,6 +543,19 @@ def clean_role_name(value: object) -> str:
     return normalize(text)
 
 
+def checked_missevan_info(payload: object, drama_id: str, *, sound_id: str = "") -> dict:
+    info = payload.get("info") if isinstance(payload, dict) else None
+    drama = info.get("drama") if isinstance(info, dict) else None
+    returned_id = normalize(drama.get("id")) if isinstance(drama, dict) else ""
+    if not returned_id or returned_id != normalize(drama_id):
+        source = f"sound_id={sound_id}" if sound_id else "getdrama"
+        raise RuntimeError(
+            f"[猫耳] ResponseDramaMismatch: expected dramaId={drama_id}, "
+            f"returned dramaId={returned_id or '<missing>'} ({source})"
+        )
+    return info
+
+
 def first_sound_id(info: dict) -> str:
     episodes = (info.get("episodes") or {}).get("episode") or []
     for ep in episodes:
@@ -552,6 +570,14 @@ def preview_sound_id(info: dict) -> str:
     return sound_ids[0] if sound_ids else ""
 
 
+def is_missevan_preview_title(title: object) -> bool:
+    text = normalize(title)
+    lowered = text.casefold()
+    return any(keyword in text for keyword in ("预告", "先导")) or any(
+        keyword in lowered for keyword in ("preview", "pv", "kv")
+    )
+
+
 def preview_sound_ids(info: dict) -> list[str]:
     out: list[str] = []
     episodes = (info.get("episodes") or {}).get("episode") or []
@@ -560,8 +586,7 @@ def preview_sound_ids(info: dict) -> list[str]:
         sound_id = str(ep.get("sound_id") or "").strip()
         if not sound_id:
             continue
-        lowered = title.casefold()
-        if ("预告" in title or "preview" in lowered) and sound_id not in out:
+        if is_missevan_preview_title(title) and sound_id not in out:
             out.append(sound_id)
     return out
 
