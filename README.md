@@ -2,10 +2,21 @@
 
 ## 人工排除的作品
 
-不再收录的作品统一维护在 `platform_sync.py` 的 `DRAMA_EXCLUSIONS`，按平台和
-`dramaId` 区分，并保留标题供核对。ongoing 输出、新剧队列读取与写入、追加 ID
-及榜单发布都会过滤这些 ID，防止删除后被自动重新收录。修改名单后仍需清理
-已经存在的源库、ongoing、队列、播放量和榜单趋势数据；名单本身不执行历史删除。
+`platform_sync.py` 中的两份名单分别控制入库与榜单展示，均按平台和 `dramaId` 区分：
+
+- `DRAMA_EXCLUSIONS`：禁止进入活跃剧库、ongoing、待补队列和 CV 统计；即使旧源库或缓存残留，也不计入 CV 榜。
+- `RANK_EXCLUSIONS`：独立控制哪些条目不在普通榜单中展示；不会因禁止入库而自动加入。
+
+两平台统一遵循：被禁止入库的内容上榜时保留条目、平台榜单数值及原始名次，
+进入 ongoing 时移除，也不进入 info 源库、待补队列或 CV 统计。当前两平台的
+`RANK_EXCLUSIONS` 均为空；入库排除本身不会删除榜位，下架归档仍按独立规则处理。
+例如猫耳《重创星纪元》（`94604`）和漫播两个翻唱合集（`1896908912553099327`、
+`2281413604869669104`）都只禁止入库。榜单缓存可以保留其标题、封面与指标，
+不绑定主役 CV；两平台榜单发布及趋势记录复用抓榜时保存的名次，不因其他条目被过滤而重新编号。
+禁止入库条目的旧 `maincvs` 会在公共清理/发布路径清空，普通抓榜、`--only-danmaku`、
+弹幕修复及直接发布都适用；榜单条目、指标和原始名次保持不变。
+
+名单本身不执行历史数据清理；禁止入库的内容也不应因此写入下架归档。
 
 ## 本地服务器运行与旧 Upstash 数据归档
 
@@ -230,7 +241,9 @@ python append_manbo_ids.py 2067945724439429338 2118896513449984153
 - 发布时先严格读取 latest/history，再通过 Lua/CAS 原子更新 latest 与受影响的 history field；每条 history 最多保留最近 32 点
 - history 缺失、损坏或发生并发修改时任务失败并重试，不从日期快照或 index 重建
 
-watchcount history 必须在 v2-only 部署前完成校验；常规任务不会读取或重建已退役的日期快照与 index。
+常规任务只使用上述播放量键，不读取、写入或清理已退役的 `{platform}:watchcount:YYYY-MM-DD` 和 index。日期键可在完整备份并校验后删除；`history`、`latest` 和 `archive:v1` 必须保留。
+
+旧日期键的本地备份放在 `recovery_backups/watchcount-dates/<UTC时间戳>/`，包含原始 JSON、TTL、SHA-256、端点指纹及删除核验记录，另有 ZIP 和对应的 SHA-256 文件。整个目录被 Git 忽略，须一并保存；一次性维护、恢复脚本及其测试已移除。旧 `watchcount:index` 不在本次日期键清理范围内。
 
 清理已确认的非目标剧集时先预检，再显式应用；命令不会修改当前 CV 排名或 CV trend：
 
@@ -241,7 +254,7 @@ python sync_new_drama_ids.py --purge-non-target-records --apply
 
 清理会为所有待改写远端键生成 `recovery_backups` 备份，并在目标集合、远端版本或 CV 资源摘要不符合预期时停止。
 
-Info、普通榜、CV 榜及 trend v2 现为唯一权威数据：正文与 Meta 使用 CAS 原子发布，冲突会重试，发布或校验失败会使任务失败。运行时不会读取或更新已退役的 info/trend/watchcount key；旧 key 只保留为人工回滚快照。
+Info、普通榜、CV 榜及 trend v2 现为唯一权威数据：正文与 Meta 使用 CAS 原子发布，冲突会重试，发布或校验失败会使任务失败。运行时不会读取或更新已退役的 info/trend/watchcount key；退役数据的人工回滚副本保存在本地 `recovery_backups`，不作为运行时依赖。
 
 用法：
 

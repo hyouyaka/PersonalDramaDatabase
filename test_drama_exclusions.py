@@ -20,18 +20,22 @@ class DramaExclusionIngressTests(unittest.TestCase):
         }
         self.assertEqual(set(fetch_ongoing.build_payload("missevan", records)["records"]), {"100"})
         self.assertEqual(set(fetch_ongoing.build_payload("manbo", records)["records"]), set(records))
-        manbo = {"1896908912553099327": {"dramaId": "1896908912553099327"}}
+        manbo = {drama_id: {"dramaId": drama_id}
+                 for drama_id in ("1896908912553099327", "2281413604869669104")}
         self.assertEqual(fetch_ongoing.build_payload("manbo", manbo)["records"], {})
 
     def test_stale_import_queue_cannot_reintroduce_excluded_records(self):
-        payload = {"missevan": ["83940", "88641", "100"], "manbo": ["1896908912553099327", "200"]}
+        payload = {"missevan": ["83940", "88641", "100"],
+                   "manbo": ["1896908912553099327", "2281413604869669104", "200"]}
         with patch.object(sync_new_drama_ids, "upstash_request", return_value=json.dumps(payload)):
             self.assertEqual(sync_new_drama_ids.load_queue(), {"missevan": ["100"], "manbo": ["200"]})
 
     def test_rank_discovery_does_not_enqueue_removed_works(self):
         client = Mock(return_value='{"missevan":["100"],"manbo":["200"]}')
         with patch.object(fetch_rank_data, "upstash_request", client), patch("builtins.print"):
-            fetch_rank_data.append_new_drama_ids_atomic(["83940", "100"], ["1896908912553099327", "200"])
+            fetch_rank_data.append_new_drama_ids_atomic(
+                ["83940", "100"], ["1896908912553099327", "2281413604869669104", "200"],
+            )
         self.assertEqual(json.loads(client.call_args.args[0][-2]), ["100"])
         self.assertEqual(json.loads(client.call_args.args[0][-1]), ["200"])
         self.assertEqual(set(json.loads(client.call_args.args[0][-4])), platform_sync.excluded_drama_ids("missevan"))
@@ -64,7 +68,7 @@ class DramaExclusionIngressTests(unittest.TestCase):
         self.assertEqual(targets, {"100"})
         self.assertEqual(sources, {"100": ["trend"]})
 
-    def test_rank_output_filters_removed_works_without_removing_other_seasons(self):
+    def test_library_exclusions_preserve_official_rank_entries(self):
         store = {
             "missevan": {
                 "dramas": {"83940": {}, "45006": {}, "72383": {}},
@@ -72,11 +76,15 @@ class DramaExclusionIngressTests(unittest.TestCase):
             },
         }
         fetch_rank_data.filter_archived_dramas(store, archived_by_platform={})
-        self.assertEqual(set(store["missevan"]["dramas"]), {"45006", "72383"})
-        self.assertEqual(store["missevan"]["ranks"]["views"]["items"], [{"drama_id": "72383"}])
+        self.assertEqual(set(store["missevan"]["dramas"]), {"83940", "45006", "72383"})
+        self.assertEqual(store["missevan"]["ranks"]["views"]["items"],
+                         [{"drama_id": "83940"}, {"drama_id": "72383"}])
 
     def test_manual_append_and_upsert_reject_excluded_ids_before_io(self):
-        for module, drama_id in ((append_missevan_ids, "88641"), (append_manbo_ids, "1896908912553099327")):
+        for module, drama_id in ((append_missevan_ids, "88641"),
+                                 (append_manbo_ids, "1896908912553099327"),
+                                 (append_manbo_ids, "2281413604869669104"),
+                                 (append_missevan_ids, "94604")):
             with self.subTest(module=module.__name__), patch.object(module, "download_info_file") as download, patch("builtins.print"):
                 self.assertEqual(module.main(["append.py", drama_id]), 0)
                 download.assert_not_called()
@@ -84,7 +92,11 @@ class DramaExclusionIngressTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Excluded"):
                 metadata.upsert_missevan_drama_ids(["83940"])
             with self.assertRaisesRegex(ValueError, "Excluded"):
+                metadata.upsert_missevan_drama_ids(["94604"])
+            with self.assertRaisesRegex(ValueError, "Excluded"):
                 metadata.upsert_manbo_drama_ids(["1896908912553099327"])
+            with self.assertRaisesRegex(ValueError, "Excluded"):
+                metadata.upsert_manbo_drama_ids(["2281413604869669104"])
             load.assert_not_called()
 
 
@@ -96,7 +108,7 @@ class CvDashAndFirstEpisodeTests(unittest.TestCase):
         intro = "<p>CAST</p>" + "".join(f"<p>角色{i}—CV{i}</p>" for i in range(1, 5))
         requester.request_json.side_effect = [
             {"info": {"drama": {"id": 100, "name": "全年龄测试", "catalog": 89}, "cvs": [], "episodes": {"episode": [{"sound_id": 1, "soundstr": "第一集"}]}}},
-            {"info": {"cvs": []}},
+            {"info": {"drama": {"id": 100}, "cvs": []}},
             {"info": {"Datas": [{"id": 1, "soundstr": "第一集", "intro": intro}]}},
         ]
         with (
@@ -121,8 +133,8 @@ class CvDashAndFirstEpisodeTests(unittest.TestCase):
             {"info": {"drama": {"id": 95054, "name": "属于他的冰上赛场", "catalog": 89}, "cvs": [], "episodes": {"episode": [
                 {"sound_id": 1, "soundstr": "预告"}, {"sound_id": 2, "soundstr": "第一集"},
             ]}}},
-            {"info": {"cvs": []}},
-            {"info": {"cvs": []}},
+            {"info": {"drama": {"id": 95054}, "cvs": []}},
+            {"info": {"drama": {"id": 95054}, "cvs": []}},
             {"info": {"Datas": [
                 {"id": 1, "soundstr": "预告", "intro": "<p>俞游歌—颜辉</p>"},
                 {"id": 2, "soundstr": "第一集", "intro": "<p>——CAST——</p><p>俞游歌—颜辉</p><p>程于非—大老师</p>"},

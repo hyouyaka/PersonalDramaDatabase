@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Callable
 
+from platform_sync import is_excluded_drama
 from upstash_editor import (
     RANK_META_KEY,
     build_rank_meta_update,
@@ -908,6 +909,11 @@ def publish_normal_trend_v2(platform: str, payload: dict, *, upstash: Callable[[
         )
     else:
         meta, fields = candidate_meta, candidate_fields
+    # Historical entities may have no candidate when no metric was captured.
+    # Clear CV bindings after merging so retained history is covered as well.
+    for drama_id, record in fields.items():
+        if is_excluded_drama(platform, drama_id):
+            record["maincvs"] = None
     publish_hash_snapshot_atomic(
         NORMAL_TREND_V2_KEYS[platform],
         meta,

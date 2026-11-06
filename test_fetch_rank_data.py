@@ -16,6 +16,13 @@ from test_upstash_v2 import FakeUpstash
 
 
 class RankFetch418CheckpointTests(unittest.TestCase):
+    def setUp(self):
+        # Checkpoint cases use empty archives; archive validation has its own tests.
+        archives = patch.object(fetch_rank_data, "load_archived_drama_ids",
+                                return_value={"missevan": set(), "manbo": set()})
+        archives.start()
+        self.addCleanup(archives.stop)
+
     def _progress(self, *, missevan_pending=None, manbo_pending=None):
         return {
             "missevan": {
@@ -633,6 +640,7 @@ class RankFullStoreKeyTests(unittest.TestCase):
                 ("missevan",),
                 include_rank_samples=False,
                 include_peak_trend=False,
+                archived_by_platform={},
             )
 
         peak.assert_not_called()
@@ -1438,6 +1446,7 @@ class RankTrendCliTests(unittest.TestCase):
         with (
             patch.object(sys, "argv", ["fetch_rank_data.py", "--only-danmaku", "--missevan-only"]),
             patch.object(fetch_rank_data, "load_initial_rank_store", return_value=store),
+            patch.object(fetch_rank_data, "load_archived_drama_ids", return_value={"missevan": set(), "manbo": set()}),
             patch.object(fetch_rank_data, "only_danmaku_mode"),
             patch.object(fetch_rank_data, "save_json"),
             patch.object(fetch_rank_data, "upload_rank_outputs", side_effect=RuntimeError("publish failed")),

@@ -26,6 +26,8 @@ from platform_sync import (
     is_numeric_drama_id,
     is_excluded_drama,
     excluded_drama_ids,
+    rank_excluded_drama_ids,
+    is_rank_excluded_drama,
     is_target_catalog,
     missevan_main_cv_entries,
     normalize,
@@ -438,9 +440,20 @@ return payload
     )
 
 
+def clear_library_excluded_maincvs(store: dict) -> None:
+    """Keep ranked content but never bind lead CVs to admission-excluded IDs."""
+    for platform in PLATFORMS:
+        dramas = (store.get(platform) or {}).get("dramas")
+        if isinstance(dramas, dict):
+            for drama_id, entry in dramas.items():
+                if is_excluded_drama(platform, drama_id) and isinstance(entry, dict):
+                    entry["maincvs"] = None
+
+
 def upload_full_ranks(store: dict) -> None:
     """Upload complete merged ranks under the latest full-rank key."""
     public_store = json.loads(json.dumps(store, ensure_ascii=False))
+    clear_library_excluded_maincvs(public_store)
     public_meta = public_store.get("_meta") or {}
     capture_started_at = public_meta.pop("_metric_capture_started_at", None)
     if capture_started_at:
@@ -538,6 +551,9 @@ def load_initial_rank_store() -> dict:
 def _coerce_rank_item(item: object, position: int) -> dict:
     row: dict[str, object] = {"position": position}
     if isinstance(item, dict):
+        source_position = safe_int(item.get("position"), position)
+        if source_position > 0:
+            row["position"] = source_position
         drama_id = item.get("dramaId") or item.get("drama_id")
         drama_ids = item.get("dramaIds") or item.get("drama_ids")
         title = item.get("name") or item.get("title")
@@ -1355,6 +1371,19 @@ def classify_missevan_danmaku_ids(
 # Phase 2: Fetch rank lists
 # ---------------------------------------------------------------------------
 
+def _seed_rank_only_entry(store: dict, platform: str, drama_id: str, source: dict) -> None:
+    if not is_excluded_drama(platform, drama_id):
+        return
+    entry = store[platform].setdefault("dramas", {}).setdefault(drama_id, {})
+    title = normalize(source.get("title") or source.get("name"))
+    cover = source.get("coverPic") or source.get("largePic") or source.get("cover")
+    if title:
+        entry["name"] = title
+    if cover:
+        entry["cover"] = cover
+    entry["maincvs"] = None
+
+
 def fetch_missevan_ranks(
     requester: MissevanRequester,
     store: dict,
@@ -1382,15 +1411,23 @@ def fetch_missevan_ranks(
         info = data.get("info") or {}
         items_raw = (info.get("data") or [])[:fetch_limit]
         ranked_items = [
-            (position, item["id"])
+            (position, item)
             for position, item in enumerate(items_raw, 1)
             if isinstance(item, dict) and "id" in item
         ]
-        items = [item_id for _position, item_id in ranked_items]
+        items = []
+        for position, source in ranked_items:
+            drama_id = str(source["id"])
+            row = {"dramaId": drama_id, "position": position}
+            row.update({field: source[field] for field in
+                        ("name", "title", "cover", "view_count", "hotValue", "diamondValue")
+                        if field in source})
+            items.append(row)
+            _seed_rank_only_entry(store, "missevan", drama_id, source)
         ranks[key] = {"name": name, "fetched_at": now_iso(), "items": items}
         successful_rank_keys.add(key)
         rank_items_for_danmaku[key] = {"items": items_raw}
-        all_ids.update(str(i) for i in items)
+        all_ids.update(row["dramaId"] for row in items)
         print(f"  [missevan] {name}: {len(items)} items")
 
     danmaku_ids, deferred_danmaku_ids = split_missevan_rank_danmaku_ids(
@@ -1437,11 +1474,12 @@ def fetch_missevan_ranks(
                 if title in unmatched_names:
                     upstash_series.setdefault(title, []).append(str(drama_id))
         peak_items = []
-        for el in elements:
+        for position, el in enumerate(elements, 1):
             name = el.get("name", "")
             cvs = [cv.get("name", "") for cv in (el.get("cvs") or []) if cv.get("name")]
             drama_ids = missevan_series.get(name) or upstash_series.get(name, [])
             peak_items.append({
+                "position": position,
                 "name": name,
                 "view_count": el.get("view_count"),
                 "cover": el.get("cover", ""),
@@ -1475,12 +1513,13 @@ def fetch_manbo_ranks(store: dict) -> set[str]:
             drama_list = drama_list[:limit]
         unit_name = body.get("unitName", "")
         items = []
-        for d in drama_list:
+        for position, d in enumerate(drama_list, 1):
             drama_id = str(d.get("radioDramaIdStr") or d.get("radioDramaId", ""))
             val = d.get(value_field, 0)
             if drama_id:
-                items.append({"dramaId": drama_id, value_field: val})
+                items.append({"dramaId": drama_id, "position": position, value_field: val})
                 all_ids.add(drama_id)
+                _seed_rank_only_entry(store, "manbo", drama_id, d)
         ranks[key] = {"name": name, "rankId": rank_id, "unitName": unit_name, "fetched_at": now_iso(), "items": items}
         print(f"  [manbo] {name}: {len(items)} items")
 
@@ -1518,6 +1557,11 @@ def fetch_missevan_drama_details(
                 clear_danmaku_on_skip=skip_danmaku,
             )
         except RejectedDramaRecord as exc:
+            if is_excluded_drama("missevan", drama_id) and not is_rank_excluded_drama("missevan", drama_id):
+                if pending_ids is not None:
+                    pending_ids.discard(str(drama_id))
+                print(f"  [missevan] rank-only entry retained {drama_id}: {exc}")
+                continue
             rejected_ids.add(str(drama_id))
             dramas.pop(str(drama_id), None)
             remove_drama_ids_from_rank_items(store, "missevan", {str(drama_id)})
@@ -1591,7 +1635,8 @@ def _fetch_one_missevan(
     catalog = drama.get("catalog")
     if not title:
         raise RejectedDramaRecord("empty title")
-    if not is_target_catalog("missevan", catalog):
+    rank_only = is_excluded_drama("missevan", drama_id) and not is_rank_excluded_drama("missevan", drama_id)
+    if not is_target_catalog("missevan", catalog) and not rank_only:
         raise RejectedDramaRecord(f"non-target catalog={catalog}")
     episodes_section = info.get("episodes") or {}
     episodes = episodes_section.get("episode") or []
@@ -1742,6 +1787,13 @@ def fetch_manbo_drama_details(
         try:
             _fetch_one_manbo(drama_id, entry)
         except RejectedDramaRecord as exc:
+            if is_excluded_drama("manbo", drama_id) and not is_rank_excluded_drama("manbo", drama_id):
+                # Library rejection must not remove an official rank entry.
+                if pending_ids is not None:
+                    pending_ids.discard(str(drama_id))
+                print(f"  [manbo] rank-only entry retained {drama_id}: {exc}")
+                save_counter += 1
+                continue
             rejected_ids.add(str(drama_id))
             dramas.pop(str(drama_id), None)
             if pending_ids is not None:
@@ -1821,7 +1873,8 @@ def _fetch_one_manbo(drama_id: str, entry: dict) -> None:
         catalog = body.get("category")
     if not title:
         raise RejectedDramaRecord("empty title")
-    if not is_target_catalog("manbo", catalog):
+    rank_only = is_excluded_drama("manbo", drama_id) and not is_rank_excluded_drama("manbo", drama_id)
+    if not is_target_catalog("manbo", catalog) and not rank_only:
         raise RejectedDramaRecord(f"non-target catalog={catalog}")
 
     entry["name"] = title
@@ -2344,11 +2397,13 @@ def filter_archived_dramas(
     *,
     archived_by_platform: dict[str, set[str]] | None = None,
 ) -> dict[str, set[str]]:
-    """Remove archived dramas before rank outputs are allowed to publish."""
+    """Apply visibility exclusions and clear forbidden library CVs before publishing."""
     if archived_by_platform is None:
         archived_by_platform = load_archived_drama_ids()
+    # Shared by normal, only-danmaku and direct publication paths.
+    clear_library_excluded_maincvs(store)
     for platform in PLATFORMS:
-        blocked = excluded_drama_ids(platform)
+        blocked = rank_excluded_drama_ids(platform)
         dramas = (store.get(platform) or {}).get("dramas")
         if isinstance(dramas, dict):
             for drama_id in blocked:
@@ -2387,6 +2442,9 @@ def lookup_cvs(store: dict) -> None:
 
     # Missevan CV lookup
     for drama_id, entry in missevan_dramas.items():
+        if is_excluded_drama("missevan", drama_id):
+            entry["maincvs"] = None
+            continue
         if not is_numeric_drama_id(drama_id):
             print(f"  [upstash] WARN: ignored invalid 猫耳 dramaId={drama_id!r}")
             entry.setdefault("maincvs", None)
@@ -2413,6 +2471,9 @@ def lookup_cvs(store: dict) -> None:
 
     # Manbo CV lookup
     for drama_id, entry in manbo_dramas.items():
+        if is_excluded_drama("manbo", drama_id):
+            entry["maincvs"] = None
+            continue
         if not is_numeric_drama_id(drama_id):
             print(f"  [upstash] WARN: ignored invalid 漫播 dramaId={drama_id!r}")
             entry.setdefault("maincvs", None)
@@ -2918,6 +2979,9 @@ def write_repaired_danmaku_layers(
     if not changed:
         print(f"[ok] {platform} danmaku already repaired or removed; nothing to publish")
         return
+    # Repairs bypass upload_rank_outputs() and publish freshly merged bases.
+    clear_library_excluded_maincvs(latest_payload)
+    clear_library_excluded_maincvs({platform: {"dramas": trend_dramas}})
     publish_repaired_rank_snapshot(
         platform, latest_payload, trend_payload,
         source_latest_raw=source_latest_raw, upstash=upstash_request,

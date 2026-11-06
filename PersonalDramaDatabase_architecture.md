@@ -97,11 +97,13 @@ flowchart LR
 - 每个条目至少包含：`name`、`view_count`、`fetched_at`
 - `refresh_watch_counts.py` 只维护这两份缓存，不会改 SQLite
 
-远端 Upstash 还维护每个平台的播放量快照索引：
+远端 Upstash 维护每个平台的最新播放量及实体历史：
 
 - `missevan:watchcount:history`、`manbo:watchcount:history` 为 Redis Hash；field 为 dramaId，value 为包含 `name` 和升序 `points` 的 JSON 字符串
+- `{platform}:watchcount:latest` 保存当前快照，`{platform}:watchcount:archive:v1` 保存已归档播放量，两者继续使用
 - 发布路径严格读取现有 latest/history，并通过一次 Lua/CAS 原子更新两者；每条 history 最多保留最近 32 点
 - history 缺失或损坏时发布失败，不读取 index、日期快照或执行 SCAN 重建
+- 旧日期键已退役，备份后可删除；本地备份、校验与恢复说明见 README 的播放量存储部分
 
 播放量刷新时，猫耳 `getdrama` 和漫播 `dramaDetail` 响应还会同步更新各自源库中的付费信息、
 会员状态和非空的 `soundIds`；这些字段与播放量共用同一次平台请求。
@@ -224,6 +226,11 @@ flowchart LR
 - 不触碰 CV map 和 SQLite
 
 ### CV Identity Mapping: `cvid_map_tools.py`
+
+入库排除使用 `platform_sync.DRAMA_EXCLUSIONS`，普通榜单排除独立使用
+`RANK_EXCLUSIONS`（目前两平台均为空）。两平台被禁止入库的内容都保留榜单展示数据和
+原始名次，但从 ongoing 输出及读取集合中排除；CV lookup 不补其主役、不入待补队列，
+CV 聚合也会跳过旧源库中残留的入库排除记录。
 
 负责双平台 CV 名称/ID 的统一：
 

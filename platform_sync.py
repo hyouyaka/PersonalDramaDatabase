@@ -41,8 +41,8 @@ MANBO_CATALOG_NAME_ALIASES = {"有声书": "有声剧"}
 MANBO_COVER_FIELDS = ("coverPic", "largePic", "cover", "sharePicUrl")
 UNKNOWN_MAIN_CV_MARKER = "主役未知"
 UNKNOWN_MAIN_CV_DISPLAY = "暂无"
-# Explicit collection decisions. Keep IDs platform-scoped so crawlers cannot
-# re-import removed works through ongoing feeds or public rankings.
+# Library/CV admission exclusions. A public ranking may still contain these
+# IDs; hiding a ranked entry requires the separate RANK_EXCLUSIONS policy.
 DRAMA_EXCLUSIONS = {
     "missevan": {
         "1598": "有你纵使海角天涯",
@@ -55,10 +55,18 @@ DRAMA_EXCLUSIONS = {
         "96415": "轮回审判者【第1季】",
         "44577": "一步之遥",
         "88641": "纸飞机",
+        "94604": "重创星纪元",
     },
     "manbo": {
         "1896908912553099327": "scc7000遥昇歌曲翻唱大合集",
+        "2281413604869669104": "星未眠翻唱合集",
     },
+}
+
+
+RANK_EXCLUSIONS = {
+    "missevan": frozenset(),
+    "manbo": frozenset(),
 }
 
 
@@ -68,6 +76,14 @@ def excluded_drama_ids(platform: str) -> frozenset[str]:
 
 def is_excluded_drama(platform: str, drama_id: object) -> bool:
     return str(drama_id).strip() in DRAMA_EXCLUSIONS[platform]
+
+
+def rank_excluded_drama_ids(platform: str) -> frozenset[str]:
+    return frozenset(RANK_EXCLUSIONS[platform])
+
+
+def is_rank_excluded_drama(platform: str, drama_id: object) -> bool:
+    return str(drama_id).strip() in RANK_EXCLUSIONS[platform]
 
 
 MANBO_CATALOG_OVERRIDES = {

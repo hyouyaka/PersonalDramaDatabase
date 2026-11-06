@@ -14,6 +14,7 @@ from platform_sync import (
     MISSEVAN_COUNTS_PATH,
     MISSEVAN_INFO_PATH,
     iter_missevan_nodes,
+    is_excluded_drama,
     load_cache,
     load_json,
     manbo_has_unknown_main_cv,
@@ -98,11 +99,18 @@ def latest_watch_count_updated_at(*caches: dict) -> str | None:
 
 
 def count_missevan_dramas(store: dict) -> int:
-    return sum(1 for _series_title, _season_key, node in iter_missevan_nodes(store or {}) if normalize(node.get("dramaId")))
+    return sum(
+        1 for _series_title, _season_key, node in iter_missevan_nodes(store or {})
+        if normalize(node.get("dramaId")) and not is_excluded_drama("missevan", node["dramaId"])
+    )
 
 
 def count_manbo_dramas(store: dict) -> int:
-    return sum(1 for record in (store or {}).get("records") or [] if isinstance(record, dict) and normalize(record.get("dramaId")))
+    return sum(
+        1 for record in (store or {}).get("records") or []
+        if isinstance(record, dict) and normalize(record.get("dramaId"))
+        and not is_excluded_drama("manbo", record["dramaId"])
+    )
 
 
 def build_map_indexes(cvid_map: dict) -> tuple[dict[int, set[str]], dict[int, set[str]], dict[str, set[str]], dict[str, str]]:
@@ -198,7 +206,7 @@ def collect_missevan_works(
 ) -> None:
     for _series_title, _season_key, node in iter_missevan_nodes(store):
         drama_id = normalize(node.get("dramaId"))
-        if not drama_id:
+        if not drama_id or is_excluded_drama("missevan", drama_id):
             continue
         count_entry = counts.get(drama_id)
         if not isinstance(count_entry, dict) or "view_count" not in count_entry:
@@ -255,7 +263,7 @@ def collect_manbo_works(
         if not isinstance(record, dict):
             continue
         drama_id = normalize(record.get("dramaId"))
-        if not drama_id:
+        if not drama_id or is_excluded_drama("manbo", drama_id):
             continue
         count_entry = counts.get(drama_id)
         if not isinstance(count_entry, dict) or "view_count" not in count_entry:
