@@ -20,6 +20,8 @@ STAGING_TTL_SECONDS = 24 * 60 * 60
 HASH_WRITE_CHUNK_SIZE = 100
 GENERATED_MISSEVAN_CVID_MIN = 330000
 GENERATED_MISSEVAN_CVID_MAX = 339999
+GENERATED_MANBO_CVID_MIN = 340000
+GENERATED_MANBO_CVID_MAX = 349999
 
 INFO_META_KEYS = {
     "missevan:info:v2": "missevan:info:meta:v2",
@@ -815,18 +817,20 @@ def _json_record_count(spec: ResourceSpec, payload: object) -> int:
     return len(_require_dict(payload, spec.key).get("records") or [])
 
 
-def _generated_missevan_cvid_identities(payload: object) -> dict[int, tuple[str, str]]:
+def _generated_missevan_cvid_identities(payload: object, *, platform: str = "missevan") -> dict[int, tuple[str, str]]:
     root = _require_dict(payload, CVID_MAP_KEY)
     identities: dict[int, tuple[str, str]] = {}
     for field, record in root.items():
         item = _require_dict(record, f"{CVID_MAP_KEY}[{field!r}]")
-        value = item.get("missevanCvId")
-        if value in (None, ""):
+        value = item.get(f"{platform}CvId")
+        if value in (None, "") and platform == "missevan":
             value = item.get("cvId")
         if value in (None, ""):
             continue
         cv_id = int(value)
-        if GENERATED_MISSEVAN_CVID_MIN <= cv_id <= GENERATED_MISSEVAN_CVID_MAX:
+        minimum, maximum = ((GENERATED_MANBO_CVID_MIN, GENERATED_MANBO_CVID_MAX) if platform == "manbo"
+                            else (GENERATED_MISSEVAN_CVID_MIN, GENERATED_MISSEVAN_CVID_MAX))
+        if minimum <= cv_id <= maximum:
             display_name = re.sub(
                 r"\s+",
                 "",
@@ -971,6 +975,11 @@ def save_resource(
             ) != _generated_missevan_cvid_identities(normalized):
                 raise ValueError(
                     "Generated Missevan CVID key, displayName, and ID are registry-managed "
+                    "and cannot be added, removed, or changed in the editor."
+                )
+            if _generated_missevan_cvid_identities(original, platform="manbo") != _generated_missevan_cvid_identities(normalized, platform="manbo"):
+                raise ValueError(
+                    "Generated Manbo CVID key, displayName, and ID are registry-managed "
                     "and cannot be added, removed, or changed in the editor."
                 )
         if spec.key in JSON_META_KEYS:

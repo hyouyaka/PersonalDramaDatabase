@@ -399,6 +399,32 @@ def manbo_main_cv_display_names(record: dict | None) -> list[str]:
     return resolved
 
 
+def manbo_main_cv_entries(record: dict) -> list[dict]:
+    """Keep aligned name-only leads without inventing a Manbo account ID."""
+    if manbo_has_unknown_main_cv(record):
+        return []
+    ids = record.get("mainCvIds") or []
+    names = record.get("mainCvNames") or []
+    nicknames = record.get("mainCvNicknames") or []
+    roles = record.get("mainCvRoleNames") or []
+    missevan_ids = record.get("mainCvMissevanIds") or []
+    entries = []
+    for index in range(max(len(ids), len(names), len(nicknames))):
+        cv_id = safe_int(ids[index]) if index < len(ids) else 0
+        name = normalize(names[index]) if index < len(names) else ""
+        nickname = normalize(nicknames[index]) if index < len(nicknames) else ""
+        if not (name or nickname or cv_id):
+            continue
+        entries.append({
+            "cv_id": cv_id or None,
+            "display_name": name or nickname,
+            "nickname": nickname or name,
+            "role_name": normalize(roles[index]) if index < len(roles) else "",
+            "missevan_cv_id": (safe_int(missevan_ids[index]) or None) if index < len(missevan_ids) else None,
+        })
+    return entries
+
+
 def normalize_text_for_match(value: object) -> str:
     text = unicodedata.normalize("NFKC", normalize(value))
     return re.sub(r"\s+", " ", text).strip()
@@ -525,6 +551,39 @@ def replace_missevan_main_cv_ids(store: dict, replacements: dict[int, int]) -> s
         if drama_id:
             affected_drama_ids.add(drama_id)
     return affected_drama_ids
+
+
+def replace_manbo_main_cv_ids(store: dict, replacements: dict[int, int], *, cv_name_map: dict[int, str] | None = None) -> set[str]:
+    """Migrate all references while keeping lead names, roles and cross-platform IDs aligned."""
+    affected: set[str] = set()
+    for record in store.get("records") or []:
+        original = manbo_main_cv_entries(record)
+        if not any(entry["cv_id"] in replacements and replacements[entry["cv_id"]] != entry["cv_id"] for entry in original):
+            continue
+        entries: list[dict] = []
+        by_id: dict[int, dict] = {}
+        for entry in original:
+            cv_id = replacements.get(entry["cv_id"], entry["cv_id"])
+            entry["cv_id"] = cv_id
+            if cv_id is not None and (cv_name_map or {}).get(cv_id):
+                entry["display_name"] = cv_name_map[cv_id]
+            if cv_id is not None and cv_id in by_id:
+                previous = by_id[cv_id]
+                previous["role_name"] = " / ".join(dict.fromkeys(filter(None, [previous["role_name"], entry["role_name"]])))
+                if previous["missevan_cv_id"] is None:
+                    previous["missevan_cv_id"] = entry["missevan_cv_id"]
+                continue
+            entries.append(entry)
+            if cv_id is not None:
+                by_id[cv_id] = entry
+        record["mainCvIds"] = [entry["cv_id"] for entry in entries]
+        record["mainCvNames"] = [entry["display_name"] for entry in entries]
+        record["mainCvNicknames"] = [entry["nickname"] for entry in entries]
+        record["mainCvRoleNames"] = [entry["role_name"] for entry in entries]
+        if "mainCvMissevanIds" in record:
+            record["mainCvMissevanIds"] = [entry["missevan_cv_id"] for entry in entries]
+        affected.add(str(record["dramaId"]))
+    return affected
 
 
 def to_beijing_month(ts: int | float | None, *, milliseconds: bool = False) -> str:

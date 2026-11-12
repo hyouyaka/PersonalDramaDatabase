@@ -12,6 +12,7 @@ from platform_sync import (
     iter_missevan_nodes,
     load_json,
     manbo_has_unknown_main_cv,
+    manbo_main_cv_entries,
     missevan_main_cv_entries,
     normalize,
     normalize_match,
@@ -26,6 +27,9 @@ GENERATED_MISSEVAN_CVID_MAX = 339999
 GENERATED_MISSEVAN_CVID_RANGE = GENERATED_MISSEVAN_CVID_MAX - GENERATED_MISSEVAN_CVID_MIN + 1
 LEGACY_GENERATED_MISSEVAN_CVID_REGISTRY_KEY = "cvid:generated:missevan"
 GENERATED_MISSEVAN_CVID_REGISTRY_KEY = "cvid:generated:{missevan}"
+GENERATED_MANBO_CVID_MIN = 340000
+GENERATED_MANBO_CVID_MAX = 349999
+GENERATED_MANBO_CVID_REGISTRY_KEY = "cvid:generated:{manbo}"
 GENERATED_MISSEVAN_CVID_RESERVE_SCRIPT = """
 local existing = redis.call('HGET', KEYS[1], ARGV[1])
 if existing then
@@ -65,6 +69,47 @@ def is_generated_missevan_cvid(value: object) -> bool:
     except (TypeError, ValueError):
         return False
     return GENERATED_MISSEVAN_CVID_MIN <= cv_id <= GENERATED_MISSEVAN_CVID_MAX
+
+
+def is_generated_manbo_cvid(value: object) -> bool:
+    try:
+        return GENERATED_MANBO_CVID_MIN <= int(value) <= GENERATED_MANBO_CVID_MAX
+    except (TypeError, ValueError):
+        return False
+
+
+def collect_generated_manbo_cvids(combined_map: dict, manbo_store: dict | None = None) -> set[int]:
+    values = [row.get("manboCvId") for row in combined_map.values()]
+    values.extend(cv_id for row in (manbo_store or {}).get("records", []) for cv_id in row.get("mainCvIds") or [])
+    return {int(value) for value in values if is_generated_manbo_cvid(value)}
+
+
+def seed_generated_manbo_cvid_registry(combined_map: dict, manbo_store: dict, *, upstash) -> int:
+    owners: dict[int, str] = {}
+    for key, row in combined_map.items():
+        cv_id = row.get("manboCvId")
+        if is_generated_manbo_cvid(cv_id):
+            name = normalize(row.get("displayName") or key)
+            if int(cv_id) in owners and normalize_match(owners[int(cv_id)]) != normalize_match(name):
+                raise RuntimeError(f"Generated Manbo CVID has multiple owners: {cv_id}")
+            owners[int(cv_id)] = name
+    for row in manbo_store.get("records") or []:
+        for entry in manbo_main_cv_entries(row):
+            if is_generated_manbo_cvid(entry["cv_id"]):
+                owners.setdefault(int(entry["cv_id"]), entry["display_name"])
+    seeded = 0
+    for cv_id, name in sorted(owners.items()):
+        if not name:
+            seeded += int(upstash(["HSETNX", GENERATED_MANBO_CVID_REGISTRY_KEY, generated_cvid_id_field(cv_id), "__legacy__"]) or 0)
+            continue
+        result = int(upstash([
+            "EVAL", GENERATED_MISSEVAN_CVID_SEED_SCRIPT, 1, GENERATED_MANBO_CVID_REGISTRY_KEY,
+            generated_cvid_name_field(name), generated_cvid_id_field(cv_id), str(cv_id), normalize_match(name),
+        ]) or 0)
+        if result < 0:
+            raise RuntimeError(f"Generated Manbo CVID registry conflict for {name} ({cv_id})")
+        seeded += result
+    return seeded
 
 
 def has_conflicting_manbo_cvid(left: object, right: object) -> bool:
@@ -142,8 +187,8 @@ def seed_generated_missevan_cvid_registry(combined_map: dict, missevan_store: di
     return seeded
 
 
-def load_generated_missevan_cvid_replacements(*, upstash) -> dict[int, int]:
-    raw = upstash(["HGETALL", GENERATED_MISSEVAN_CVID_REGISTRY_KEY]) or []
+def load_generated_missevan_cvid_replacements(*, upstash, registry_key=GENERATED_MISSEVAN_CVID_REGISTRY_KEY) -> dict[int, int]:
+    raw = upstash(["HGETALL", registry_key]) or []
     items = raw.items() if isinstance(raw, dict) else zip(raw[0::2], raw[1::2])
     replacements: dict[int, int] = {}
     for field, value in items:
@@ -154,31 +199,46 @@ def load_generated_missevan_cvid_replacements(*, upstash) -> dict[int, int]:
     return replacements
 
 
-def persist_generated_missevan_cvid_replacements(replacements: dict[int, int], *, upstash) -> None:
+def persist_generated_missevan_cvid_replacements(replacements: dict[int, int], *, upstash, registry_key=GENERATED_MISSEVAN_CVID_REGISTRY_KEY) -> None:
     if not replacements:
         return
-    command: list[object] = ["HSET", GENERATED_MISSEVAN_CVID_REGISTRY_KEY]
+    command: list[object] = ["HSET", registry_key]
     for old_id, new_id in sorted(replacements.items()):
         command.extend([f"upgrade:{int(old_id)}", str(int(new_id))])
     upstash(command)
 
 
+def load_generated_manbo_cvid_replacements(*, upstash) -> dict[int, int]:
+    replacements = load_generated_missevan_cvid_replacements(upstash=upstash, registry_key=GENERATED_MANBO_CVID_REGISTRY_KEY)
+    if any(not is_generated_manbo_cvid(old) or new <= 0 or is_generated_manbo_cvid(new) for old, new in replacements.items()):
+        raise RuntimeError("Invalid generated Manbo CVID replacement registry")
+    return replacements
+
+
 class UpstashGeneratedMissevanCvIdAllocator:
+    minimum = GENERATED_MISSEVAN_CVID_MIN
+    maximum = GENERATED_MISSEVAN_CVID_MAX
+    registry_key = GENERATED_MISSEVAN_CVID_REGISTRY_KEY
+    collect_used = staticmethod(collect_generated_missevan_cvids)
+    is_generated = staticmethod(is_generated_missevan_cvid)
+    label = "Missevan"
+
     def __init__(self, *, upstash, randbelow=secrets.randbelow) -> None:
         self.upstash = upstash
         self.randbelow = randbelow
 
     def __call__(self, combined_map: dict, display_name: object) -> int:
-        used = collect_generated_missevan_cvids(combined_map)
+        used = self.collect_used(combined_map)
         name_field = generated_cvid_name_field(display_name)
         normalized_name = normalize_match(display_name)
-        start = self.randbelow(GENERATED_MISSEVAN_CVID_RANGE)
+        capacity = self.maximum - self.minimum + 1
+        start = self.randbelow(capacity)
         coprime_steps = [
-            step for step in range(1, GENERATED_MISSEVAN_CVID_RANGE) if math.gcd(step, GENERATED_MISSEVAN_CVID_RANGE) == 1
+            step for step in range(1, capacity) if math.gcd(step, capacity) == 1
         ]
         step = coprime_steps[self.randbelow(len(coprime_steps))]
-        for attempt in range(GENERATED_MISSEVAN_CVID_RANGE):
-            candidate = GENERATED_MISSEVAN_CVID_MIN + (start + attempt * step) % GENERATED_MISSEVAN_CVID_RANGE
+        for attempt in range(capacity):
+            candidate = self.minimum + (start + attempt * step) % capacity
             if candidate in used:
                 continue
             reserved = self.upstash(
@@ -186,7 +246,7 @@ class UpstashGeneratedMissevanCvIdAllocator:
                     "EVAL",
                     GENERATED_MISSEVAN_CVID_RESERVE_SCRIPT,
                     1,
-                    GENERATED_MISSEVAN_CVID_REGISTRY_KEY,
+                    self.registry_key,
                     name_field,
                     generated_cvid_id_field(candidate),
                     str(candidate),
@@ -195,18 +255,27 @@ class UpstashGeneratedMissevanCvIdAllocator:
             )
             reserved_id = int(reserved or 0)
             if reserved_id != 0:
-                if not is_generated_missevan_cvid(reserved_id):
+                if not self.is_generated(reserved_id):
                     raise RuntimeError(
-                        f"Generated Missevan CVID registry returned invalid ID {reserved_id} "
+                        f"Generated {self.label} CVID registry returned invalid ID {reserved_id} "
                         f"for {normalize(display_name)}."
                     )
                 if reserved_id in used:
                     raise RuntimeError(
-                        f"Generated Missevan CVID registry returned occupied ID {reserved_id} "
+                        f"Generated {self.label} CVID registry returned occupied ID {reserved_id} "
                         f"for {normalize(display_name)}."
                     )
                 return reserved_id
-        raise RuntimeError("Generated Missevan CVID range 330000-339999 is exhausted.")
+        raise RuntimeError(f"Generated {self.label} CVID range {self.minimum}-{self.maximum} is exhausted.")
+
+
+class UpstashGeneratedManboCvIdAllocator(UpstashGeneratedMissevanCvIdAllocator):
+    minimum = GENERATED_MANBO_CVID_MIN
+    maximum = GENERATED_MANBO_CVID_MAX
+    registry_key = GENERATED_MANBO_CVID_REGISTRY_KEY
+    collect_used = staticmethod(collect_generated_manbo_cvids)
+    is_generated = staticmethod(is_generated_manbo_cvid)
+    label = "Manbo"
 
 
 class RemoteCombinedMap(dict):
@@ -265,6 +334,8 @@ def fetch_missevan_cv_avatar(cv_id: int, requester: MissevanRequester) -> str:
 
 
 def fetch_manbo_cv_avatar(cv_id: int, *, manbo_request=request_manbo_json) -> str:
+    if is_generated_manbo_cvid(cv_id):
+        return ""
     payload = manbo_request(f"https://api.kilamanbo.com/api/v530/personal/homepage/getUserBaseInfo?uid={cv_id}")
     return normalize_avatar_url((((payload.get("b") or {}).get("userResp") or {}).get("headPortraitUrl")))
 
@@ -316,7 +387,7 @@ def payload_avatar(payload: dict, *, avatar_lookup=None, force: bool = False) ->
         if avatar:
             return avatar
     manbo_id = payload.get("manboCvId")
-    if manbo_id not in (None, ""):
+    if manbo_id not in (None, "") and not is_generated_manbo_cvid(manbo_id):
         avatar = normalize_avatar_url(avatar_lookup("漫播", int(manbo_id)))
         if avatar and missevan_id not in (None, "") and hasattr(avatar_lookup, "fallback_to_manbo"):
             avatar_lookup.fallback_to_manbo += 1
@@ -401,6 +472,126 @@ def ensure_generated_missevan_cv_entry(combined_map: dict, display_name: object,
     return generated_id, True
 
 
+def ensure_generated_manbo_cv_entry(combined_map: dict, display_name: object, *, allocator) -> tuple[int | None, bool]:
+    name = normalize(display_name)
+    if not name:
+        return None, False
+    keys = [key for key, row in combined_map.items() if normalize_match(name) in {
+        normalize_match(value) for value in [key, row.get("displayName"), *(row.get("aliases") or [])]
+        if normalize(value)
+    }]
+    if len(keys) > 1:
+        return None, False
+    key = keys[0] if keys else name
+    row = dict(combined_map.get(key) or {})
+    existing = row.get("manboCvId")
+    if existing not in (None, ""):
+        return int(existing), False
+    canonical = normalize(row.get("displayName") or key)
+    cv_id = int(allocator(combined_map, canonical))
+    if not is_generated_manbo_cvid(cv_id):
+        raise RuntimeError(f"Invalid generated Manbo CVID: {cv_id}")
+    row.update(manboCvId=cv_id, manboIdSource="generated", displayName=canonical, updatedAt=utc_now())
+    for field in ("cvId", "missevanCvId"):
+        row.setdefault(field, None)
+    row.setdefault("aliases", [])
+    row.setdefault("avatar", "")
+    row.setdefault("source", "observed")
+    note = f"漫播搜索未命中，使用自动生成 CVID {cv_id}"
+    row["notes"] = "；".join(filter(None, [normalize(row.get("notes")), note]))
+    combined_map[key] = row
+    return cv_id, True
+
+
+def persist_generated_manbo_cvid_replacements(replacements: dict[int, int], *, upstash) -> None:
+    if not replacements:
+        return
+    args = [value for old, new in sorted(replacements.items()) for value in (f"upgrade:{old}", str(new))]
+    result = upstash(["EVAL", """
+for i = 1, #ARGV, 2 do
+  local existing = redis.call('HGET', KEYS[1], ARGV[i])
+  if existing and existing ~= ARGV[i + 1] then return 0 end
+end
+for i = 1, #ARGV, 2 do redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1]) end
+return 1
+""", 1, GENERATED_MANBO_CVID_REGISTRY_KEY, *args])
+    if int(result or 0) != 1:
+        raise RuntimeError("Conflicting generated Manbo CVID replacement registry")
+
+
+def _reconcile_generated_manbo_ids(current: dict, replacements: dict[int, int], observed: list[ObservedCV], ambiguous: list[str]) -> tuple[dict[int, int], int]:
+    desired = dict(replacements)
+    conflicted: set[int] = set()
+
+    def propose(old_id: int, real_id: int, name: str) -> None:
+        if old_id in conflicted:
+            return
+        if old_id in desired and desired[old_id] != real_id:
+            # No candidate may win by order, including a later repeated observation.
+            desired.pop(old_id)
+            conflicted.add(old_id)
+            ambiguous.append(f"漫播:{name}:conflicting-upgrade")
+            return
+        desired[old_id] = real_id
+
+    for item in observed:
+        real_id = item.platform_cv_id
+        if item.platform != "漫播" or real_id is None:
+            continue
+        names = {normalize_match(name) for name in [item.display_name, *item.aliases] if normalize(name)}
+        if is_generated_manbo_cvid(real_id):
+            targets = {int(row["manboCvId"]) for key, row in current.items()
+                       if row.get("manboCvId") not in (None, "") and not is_generated_manbo_cvid(row["manboCvId"])
+                       and names & {normalize_match(name) for name in [key, row.get("displayName"), *(row.get("aliases") or [])] if normalize(name)}}
+            if len(targets) == 1:
+                propose(int(real_id), targets.pop(), item.display_name)
+            continue
+        sources = [row for key, row in current.items() if is_generated_manbo_cvid(row.get("manboCvId")) and names & {
+            normalize_match(name) for name in [key, row.get("displayName"), *(row.get("aliases") or [])] if normalize(name)
+        }]
+        if len(sources) == 1:
+            old_id = int(sources[0]["manboCvId"])
+            propose(old_id, int(real_id), item.display_name)
+    accepted: dict[int, int] = {}
+    changed = 0
+    for old_id, real_id in desired.items():
+        if not is_generated_manbo_cvid(old_id) or int(real_id) <= 0 or is_generated_manbo_cvid(real_id):
+            raise ValueError(f"Invalid Manbo CVID replacement: {old_id} -> {real_id}")
+        source_keys = [key for key, row in current.items() if row.get("manboCvId") not in (None, "") and int(row["manboCvId"]) == old_id]
+        target_keys = [key for key, row in current.items() if row.get("manboCvId") not in (None, "") and int(row["manboCvId"]) == real_id]
+        if not source_keys and len(target_keys) == 1:
+            accepted[old_id] = real_id  # Retry migration after an earlier successful map publication.
+            continue
+        if len(source_keys) != 1 or len(target_keys) > 1:
+            ambiguous.append(f"漫播:{old_id}:upgrade-targets")
+            continue
+        source_key = source_keys[0]
+        source = current[source_key]
+        target_key = target_keys[0] if target_keys else source_key
+        target = dict(current[target_key])
+        source_cat = source.get("missevanCvId") or source.get("cvId")
+        target_cat = target.get("missevanCvId") or target.get("cvId")
+        if source_cat and target_cat and int(source_cat) != int(target_cat):
+            ambiguous.append(f"漫播:{source_key}:missevan-conflict={target_key}")
+            continue
+        canonical = normalize(target.get("displayName") or target_key)
+        aliases = [*(target.get("aliases") or []), *(source.get("aliases") or []), source_key, source.get("displayName")]
+        target["aliases"] = list(dict.fromkeys(normalize(alias) for alias in aliases
+                                                if normalize(alias) and normalize_match(alias) != normalize_match(canonical)))
+        for field in ("cvId", "missevanCvId", "avatar"):
+            if not target.get(field) and source.get(field):
+                target[field] = source[field]
+        target.update(manboCvId=int(real_id), manboIdSource="platform", updatedAt=utc_now())
+        note = f"自动生成漫播 CVID {old_id} 已升级为真实漫播 CVID {real_id}"
+        target["notes"] = "；".join(dict.fromkeys(filter(None, [normalize(target.get("notes")), normalize(source.get("notes")), note])))
+        current[target_key] = target
+        if target_key != source_key:
+            del current[source_key]
+        accepted[old_id] = real_id
+        changed += 1
+    return accepted, changed
+
+
 def _nickname_variants(value: object) -> list[str]:
     text = normalize(value)
     if not text:
@@ -451,12 +642,15 @@ def collect_observed_cvs(
             continue
         if manbo_has_unknown_main_cv(record):
             continue
-        ids = record.get("mainCvIds") or []
-        names = record.get("mainCvNicknames") or []
-        for idx, cv_id in enumerate(ids):
-            raw_name = normalize(names[idx] if idx < len(names) else "")
+        for entry in manbo_main_cv_entries(record):
+            raw_name = entry["nickname"]
             aliases = _nickname_variants(raw_name)
-            observed.append(ObservedCV("漫播", raw_name or f"漫播CV_{cv_id}", int(cv_id), aliases))
+            cv_id = entry["cv_id"]
+            # Use the canonical name for name-only records; preserve platform nicknames as aliases.
+            display_name = entry["display_name"] or raw_name or f"漫播CV_{cv_id}"
+            observed.append(ObservedCV("漫播", display_name, cv_id, aliases))
+            if entry["missevan_cv_id"] is not None:
+                observed.append(ObservedCV("猫耳", display_name, entry["missevan_cv_id"], aliases))
     return observed
 
 
@@ -471,6 +665,7 @@ def update_combined_cvid_map(
     avatar_lookup=None,
     force_avatar: bool = False,
     persistent_generated_replacements: dict[int, int] | None = None,
+    persistent_manbo_generated_replacements: dict[int, int] | None = None,
 ) -> dict:
     current = load_remote_combined_map(upstash=upstash) if remote else load_combined_map()
     now = utc_now()
@@ -479,6 +674,12 @@ def update_combined_cvid_map(
     updated = 0
     unchanged = 0
     generated_replacements: dict[int, int] = dict(persistent_generated_replacements or {})
+    observed = collect_observed_cvs(missevan_store, manbo_store,
+                                   missevan_drama_ids=missevan_drama_ids, manbo_drama_ids=manbo_drama_ids)
+    manbo_replacements, manbo_upgraded = _reconcile_generated_manbo_ids(
+        current, persistent_manbo_generated_replacements or {}, observed, ambiguous,
+    )
+    updated += manbo_upgraded
 
     for key, existing_payload in list(current.items()):
         payload = dict(existing_payload)
@@ -544,6 +745,7 @@ def update_combined_cvid_map(
                 target["avatar"] = payload.get("avatar")
             if target.get("manboCvId") in (None, "") and payload.get("manboCvId") not in (None, ""):
                 target["manboCvId"] = payload.get("manboCvId")
+                target["manboIdSource"] = "generated" if is_generated_manbo_cvid(target["manboCvId"]) else "platform"
             target["updatedAt"] = now
             upgrade_note = f"自动生成 CVID {upgrade_source_id} 已合并到真实猫耳 CVID {int(real_id)}"
             current_notes = normalize(target.get("notes"))
@@ -583,12 +785,9 @@ def update_combined_cvid_map(
         if normalize(key):
             register_indexes(key, payload)
 
-    for item in collect_observed_cvs(
-        missevan_store,
-        manbo_store,
-        missevan_drama_ids=missevan_drama_ids,
-        manbo_drama_ids=manbo_drama_ids,
-    ):
+    for item in observed:
+        if item.platform == "漫播" and item.platform_cv_id in manbo_replacements:
+            item = ObservedCV(item.platform, item.display_name, manbo_replacements[item.platform_cv_id], item.aliases)
         candidate_keys: set[str] = set()
         if item.platform_cv_id is not None:
             id_index = missevan_id_index if item.platform == "猫耳" else manbo_id_index
@@ -644,6 +843,10 @@ def update_combined_cvid_map(
                 next_manbo_cv_id = int(item.platform_cv_id) if item.platform_cv_id is not None else payload.get("manboCvId")
                 id_changed = payload.get("manboCvId") != next_manbo_cv_id
                 payload["manboCvId"] = next_manbo_cv_id
+                if next_manbo_cv_id is not None:
+                    source = "generated" if is_generated_manbo_cvid(next_manbo_cv_id) else "platform"
+                    generated_metadata_changed = payload.get("manboIdSource") != source
+                    payload["manboIdSource"] = source
             aliases = []
             for alias in payload.get("aliases") or []:
                 alias = normalize(alias)
@@ -666,6 +869,7 @@ def update_combined_cvid_map(
                 continue
             payload["updatedAt"] = now
             current[key] = payload
+            register_indexes(key, payload)
             updated += 1
             continue
 
@@ -687,6 +891,8 @@ def update_combined_cvid_map(
             "notes": "猫耳搜索未命中，以显示名称识别" if item.platform == "猫耳" and item.platform_cv_id is None else "",
         }
         payload["avatar"] = payload_avatar(payload, avatar_lookup=avatar_lookup, force=force_avatar)
+        if payload.get("manboCvId") is not None:
+            payload["manboIdSource"] = "generated" if is_generated_manbo_cvid(payload["manboCvId"]) else "platform"
         current[key] = payload
         register_indexes(key, payload)
         created += 1
@@ -697,6 +903,7 @@ def update_combined_cvid_map(
 
             upstash = upstash_request
         persist_generated_missevan_cvid_replacements(generated_replacements, upstash=upstash)
+        persist_generated_manbo_cvid_replacements(manbo_replacements, upstash=upstash)
         save_remote_combined_map(current, upstash=upstash)
     else:
         save_combined_map(current)
@@ -708,4 +915,5 @@ def update_combined_cvid_map(
         "ambiguous_samples": ambiguous[:20],
         "total_entries": len(current),
         "missevan_generated_replacements": generated_replacements,
+        "manbo_generated_replacements": manbo_replacements,
     }

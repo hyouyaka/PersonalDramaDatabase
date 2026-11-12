@@ -86,12 +86,17 @@ class AppendInfoBackupTests(unittest.TestCase):
         download.assert_called_once_with(append_missevan_ids.MISSEVAN_INFO_KEY, append_missevan_ids.MISSEVAN_INFO_PATH)
         download_support.assert_called_once_with()
 
-    def test_append_manbo_downloads_only_manbo_info(self) -> None:
+    def test_append_manbo_downloads_manbo_info_and_current_cv_map(self) -> None:
         with (
             patch.object(append_manbo_ids, "load_env_file"),
             patch.object(append_manbo_ids, "download_info_file") as download,
+            patch.object(append_manbo_ids, "download_support_files") as download_support,
+            patch.object(append_manbo_ids, "seed_generated_manbo_cvid_registry", return_value=0),
+            patch.object(append_manbo_ids, "load_generated_manbo_cvid_replacements", return_value={}),
+            patch.object(append_manbo_ids, "UpstashGeneratedManboCvIdAllocator"),
             patch.object(append_manbo_ids, "upsert_manbo_drama_ids", return_value={"processed": 1}),
-            patch.object(append_manbo_ids, "load_json", return_value={"records": []}),
+            patch.object(append_manbo_ids, "load_json", side_effect=lambda path, _default:
+                         {"records": []} if path == append_manbo_ids.MANBO_INFO_PATH else {}),
             patch.object(
                 append_manbo_ids,
                 "update_combined_cvid_map",
@@ -103,6 +108,7 @@ class AppendInfoBackupTests(unittest.TestCase):
             self.assertEqual(append_manbo_ids.main(["append_manbo_ids.py", "200"]), 0)
 
         download.assert_called_once_with(append_manbo_ids.MANBO_INFO_KEY, append_manbo_ids.MANBO_INFO_PATH)
+        download_support.assert_called_once_with()
 
     def test_append_missevan_continues_when_avatar_lookup_hits_418(self) -> None:
         def fake_update(*args, avatar_lookup=None, **kwargs):

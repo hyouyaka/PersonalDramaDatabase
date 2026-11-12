@@ -18,6 +18,7 @@ from platform_sync import (
     load_cache,
     load_json,
     manbo_has_unknown_main_cv,
+    manbo_main_cv_entries,
     missevan_main_cv_entries,
     normalize,
     normalize_match,
@@ -234,11 +235,9 @@ def build_rows() -> list[dict]:
         base_title = base_series_title(title_value)
         genre = normalize(record.get("genre") or GENRE_BY_TYPE.get(int(record.get("type") or 0), ""))
         catalog_name = normalize_manbo_catalog_name(record.get("catalogName"), catalog)
-        ids = [int(item) for item in (record.get("mainCvIds") or [])]
-        names = record.get("mainCvNicknames") or []
-        roles = record.get("mainCvRoleNames") or []
-        for idx, cv_id in enumerate(ids):
-            raw_name = normalize(names[idx] if idx < len(names) else "")
+        for entry in manbo_main_cv_entries(record):
+            cv_id = entry["cv_id"]
+            raw_name = entry["display_name"]
             cv_name = resolve_cv_name(raw_name, cv_id, platform="漫播", missevan_ids=missevan_ids, manbo_ids=manbo_ids, name_index=name_index)
             key = (cv_name, "漫播", catalog, base_title)
             bucket = buckets.setdefault(
@@ -258,7 +257,7 @@ def build_rows() -> list[dict]:
             drama_id = str(record.get("dramaId") or "").strip()
             if drama_id and drama_id not in bucket["drama_ids"]:
                 bucket["drama_ids"].append(drama_id)
-            role_name = normalize(roles[idx] if idx < len(roles) else "")
+            role_name = entry["role_name"]
             if role_name:
                 bucket["role_names"].append(role_name)
             create_month = normalize(record.get("createTime"))

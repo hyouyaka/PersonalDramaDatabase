@@ -2,18 +2,29 @@ from __future__ import annotations
 
 import sys
 
-from cvid_map_tools import BestEffortAvatarLookup, CvAvatarLookup, update_combined_cvid_map
+from cvid_map_tools import (
+    BestEffortAvatarLookup, CvAvatarLookup, update_combined_cvid_map,
+    UpstashGeneratedManboCvIdAllocator, seed_generated_manbo_cvid_registry,
+    load_generated_manbo_cvid_replacements,
+)
 from platform_sync import is_numeric_drama_id, load_json, MANBO_INFO_PATH, MISSEVAN_INFO_PATH
 from platform_sync import is_excluded_drama
+from platform_sync import COMBINED_CVID_MAP_PATH, manbo_main_cv_entries, replace_manbo_main_cv_ids, save_json
 from refresh_platform_metadata import upsert_manbo_drama_ids
 from sync_new_drama_ids import (
     MANBO_INFO_KEY,
     ROOT,
     download_info_file,
+    download_support_files,
     load_env_file,
     merge_and_upload_info_file,
     upstash_request,
 )
+
+
+def _referenced_manbo_cv_ids(store: dict) -> set[int]:
+    return {entry["cv_id"] for record in store.get("records") or []
+            for entry in manbo_main_cv_entries(record) if entry["cv_id"] is not None}
 
 
 def main(argv: list[str]) -> int:
@@ -33,9 +44,21 @@ def main(argv: list[str]) -> int:
             return 0
     load_env_file(ROOT / ".env")
     download_info_file(MANBO_INFO_KEY, MANBO_INFO_PATH)
-    target_drama_ids = set(drama_ids)
-    stats = upsert_manbo_drama_ids(drama_ids, force=True)
+    download_support_files()
     manbo_store = load_json(MANBO_INFO_PATH, {"records": []})
+    combined_map = load_json(COMBINED_CVID_MAP_PATH, {})
+    seed_generated_manbo_cvid_registry(combined_map, manbo_store, upstash=upstash_request)
+    replacements = load_generated_manbo_cvid_replacements(upstash=upstash_request)
+    referenced_ids = _referenced_manbo_cv_ids(manbo_store)
+    target_drama_ids = set(drama_ids)
+    stats = upsert_manbo_drama_ids(drama_ids, force=True,
+                                  generated_cv_id_allocator=UpstashGeneratedManboCvIdAllocator(upstash=upstash_request))
+    manbo_store = load_json(MANBO_INFO_PATH, {"records": []})
+    # A refresh may remove the last old reference or introduce one through reused
+    # metadata. Confirm both sets, plus every upgrade discovered in this run.
+    referenced_ids.update(_referenced_manbo_cv_ids(manbo_store))
+    replacements = {old: new for old, new in replacements.items() if old in referenced_ids}
+    replacements.update(stats.get("manbo_generated_replacements") or {})
     records = manbo_store.get("records") or []
     synced_main_cv_names = sum(
         1
@@ -55,8 +78,24 @@ def main(argv: list[str]) -> int:
         remote=True,
         upstash=upstash_request,
         avatar_lookup=BestEffortAvatarLookup(CvAvatarLookup()),
+        persistent_manbo_generated_replacements=replacements,
     )
-    merge_and_upload_info_file(MANBO_INFO_KEY, MANBO_INFO_PATH, drama_ids)
+    confirmed = dict(map_stats.get("manbo_generated_replacements") or {})
+    unconfirmed = {old: new for old, new in replacements.items() if confirmed.get(old) != new}
+    if unconfirmed:
+        raise RuntimeError(
+            "Refusing to publish Manbo info with unconfirmed CVID replacements: "
+            + ", ".join(f"{old}->{new}" for old, new in sorted(unconfirmed.items()))
+        )
+    replacements = confirmed
+    combined_map = load_json(COMBINED_CVID_MAP_PATH, {})
+    names = {int(row["manboCvId"]): row.get("displayName") or key
+             for key, row in combined_map.items() if row.get("manboCvId") not in (None, "")}
+    migrated = replace_manbo_main_cv_ids(manbo_store, replacements, cv_name_map=names)
+    if migrated:
+        save_json(MANBO_INFO_PATH, manbo_store)
+    merge_and_upload_info_file(MANBO_INFO_KEY, MANBO_INFO_PATH, list(dict.fromkeys([*drama_ids, *sorted(migrated)])))
+    print("migrated 漫播 dramas:", len(migrated))
     print("漫播 processed:", stats["processed"])
     print("漫播 watch counts updated:", stats["processed"])
     print("漫播 mainCvNames synced:", synced_main_cv_names)

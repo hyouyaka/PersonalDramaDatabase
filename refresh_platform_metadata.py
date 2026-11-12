@@ -12,11 +12,14 @@ from clean_manbo_pricing import MANBO_PRICING_EXCLUSIONS, classify_manbo_pricing
 from archive_manager import ARCHIVE_ENABLED, ARCHIVE_RETRY_DELAYS, apply_local_archive_candidates
 from cvid_map_tools import (
     ensure_generated_missevan_cv_entry,
+    ensure_generated_manbo_cv_entry,
     ensure_name_only_cv_entry,
     has_conflicting_manbo_cvid,
     is_generated_missevan_cvid,
+    is_generated_manbo_cvid,
     load_combined_map,
     save_combined_map,
+    update_combined_cvid_map,
 )
 from platform_sync import (
     GENRE_BY_TYPE,
@@ -53,6 +56,7 @@ from platform_sync import (
     missevan_main_cv_entries,
     missevan_has_unknown_main_cv,
     manbo_has_unknown_main_cv,
+    manbo_main_cv_entries,
     normalize,
     normalize_match,
     pick_first_episode_month,
@@ -85,6 +89,10 @@ MISSEVAN_INTRO_SECTION_PATTERN = re.compile(
 )
 # Double-dash credits may put the CV first; only add the single-dash format.
 MISSEVAN_INTRO_ROLE_CV_PATTERN = re.compile(r"^(?P<role>[^：:—\n]{1,40})(?:[：:]|—(?!—))(?P<cv>.+)$")
+MANBO_INTRO_CREDIT_LABEL_PATTERN = re.compile(
+    r"^(?:主役(?:\s*CV)?|主要(?:配音|演员)|配音(?:演员|阵容|组)?|演员(?:阵容|组)?|"
+    r"领衔(?:主演|配音)?|主演|CV|CAST)\s*[：:]\s*", re.I,
+)
 MISSEVAN_CV_SUFFIX_PATTERN = re.compile(r"\s*(?:@|＠|【|\[|（|\(|<|《).*$")
 MISSEVAN_CV_ACCOUNT_END_PATTERN = re.compile(r"[\s、，,；;【\[（\(<《]")
 MISSEVAN_INTRO_STAFF_ROLE_NAMES = {
@@ -1425,7 +1433,110 @@ def upsert_missevan_drama_ids(
     )
 
 
-def build_manbo_record(record: dict, payload: dict, manbo_cv_name_map: dict[int, str] | None = None) -> dict:
+def extract_manbo_intro_cv_candidates(desc: object, *, limit: int = 2) -> list[dict]:
+    candidates = extract_missevan_intro_cv_candidates(desc, limit=limit)
+    # Manbo also embeds credits inline: 梵叶（旁白）、一礼（楚淮予）等精彩演绎。
+    for line in missevan_intro_text_lines(desc):
+        if not re.search(r"演绎|配音|饰演|领衔|主演|(?:演员|主役|CV|CAST)\s*[：:]", line, re.I):
+            continue
+        for match in re.finditer(
+            r"(?:^|[、，,；;])\s*(?P<cv>[^、，,；;()（）]{1,40})[（(](?P<role>[^()（）]{1,40})[）)]",
+            line,
+        ):
+            role = normalize(match.group("role"))
+            credit_name = MANBO_INTRO_CREDIT_LABEL_PATTERN.sub("", normalize(match.group("cv")))
+            name = clean_missevan_intro_cv_name(credit_name)
+            if not name or is_missevan_intro_narrator_role(role) or is_missevan_intro_staff_role(role):
+                continue
+            if all(normalize_match(row["display_name"]) != normalize_match(name) for row in candidates):
+                candidates.append({"display_name": name, "role_name": role})
+    return candidates[:limit]
+
+
+def search_manbo_cv(name: str) -> dict | None:
+    payload = request_manbo_json(
+        "https://api.kilamanbo.com/api/v530/search/page/content/new"
+        f"?type=3&keyWord={quote(normalize(name))}&pageNo=1&pageSize=20"
+    )
+    header = payload.get("h") or {}
+    if safe_int(header.get("code"), 200) != 200:
+        raise RuntimeError(f"Manbo CV search failed: {header.get('msg')}")
+    body = payload.get("b")
+    if not isinstance(body, dict):
+        raise RuntimeError("Manbo CV search response is missing its body")
+    groups = body.get("searchStructureNewRespList", body.get("searchStructureRespList"))
+    if not isinstance(groups, list):
+        raise RuntimeError("Manbo CV search response is missing its result list")
+    matches = {}
+    for group in groups:
+        for row in group.get("timelineItemResp") or []:
+            user = row.get("userResp") or {}
+            if normalize_match(user.get("nickname")) != normalize_match(name):
+                continue
+            cv_id = safe_int(user.get("id"))
+            if cv_id > 0:
+                matches[cv_id] = {"manboCvId": cv_id, "display_name": normalize(user.get("nickname"))}
+    return next(iter(matches.values())) if len(matches) == 1 else None
+
+
+def apply_manbo_intro_cv_fallback(
+    record: dict, desc: object, *, combined_map: dict, search_cv=None, generated_cv_id_allocator=None,
+) -> dict:
+    drama_id = str(record.get("dramaId") or "")
+    if manbo_has_unknown_main_cv(record) or drama_id in MANBO_MAINCV_OVERRIDES:
+        return record
+    original_entries = manbo_main_cv_entries(record)
+    entries = [entry for entry in original_entries if not is_missevan_intro_narrator_role(entry["role_name"])]
+    limit = 4 if int(record.get("type") or 0) == 3 else 2
+    if len(entries) >= limit:
+        return record
+    candidates = extract_manbo_intro_cv_candidates(desc, limit=limit + len(entries))
+    for candidate in candidates:
+        if len(entries) >= limit:
+            break
+        name = candidate["display_name"]
+        if any(normalize_match(name) in {normalize_match(e["display_name"]), normalize_match(e["nickname"])} for e in entries):
+            continue
+        keys = [key for key, value in combined_map.items() if normalize_match(name) in {
+            normalize_match(alias) for alias in [key, value.get("displayName"), *(value.get("aliases") or [])]
+            if normalize(alias)
+        }]
+        if len(keys) > 1:
+            print(f"[漫播] ambiguous intro CV skipped: {name}")
+            continue
+        mapped = combined_map[keys[0]] if keys else {}
+        cv_id = safe_int(mapped.get("manboCvId")) or None
+        missevan_id = safe_int(mapped.get("missevanCvId") or mapped.get("cvId")) or None
+        canonical = normalize(mapped.get("displayName") or (keys[0] if keys else name))
+        if (cv_id is None or is_generated_manbo_cvid(cv_id)) and search_cv is not None:
+            found = search_cv(name) or {}
+            cv_id = safe_int(found.get("manboCvId")) or cv_id
+            missevan_id = safe_int(found.get("missevanCvId")) or missevan_id
+        if cv_id is None and generated_cv_id_allocator is not None:
+            cv_id, _created = ensure_generated_manbo_cv_entry(
+                combined_map, canonical, allocator=generated_cv_id_allocator,
+            )
+        if any(normalize_match(e["display_name"]) == normalize_match(canonical)
+               or (cv_id is not None and e["cv_id"] == cv_id) for e in entries):
+            continue
+        entries.append({"cv_id": cv_id, "missevan_cv_id": missevan_id,
+                        "display_name": canonical, "nickname": name, "role_name": candidate["role_name"]})
+    if not candidates or entries == original_entries:
+        return record
+    updated = dict(record)
+    updated["mainCvIds"] = [entry["cv_id"] for entry in entries]
+    updated["mainCvMissevanIds"] = [entry["missevan_cv_id"] for entry in entries]
+    updated["mainCvNames"] = [entry["display_name"] for entry in entries]
+    updated["mainCvNicknames"] = [entry["nickname"] for entry in entries]
+    updated["mainCvRoleNames"] = [entry["role_name"] for entry in entries]
+    return updated
+
+
+def build_manbo_record(
+    record: dict, payload: dict, manbo_cv_name_map: dict[int, str] | None = None,
+    *, combined_map: dict | None = None, search_cv=None,
+    generated_cv_id_allocator=None,
+) -> dict:
     data = payload.get("data") or {}
     manual_unknown_main_cv = manbo_has_unknown_main_cv(record)
     catalog = data.get("catelog")
@@ -1481,6 +1592,7 @@ def build_manbo_record(record: dict, payload: dict, manbo_cv_name_map: dict[int,
         for idx, cv_id in enumerate(updated["mainCvIds"])
     ]
     updated["mainCvRoleNames"] = [entry["role_name"] for entry in main_entries]
+    updated.pop("mainCvMissevanIds", None)
     if manual_unknown_main_cv:
         updated["mainCvIds"] = []
         updated["mainCvNicknames"] = [UNKNOWN_MAIN_CV_MARKER]
@@ -1493,7 +1605,11 @@ def build_manbo_record(record: dict, payload: dict, manbo_cv_name_map: dict[int,
     pricing_category = classify_manbo_pricing(payload or {})
     updated["needpay"] = drama_id in MANBO_PRICING_EXCLUSIONS or pricing_category not in {"free", "100_redbean"}
     updated["vipFree"] = manbo_vip_free_from_payload(payload)
-    return apply_manbo_record_field_overrides(updated)
+    updated = apply_manbo_record_field_overrides(updated)
+    return apply_manbo_intro_cv_fallback(
+        updated, data.get("desc"), combined_map=combined_map if combined_map is not None else {}, search_cv=search_cv,
+        generated_cv_id_allocator=generated_cv_id_allocator,
+    )
 
 
 def manbo_vip_free_from_payload(payload: dict) -> int:
@@ -1512,11 +1628,32 @@ def finalize_manbo_records(records: list[dict]) -> None:
     finalize_series_titles(records, title_key="name", catalog_key="catalog", catalog_name_key="catalogName", output_key="seriesTitle")
 
 
-def refresh_manbo(*, target_drama_ids: set[str] | None = None, force: bool = True, all_age_only: bool = False) -> dict:
+def refresh_manbo(
+    *, target_drama_ids: set[str] | None = None, force: bool = True, all_age_only: bool = False,
+    generated_cv_id_allocator=None,
+) -> dict:
     info = load_json(MANBO_INFO_PATH, {"version": 1, "updatedAt": None, "records": []})
     records = info.get("records", [])
     cache = load_cache(MANBO_COUNTS_PATH)
     manbo_cv_name_map = build_manbo_cv_name_map()
+    combined_map = load_combined_map()
+    intro_updated_ids: set[str] = set()
+    cv_search_cache: dict[str, dict | None] = {}
+    missevan_requester = None
+
+    def search_intro_cv(name: str) -> dict | None:
+        nonlocal missevan_requester
+        key = normalize_match(name)
+        if key not in cv_search_cache:
+            found = search_manbo_cv(name)
+            if found is None:
+                if missevan_requester is None:
+                    missevan_requester = MissevanRequester()
+                missevan_found = search_missevan_cv(name, missevan_requester)
+                if missevan_found is not None:
+                    found = {"missevanCvId": missevan_found["cv_id"]}
+            cv_search_cache[key] = found
+        return cv_search_cache[key]
     unknown_catalogs: set[int] = set()
     missing_catalog = 0
     processed = 0
@@ -1570,7 +1707,11 @@ def refresh_manbo(*, target_drama_ids: set[str] | None = None, force: bool = Tru
             else:
                 print(f"[漫播] WARN existing record rejected by current detail ID={drama_id}: {reason}")
             continue
-        updated = build_manbo_record(record, payload, manbo_cv_name_map)
+        updated = build_manbo_record(record, payload, manbo_cv_name_map,
+                                     combined_map=combined_map, search_cv=search_intro_cv,
+                                     generated_cv_id_allocator=generated_cv_id_allocator)
+        if "mainCvMissevanIds" in updated:
+            intro_updated_ids.add(drama_id)
         if updated.get("catalog") is None:
             missing_catalog += 1
         elif int(updated["catalog"]) not in set(MANBO_CATALOG_NAME_BY_ID):
@@ -1594,16 +1735,20 @@ def refresh_manbo(*, target_drama_ids: set[str] | None = None, force: bool = Tru
     info["updatedAt"] = utc_now()
     save_json(MANBO_INFO_PATH, info)
     save_cache(MANBO_COUNTS_PATH, cache)
+    map_stats = {}
+    if intro_updated_ids:
+        map_stats = update_combined_cvid_map({}, info, missevan_drama_ids=set(), manbo_drama_ids=intro_updated_ids)
     return {
         "processed": processed,
         "skipped": skipped,
         "unknown_catalogs": sorted(unknown_catalogs),
         "missing_catalog": missing_catalog,
         "rejected": rejected,
+        "manbo_generated_replacements": map_stats.get("manbo_generated_replacements", {}),
     }
 
 
-def upsert_manbo_drama_ids(drama_ids: list[str], *, force: bool = True) -> dict:
+def upsert_manbo_drama_ids(drama_ids: list[str], *, force: bool = True, generated_cv_id_allocator=None) -> dict:
     excluded = [str(value) for value in drama_ids if is_excluded_drama("manbo", value)]
     if excluded:
         raise ValueError(f"Excluded 漫播 dramaIds: {', '.join(excluded)}")
@@ -1627,7 +1772,8 @@ def upsert_manbo_drama_ids(drama_ids: list[str], *, force: bool = True) -> dict:
                 }
             )
     save_json(MANBO_INFO_PATH, info)
-    return refresh_manbo(target_drama_ids={str(item) for item in drama_ids}, force=force)
+    return refresh_manbo(target_drama_ids={str(item) for item in drama_ids}, force=force,
+                         generated_cv_id_allocator=generated_cv_id_allocator)
 
 
 def fix_chennianliegou(conn: sqlite3.Connection) -> None:

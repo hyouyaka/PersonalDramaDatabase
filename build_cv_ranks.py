@@ -17,8 +17,8 @@ from platform_sync import (
     is_excluded_drama,
     load_cache,
     load_json,
-    manbo_has_unknown_main_cv,
     manbo_main_cv_display_names,
+    manbo_main_cv_entries,
     missevan_main_cv_entries,
     normalize,
     normalize_match,
@@ -286,13 +286,9 @@ def collect_manbo_works(
             "viewCount": view_count,
             "isPaid": is_paid,
         }
-        ids = record.get("mainCvIds") or []
-        names = record.get("mainCvNames") or record.get("mainCvNicknames") or []
-        if manbo_has_unknown_main_cv(record):
-            continue
-        for idx, raw_cv_id in enumerate(ids):
-            cv_id = safe_int_or_none(raw_cv_id)
-            raw_name = names[idx] if idx < len(names) else ""
+        for entry in manbo_main_cv_entries(record):
+            cv_id = entry["cv_id"]
+            raw_name = entry["display_name"]
             cv_name = resolve_cv_name(
                 raw_name,
                 cv_id,
