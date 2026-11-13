@@ -251,18 +251,66 @@ class SeriesCountRankTests(unittest.TestCase):
         ranks = self.payload(manbo=records, series={
             "漫播:系列": self.series("漫播", ["10", "2"]),
         })["seriesCountRankings"]["manbo"]
-        self.assertEqual(len(ranks), 30)
+        self.assertEqual(len(ranks), 36)
         self.assertEqual(ranks[0]["cvName"], "领先")
         self.assertEqual(ranks[0]["seriesCount"], 2)
-        self.assertEqual([row["cvName"] for row in ranks[1:]], [f"CV{i:02d}" for i in range(29)])
-        self.assertEqual([row["rank"] for row in ranks], list(range(1, 31)))
+        self.assertEqual([row["cvName"] for row in ranks[1:]], [f"CV{i:02d}" for i in range(35)])
+        self.assertEqual([row["rank"] for row in ranks], [1] + [2] * 35)
         series = next(work for work in ranks[0]["works"] if work["seriesKey"] == "漫播:系列")
         self.assertEqual(series["dramaIds"], ["2", "10"])
 
     def test_empty_platforms_and_smaller_limit(self):
         self.assertEqual(self.payload()["seriesCountRankings"], {"missevan": [], "manbo": []})
         ranks = self.payload(manbo=[self.manbo("100", "A"), self.manbo("101", "B")], top_n=1)
-        self.assertEqual([r["cvName"] for r in ranks["seriesCountRankings"]["manbo"]], ["A"])
+        self.assertEqual([r["cvName"] for r in ranks["seriesCountRankings"]["manbo"]], ["A", "B"])
+        self.assertEqual([r["rank"] for r in ranks["seriesCountRankings"]["manbo"]], [1, 1])
+
+    def rankings_for_series_counts(self, counts, *, top_n=30):
+        missevan = {}
+        manbo = []
+        for index, count in enumerate(counts):
+            for work in range(count):
+                drama_id = str(100000 + index * 1000 + work)
+                name = f"CV{index:02d}"
+                missevan[drama_id] = self.missevan(drama_id, name)
+                manbo.append(self.manbo(drama_id, name))
+        return self.payload(missevan=missevan, manbo=manbo, top_n=top_n)["seriesCountRankings"]
+
+    def test_equal_series_counts_share_rank_and_next_rank_skips_tied_entries(self):
+        for platform, ranks in self.rankings_for_series_counts([7, 6, 6, 5, 4, 4, 3]).items():
+            with self.subTest(platform=platform):
+                self.assertEqual([r["rank"] for r in ranks], [1, 2, 2, 4, 5, 5, 7])
+                self.assertEqual([r["cvName"] for r in ranks], [f"CV{i:02d}" for i in range(7)])
+
+    def test_all_entries_tied_at_rank_30_are_retained_and_rank_33_is_excluded(self):
+        counts = list(range(31, 2, -1)) + [2, 2, 2, 1, 1]
+        for platform, ranks in self.rankings_for_series_counts(counts).items():
+            with self.subTest(platform=platform):
+                self.assertEqual(len(ranks), 32)
+                self.assertEqual([r["rank"] for r in ranks], list(range(1, 30)) + [30, 30, 30])
+                self.assertEqual([r["cvName"] for r in ranks[-3:]], ["CV29", "CV30", "CV31"])
+
+    def test_rank_cutoff_does_not_include_next_group_when_ties_skip_rank_30(self):
+        counts = list(range(30, 2, -1)) + [2, 2, 2, 2, 1]
+        for platform, ranks in self.rankings_for_series_counts(counts).items():
+            with self.subTest(platform=platform):
+                self.assertEqual(len(ranks), 32)
+                self.assertEqual([r["rank"] for r in ranks], list(range(1, 29)) + [29] * 4)
+
+    def test_all_tied_cvs_are_retained_even_if_more_than_30(self):
+        for platform, ranks in self.rankings_for_series_counts([1] * 35).items():
+            with self.subTest(platform=platform):
+                self.assertEqual(len(ranks), 35)
+                self.assertEqual([r["rank"] for r in ranks], [1] * 35)
+
+    def test_distinct_counts_still_keep_only_ranks_up_to_30(self):
+        for platform, ranks in self.rankings_for_series_counts(list(range(35, 0, -1))).items():
+            with self.subTest(platform=platform):
+                self.assertEqual(len(ranks), 30)
+                self.assertEqual([r["rank"] for r in ranks], list(range(1, 31)))
+
+    def test_zero_rank_limit_returns_empty_rankings(self):
+        self.assertEqual(self.rankings_for_series_counts([2, 1, 1], top_n=0), {"missevan": [], "manbo": []})
 
     def test_series_validation_and_conflicting_membership(self):
         valid = self.series("猫耳", ["100"])

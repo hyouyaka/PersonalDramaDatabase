@@ -795,8 +795,9 @@ class BuildCvRanksTests(unittest.TestCase):
         self.assertEqual(len(payload["rankings"]["manbo"]), 30)
         self.assertEqual(payload["rankings"]["missevan"][0]["cvName"], "猫耳CV00")
         self.assertEqual(payload["rankings"]["manbo"][0]["cvName"], "漫播CV00")
-        self.assertEqual(len(payload["seriesCountRankings"]["missevan"]), 30)
-        self.assertEqual(len(payload["seriesCountRankings"]["manbo"]), 30)
+        for platform in ("missevan", "manbo"):
+            self.assertEqual(len(payload["seriesCountRankings"][platform]), 35)
+            self.assertEqual([row["rank"] for row in payload["seriesCountRankings"][platform]], [1] * 35)
 
     def test_syncs_remote_watchcounts_before_loading_caches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

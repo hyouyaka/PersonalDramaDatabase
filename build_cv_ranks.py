@@ -385,9 +385,18 @@ def build_series_count_rankings(
                 )
                 work["dramaIds"].add(drama_id)
         rankings = []
-        for cv_name, works in sorted(buckets.items(), key=lambda item: (-len(item[1]), item[0]))[:top_n]:
+        previous_count = None
+        rank = 0
+        for position, (cv_name, works) in enumerate(
+            sorted(buckets.items(), key=lambda item: (-len(item[1]), item[0])), start=1,
+        ):
+            if len(works) != previous_count:
+                rank = position
+            if rank > top_n:
+                break
+            previous_count = len(works)
             rankings.append({
-                "rank": len(rankings) + 1, "cvName": cv_name, "avatar": avatars.get(cv_name, ""),
+                "rank": rank, "cvName": cv_name, "avatar": avatars.get(cv_name, ""),
                 "seriesCount": len(works),
                 "works": [
                     {
