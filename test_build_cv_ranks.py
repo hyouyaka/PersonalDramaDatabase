@@ -225,6 +225,9 @@ class BuildCvRanksTests(unittest.TestCase):
             upstash = Mock(side_effect=upstash)
 
             with (
+                patch.object(build_cv_ranks, "fetch_remote_series_info", return_value={
+                    "猫耳:系列": {"platform": "猫耳", "category": "广播剧", "series title": "系列", "dramaIds": ["100", "101"]},
+                }),
                 patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value=remote_map),
                 patch.object(build_cv_ranks, "sync_remote_watchcount_inputs"),
                 patch.object(build_cv_ranks, "publish_trend_v2_best_effort"),
@@ -244,7 +247,7 @@ class BuildCvRanksTests(unittest.TestCase):
             self.assertEqual(payload["date"], "2026-06-10")
             self.assertEqual(payload["generated_at"], "2026-06-10T12:00:00+00:00")
             self.assertEqual(payload["source"]["scope"], "all")
-            self.assertEqual(payload["version"], 3)
+            self.assertEqual(payload["version"], 4)
             self.assertEqual(payload["missevanDramaCount"], 2)
             self.assertEqual(payload["manboDramaCount"], 1)
             self.assertEqual(set(payload["rankings"]), {"missevan", "manbo"})
@@ -270,7 +273,11 @@ class BuildCvRanksTests(unittest.TestCase):
             self.assertEqual(manbo_cv["works"][0]["cover"], "mb-cover")
             self.assertIs(manbo_cv["works"][0]["isPaid"], True)
             self.assertEqual(payload["paidRankings"]["manbo"][0]["totalViewCount"], 60)
+            self.assertEqual(payload["seriesCountRankings"]["missevan"][0]["seriesCount"], 1)
+            self.assertEqual(payload["seriesCountRankings"]["missevan"][0]["works"][0]["dramaIds"], ["100", "101"])
+            self.assertEqual(payload["seriesCountRankings"]["manbo"][0]["seriesCount"], 1)
             self.assertEqual(json.loads(output.read_text(encoding="utf-8")), payload)
+            self.assertEqual(json.loads(remote["ranks:cv:latest"]), payload)
             atomic_rank_writes = [
                 call.args[0]
                 for call in upstash.call_args_list
@@ -335,6 +342,7 @@ class BuildCvRanksTests(unittest.TestCase):
         }
 
         payload = build_cv_ranks.build_cv_ranks_payload(
+            series_info={},
             missevan_store=missevan_store,
             manbo_store=manbo_store,
             missevan_counts={
@@ -514,6 +522,7 @@ class BuildCvRanksTests(unittest.TestCase):
                 raise AssertionError(command)
 
             with (
+                patch.object(build_cv_ranks, "fetch_remote_series_info", return_value={}),
                 patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value={}),
                 patch.object(build_cv_ranks, "sync_remote_watchcount_inputs"),
                 patch.object(build_cv_ranks, "publish_trend_v2_best_effort") as publish_v2,
@@ -579,6 +588,7 @@ class BuildCvRanksTests(unittest.TestCase):
                 return remote_map
 
             with (
+                patch.object(build_cv_ranks, "fetch_remote_series_info", return_value={}),
                 patch.object(build_cv_ranks, "sync_remote_rank_inputs", side_effect=sync_inputs) as sync_remote,
                 patch.object(build_cv_ranks, "sync_remote_watchcount_inputs"),
             ):
@@ -650,6 +660,7 @@ class BuildCvRanksTests(unittest.TestCase):
                     json.dumps(remote_manbo, ensure_ascii=False),
                     json.dumps(remote_missevan, ensure_ascii=False),
                     json.dumps(remote_map, ensure_ascii=False),
+                    json.dumps({"猫耳:系列": {"platform": "猫耳", "category": "广播剧", "series title": "系列", "dramaIds": ["100"]}}, ensure_ascii=False),
                 ]
             )
 
@@ -670,6 +681,8 @@ class BuildCvRanksTests(unittest.TestCase):
             self.assertEqual(upstash.call_args_list[2].args[0], ["GET", "manbo:info:v2"])
             self.assertEqual(upstash.call_args_list[3].args[0], ["GET", "missevan:info:v2"])
             self.assertEqual(upstash.call_args_list[4].args[0], ["GET", "cvid-map:v1"])
+            self.assertEqual(upstash.call_args_list[5].args[0], ["GET", "drama:series-info:v1"])
+            self.assertEqual(payload["seriesCountRankings"]["missevan"][0]["works"][0]["seriesKey"], "猫耳:系列")
             self.assertEqual(json.loads(manbo_info.read_text(encoding="utf-8")), remote_manbo)
             self.assertEqual(json.loads(missevan_info.read_text(encoding="utf-8")), remote_missevan)
             self.assertEqual(json.loads(cvid_map.read_text(encoding="utf-8")), remote_map)
@@ -720,6 +733,7 @@ class BuildCvRanksTests(unittest.TestCase):
             cvid_map = self.write_json(tmp, "map.json", {})
 
             with (
+                patch.object(build_cv_ranks, "fetch_remote_series_info", return_value={}),
                 patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value={}),
                 patch.object(build_cv_ranks, "sync_remote_watchcount_inputs"),
             ):
@@ -768,6 +782,7 @@ class BuildCvRanksTests(unittest.TestCase):
             manbo_counts[manbo_id] = {"view_count": 2000 - idx}
 
         payload = build_cv_ranks.build_cv_ranks_payload(
+            series_info={},
             missevan_store=missevan_store,
             manbo_store=manbo_store,
             missevan_counts=missevan_counts,
@@ -780,6 +795,8 @@ class BuildCvRanksTests(unittest.TestCase):
         self.assertEqual(len(payload["rankings"]["manbo"]), 30)
         self.assertEqual(payload["rankings"]["missevan"][0]["cvName"], "猫耳CV00")
         self.assertEqual(payload["rankings"]["manbo"][0]["cvName"], "漫播CV00")
+        self.assertEqual(len(payload["seriesCountRankings"]["missevan"]), 30)
+        self.assertEqual(len(payload["seriesCountRankings"]["manbo"]), 30)
 
     def test_syncs_remote_watchcounts_before_loading_caches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -811,6 +828,7 @@ class BuildCvRanksTests(unittest.TestCase):
 
             with (
                 patch.object(build_cv_ranks, "sync_remote_watchcount_inputs", side_effect=sync_watchcounts) as sync_remote,
+                patch.object(build_cv_ranks, "fetch_remote_series_info", return_value={}),
                 patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value={}),
             ):
                 payload = build_cv_ranks.build_and_publish_cv_ranks(
@@ -837,6 +855,7 @@ class BuildCvRanksTests(unittest.TestCase):
 
             with (
                 patch.object(build_cv_ranks, "sync_remote_watchcount_inputs") as sync_watchcounts,
+                patch.object(build_cv_ranks, "fetch_remote_series_info", return_value={}),
                 patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value={}) as sync_rank_inputs,
             ):
                 build_cv_ranks.build_and_publish_cv_ranks(

@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 class WeeklyCvUpdateScriptTests(unittest.TestCase):
-    def execute_weekly(self, refresh_exit_code=0):
+    def execute_weekly(self, refresh_exit_code=0, build_exit_code=0):
         powershell = shutil.which("pwsh") or shutil.which("powershell")
         if not powershell:
             self.skipTest("PowerShell is required to execute the weekly wrapper")
@@ -19,6 +19,7 @@ class WeeklyCvUpdateScriptTests(unittest.TestCase):
                 **os.environ, "DRAMA_DB_ROOT": tmp,
                 "WEEKLY_TEST_SCRIPT": str(script), "WEEKLY_TEST_COMMAND_LOG": str(log),
                 "WEEKLY_TEST_REFRESH_EXIT_CODE": str(refresh_exit_code),
+                "WEEKLY_TEST_BUILD_EXIT_CODE": str(build_exit_code),
             }
             command = r'''
 function global:python {
@@ -27,6 +28,8 @@ function global:python {
     [System.IO.File]::AppendAllText($env:WEEKLY_TEST_COMMAND_LOG, $Line + [Environment]::NewLine)
     $global:LASTEXITCODE = if ($NativeArgs[3] -eq 'refresh_watch_counts.py') {
         [int]$env:WEEKLY_TEST_REFRESH_EXIT_CODE
+    } elseif ($NativeArgs[3] -eq 'build_cv_ranks.py') {
+        [int]$env:WEEKLY_TEST_BUILD_EXIT_CODE
     } else { 0 }
 }
 & $env:WEEKLY_TEST_SCRIPT
@@ -57,6 +60,11 @@ function global:python {
         result, calls = self.execute_weekly(refresh_exit_code=1)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(calls, [["-X", "utf8", "-u", "refresh_watch_counts.py", "--refresh-all"]])
+
+    def test_failed_cv_build_skips_growth_and_publish_metadata(self) -> None:
+        result, calls = self.execute_weekly(build_exit_code=1)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual([call[3] for call in calls], ["refresh_watch_counts.py", "build_cv_ranks.py"])
 
     def test_weekly_script_refreshes_counts_before_building_ranks(self) -> None:
         script = Path(__file__).with_name("run_weekly_cv_update.ps1").read_text(encoding="utf-8")

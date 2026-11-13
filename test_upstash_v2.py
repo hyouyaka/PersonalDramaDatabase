@@ -218,6 +218,39 @@ class UpstashV2Tests(unittest.TestCase):
         self.assertIn("ranks:latest", meta["normal"]["resources"])
         self.assertIn("ranks:cv:latest", meta["cv"]["resources"])
 
+    def test_rank_string_publish_can_override_resource_time_without_changing_sample_time(self) -> None:
+        fake = FakeUpstash()
+        payload = {"date": "2026-11-06", "generated_at": "2026-11-06T05:17:38+00:00"}
+        upstash_v2.publish_rank_string(
+            "ranks:cv:latest", payload, scope="cv", upstash=fake,
+            updated_at="2026-11-13T01:30:00+00:00",
+        )
+        meta = json.loads(fake.strings[upstash_v2.RANK_META_KEY])
+        self.assertEqual(meta["cv"]["resources"]["ranks:cv:latest"]["updatedAt"], "2026-11-13T01:30:00+00:00")
+        self.assertEqual(json.loads(fake.strings["ranks:cv:latest"]), payload)
+
+    def test_cv_resource_time_uses_latest_subranking_and_legacy_payload_still_uses_sample_time(self) -> None:
+        import build_cv_ranks
+
+        sample_time = "2026-11-06T05:17:38+00:00"
+        cases = [
+            ({}, sample_time),
+            ({"missevan": {"generated_at": "2026-11-13T01:30:00+00:00"},
+              "manbo": {"generated_at": "2026-11-13T01:00:00+00:00"}}, "2026-11-13T01:30:00+00:00"),
+            ({"missevan": {"generated_at": "2026-11-05T01:30:00+00:00"}}, sample_time),
+            ({"missevan": {"generated_at": "2026-11-06T06:00:00+02:00"}}, sample_time),
+        ]
+        for series_meta, expected in cases:
+            with self.subTest(meta=series_meta):
+                fake = FakeUpstash()
+                payload = {"date": "2026-11-06", "generated_at": sample_time}
+                if series_meta:
+                    payload["seriesCountMeta"] = series_meta
+                build_cv_ranks.upload_cv_ranks(payload, upstash=fake)
+                meta = json.loads(fake.strings[upstash_v2.RANK_META_KEY])
+                self.assertEqual(meta["cv"]["resources"]["ranks:cv:latest"]["updatedAt"], expected)
+                self.assertEqual(json.loads(fake.strings["ranks:cv:latest"]), payload)
+
     def test_watchcount_growth_rank_uses_independent_meta_scope(self) -> None:
         fake = FakeUpstash()
         fake.strings[upstash_v2.RANK_META_KEY] = upstash_v2.compact_json(

@@ -314,13 +314,54 @@ python build_weekly_growth_ranks.py --expected-end-date 2026-08-28
 - 排序为增量降序、当前播放量降序、数字 `dramaId` 升序
 - GUI“榜单数据”区域的“重算 7天/4周增量榜”直接按远端 history 重算，不先抓取播放量
 
+### 3.2 生成 CV 作品总数榜（按系列）
+
+`build_cv_ranks.py` 同时生成播放量榜和作品总数榜，随现有周更任务一起发布，无需增加调度步骤。
+
+```powershell
+python build_cv_ranks.py
+python build_cv_ranks.py --no-upload
+```
+
+`--no-upload` 仍读取远端输入，只生成本地结果。每次额外读取并校验 `drama:series-info:v1`；
+系列表缺失、为空、结构异常、读取失败或同平台同一作品归属多个系列时，构建失败，保留原榜单。
+周更遇到此类错误会跳过后续增量榜及发布完成 Meta 步骤。
+
+统计规则：
+
+- 猫耳、漫播分别取前 30，按系列数降序、CV 规范名升序排序，连续编号；不足 30 人时输出全部。
+- 免费、付费、会员作品全部参与，缺少或空播放量不影响作品数；复用现有主役解析、CV 名称统一与入库排除规则。
+- 按系列表成员关系去重：同一 CV 参与同系列任一季计 1 部；未归系列的作品按 `dramaId` 各计 1 部，不按标题猜测合并。
+- 只遍历活跃 info v2。已归档作品即使仍在系列表中也不计数；系列全部归档时不计，部分归档时只保留活跃季及其实际主役。
+- 重复剧目或主役、别名映射到同一 CV 后不重复计数；周更只读取系列表，不自动更新系列关系。
+
+本地 `ranks-cv.json` 与远端 `ranks:cv:latest` 的 Payload 版本升至 4，新增
+`seriesCountRankings.missevan` / `seriesCountRankings.manbo`。榜单项包含 `rank`、`cvName`、
+`avatar`、`seriesCount` 和 `works`；每项作品明细包含 `seriesKey`、`title`、`dramaIds`。
+已归系列的 `seriesKey` 使用系列表原始键，单部作品使用 `{platform}:drama:{dramaId}`；
+`dramaIds` 仅列该 CV 实际参与的活跃作品，按数字 ID 升序排列；作品明细按标题、系列标识升序排列。
+新分项随完整 CV Payload 原子发布并回读校验，沿用 `cv` 发布元数据，仅保留最新榜单，
+不新增作品数趋势；现有 `rankings`、`paidRankings` 和播放量趋势的统计含义保持不变。
+
+`seriesCountMeta.missevan` / `seriesCountMeta.manbo` 分别记录作品数分项的独立标记：
+
+- `generated_at` 为本次作品数统计的生成时间（UTC），不受播放量快照或 `--date` 影响。
+- `sourceVersions` 记录对应平台 info v2、`cvid-map:v1` 和 `drama:series-info:v1` 的内容版本，
+  以 Redis key 为键、`sha256:<摘要>` 为值。摘要对实际输入按键排序、保留 Unicode、无额外空白的
+  JSON 编码计算；不是远端 Meta 中针对原始字节的 `contentSha1`，也不代表来源更新时间。
+- 顶层 `date` / `generated_at` 继续沿用播放量采样日期逻辑，CV 播放量趋势仍使用这两个字段。
+  `ranks:meta.cv.resources["ranks:cv:latest"].updatedAt` 取原播放量时间与各作品数分项生成时间的较晚者，
+  反映完整资源的更新；CAS 原子发布及回读校验保持不变。
+
+合并双平台的总榜仍仅供本地预览，不加入周更发布。
+
 每周任务 `run_weekly_cv_update.ps1` 的执行顺序为：
 
 ```text
 refresh_watch_counts.py --refresh-all
     → latest + history 原子上传并回读 ✅
     → 空 createTime 补全并发布 info v2 ✅
-    → build_cv_ranks.py ✅
+    → build_cv_ranks.py（播放量榜 + 按系列作品总数榜）✅
     → build_weekly_growth_ranks.py --expected-end-date <UTC日期> ✅
     → update_rank_meta.py cv ✅
     → update_rank_meta.py watchcountGrowth ✅

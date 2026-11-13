@@ -25,7 +25,7 @@ from platform_sync import (
     save_json,
 )
 from sync_new_drama_ids import ROOT, configure_stdio, load_env_file, sync_remote_watchcount_if_newer, upstash_request
-from sync_new_drama_ids import MANBO_INFO_KEY, MISSEVAN_INFO_KEY
+from sync_new_drama_ids import CVID_MAP_KEY, MANBO_INFO_KEY, MISSEVAN_INFO_KEY, SERIES_INFO_KEY, decode_remote_json_payload
 from sync_remote_libraries import fetch_cvid_map_payload, fetch_info_payload, write_payloads
 from upstash_editor import decode_hgetall
 from upstash_v2 import (
@@ -315,6 +315,118 @@ def build_ranking_from_buckets(buckets: dict[str, dict], *, top_n: int) -> list[
     return rankings
 
 
+def build_series_index(series_info: dict) -> dict[tuple[str, str], tuple[str, str]]:
+    if not isinstance(series_info, dict):
+        raise ValueError("series-info must be a JSON object")
+    platforms = {"猫耳": "missevan", "漫播": "manbo"}
+    index: dict[tuple[str, str], tuple[str, str]] = {}
+    for key, entry in series_info.items():
+        if not isinstance(key, str) or not key.strip() or not isinstance(entry, dict):
+            raise ValueError("Invalid series-info entry")
+        platform_name = entry.get("platform")
+        platform = platforms.get(platform_name) if isinstance(platform_name, str) else None
+        title = entry.get("series title")
+        category = entry.get("category")
+        ids = entry.get("dramaIds")
+        if (
+            platform is None or not isinstance(title, str) or not title.strip()
+            or not isinstance(category, str) or not category.strip() or not isinstance(ids, list)
+        ):
+            raise ValueError(f"Invalid series-info fields: {key}")
+        for raw_id in ids:
+            if isinstance(raw_id, bool) or not isinstance(raw_id, (str, int)) or not normalize(raw_id):
+                raise ValueError(f"Invalid series-info dramaId: {key}")
+            identity = (platform, normalize(raw_id))
+            if identity in index and index[identity][0] != key:
+                raise ValueError(f"Multiple series own {platform}:{identity[1]}")
+            index[identity] = (key, normalize(title))
+    return index
+
+
+def fetch_remote_series_info(*, upstash=upstash_request) -> dict:
+    payload = decode_remote_json_payload(SERIES_INFO_KEY, upstash(["GET", SERIES_INFO_KEY]))
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError(f"Refusing to use empty or invalid {SERIES_INFO_KEY}")
+    build_series_index(payload)
+    return payload
+
+
+def build_series_count_rankings(
+    *, missevan_store: dict, manbo_store: dict, series_info: dict, cvid_map: dict, top_n: int = 30,
+) -> dict[str, list[dict]]:
+    series_index = build_series_index(series_info)
+    missevan_ids, manbo_ids, name_index, avatars = build_map_indexes(cvid_map)
+    result: dict[str, list[dict]] = {}
+    for platform, records, entries, title_key in (
+        ("missevan", (node for _, _, node in iter_missevan_nodes(missevan_store)), missevan_main_cv_entries, "title"),
+        ("manbo", manbo_store.get("records") or [], manbo_main_cv_entries, "name"),
+    ):
+        buckets: dict[str, dict[str, dict]] = {}
+        # Traverse active info only: retained series members cannot resurrect archived works.
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            drama_id = normalize(record.get("dramaId"))
+            if not drama_id or is_excluded_drama(platform, drama_id):
+                continue
+            series_key, title = series_index.get(
+                (platform, drama_id),
+                (f"{platform}:drama:{drama_id}", normalize(record.get("seriesTitle") or record.get(title_key))),
+            )
+            for entry in entries(record):
+                if entry.get("unknown"):
+                    continue
+                cv_name = resolve_cv_name(
+                    entry["display_name"], entry["cv_id"], platform=platform,
+                    missevan_ids=missevan_ids, manbo_ids=manbo_ids, name_index=name_index,
+                )
+                work = buckets.setdefault(cv_name, {}).setdefault(
+                    series_key, {"seriesKey": series_key, "title": title, "dramaIds": set()},
+                )
+                work["dramaIds"].add(drama_id)
+        rankings = []
+        for cv_name, works in sorted(buckets.items(), key=lambda item: (-len(item[1]), item[0]))[:top_n]:
+            rankings.append({
+                "rank": len(rankings) + 1, "cvName": cv_name, "avatar": avatars.get(cv_name, ""),
+                "seriesCount": len(works),
+                "works": [
+                    {
+                        **work,
+                        "dramaIds": sorted(
+                            work["dramaIds"],
+                            key=lambda value: (0, int(value)) if value.isdigit() else (1, value),
+                        ),
+                    }
+                    for work in sorted(works.values(), key=lambda work: (work["title"], work["seriesKey"]))
+                ],
+            })
+        result[platform] = rankings
+    return result
+
+
+def build_series_count_meta(
+    *, missevan_store: dict, manbo_store: dict, cvid_map: dict, series_info: dict, generated_at: str,
+) -> dict[str, dict]:
+    def content_version(payload: dict) -> str:
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    shared_versions = {
+        CVID_MAP_KEY: content_version(cvid_map),
+        SERIES_INFO_KEY: content_version(series_info),
+    }
+    return {
+        platform: {
+            "generated_at": generated_at,
+            "sourceVersions": {info_key: content_version(store), **shared_versions},
+        }
+        for platform, info_key, store in (
+            ("missevan", MISSEVAN_INFO_KEY, missevan_store),
+            ("manbo", MANBO_INFO_KEY, manbo_store),
+        )
+    }
+
+
 def build_cv_rank_outputs(
     *,
     missevan_store: dict,
@@ -322,9 +434,15 @@ def build_cv_rank_outputs(
     missevan_counts: dict,
     manbo_counts: dict,
     cvid_map: dict,
+    series_info: dict,
     generated_at: str,
     top_n: int = 30,
+    series_count_generated_at: str | None = None,
 ) -> tuple[dict, dict[str, list[dict]], dict[str, list[dict]]]:
+    series_count_rankings = build_series_count_rankings(
+        missevan_store=missevan_store, manbo_store=manbo_store,
+        series_info=series_info, cvid_map=cvid_map, top_n=top_n,
+    )
     missevan_ids, manbo_ids, name_index, avatar_index = build_map_indexes(cvid_map)
     missevan_buckets: dict[str, dict] = {}
     manbo_buckets: dict[str, dict] = {}
@@ -361,7 +479,7 @@ def build_cv_rank_outputs(
     }
 
     payload = {
-        "version": 3,
+        "version": 4,
         "date": generated_at[:10],
         "generated_at": generated_at,
         "source": {"scope": "all", "platforms": list(PLATFORMS)},
@@ -375,6 +493,12 @@ def build_cv_rank_outputs(
             "missevan": full_paid_rankings["missevan"][:top_n],
             "manbo": full_paid_rankings["manbo"][:top_n],
         },
+        "seriesCountRankings": series_count_rankings,
+        "seriesCountMeta": build_series_count_meta(
+            missevan_store=missevan_store, manbo_store=manbo_store,
+            cvid_map=cvid_map, series_info=series_info,
+            generated_at=series_count_generated_at or now_iso(),
+        ),
     }
     return payload, full_rankings, full_paid_rankings
 
@@ -386,8 +510,10 @@ def build_cv_ranks_payload(
     missevan_counts: dict,
     manbo_counts: dict,
     cvid_map: dict,
+    series_info: dict,
     generated_at: str,
     top_n: int = 30,
+    series_count_generated_at: str | None = None,
 ) -> dict:
     payload, _full_rankings, _full_paid_rankings = build_cv_rank_outputs(
         missevan_store=missevan_store,
@@ -395,8 +521,10 @@ def build_cv_ranks_payload(
         missevan_counts=missevan_counts,
         manbo_counts=manbo_counts,
         cvid_map=cvid_map,
+        series_info=series_info,
         generated_at=generated_at,
         top_n=top_n,
+        series_count_generated_at=series_count_generated_at,
     )
     return payload
 
@@ -529,7 +657,12 @@ def build_cv_trend_payload(
 def upload_cv_ranks(payload: dict, *, upstash=upstash_request) -> None:
     encoded = json.dumps(payload, ensure_ascii=False)
     key = "ranks:cv:latest"
-    publish_rank_string(key, payload, scope="cv", upstash=upstash)
+    # Resource freshness covers all sub-rankings; the top-level date remains the watchcount sample date.
+    timestamps = [payload.get("generated_at")]
+    timestamps.extend(meta.get("generated_at") for meta in (payload.get("seriesCountMeta") or {}).values())
+    candidates = [(parsed, value) for value in timestamps if (parsed := parse_iso_datetime(value)) is not None]
+    updated_at = max(candidates, key=lambda item: item[0])[1] if candidates else None
+    publish_rank_string(key, payload, scope="cv", upstash=upstash, updated_at=updated_at)
     print(f"[ok] uploaded {key} ({len(encoded)} bytes)")
 
 
@@ -781,12 +914,14 @@ def build_and_publish_cv_ranks(
         cvid_map_path=cvid_map_path,
         upstash=upstash,
     )
+    series_info = fetch_remote_series_info(upstash=upstash)
     payload, full_rankings, full_paid_rankings = build_cv_rank_outputs(
         missevan_store=load_json(missevan_info_path, {}),
         manbo_store=load_json(manbo_info_path, {"records": []}),
         missevan_counts=missevan_cache.get("counts", {}),
         manbo_counts=manbo_cache.get("counts", {}),
         cvid_map=cvid_map,
+        series_info=series_info,
         generated_at=generated,
     )
     save_json(output_path, payload)
@@ -803,7 +938,7 @@ def build_and_publish_cv_ranks(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build CV view-count rankings from local platform libraries")
+    parser = argparse.ArgumentParser(description="Build CV view-count and series-count rankings from platform libraries")
     parser.add_argument("--no-upload", action="store_true", help="Only write ranks-cv.json locally")
     parser.add_argument("--date", help="Override the output and aggregate sample date (YYYY-MM-DD)")
     parser.add_argument("--force", action="store_true", help="构建前无条件拉取远端 watchcount latest")

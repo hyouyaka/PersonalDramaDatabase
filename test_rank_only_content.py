@@ -429,6 +429,7 @@ class CvExclusionDefenseTests(unittest.TestCase):
             for song_id in SONGS
         ] + [{"dramaId": "200", "mainCvIds": [22], "mainCvNames": ["演员"], "needpay": True}]}
         payload, full, paid = cv.build_cv_rank_outputs(
+            series_info={},
             missevan_store=missevan, manbo_store=manbo,
             missevan_counts={"83940": {"view_count": 999}, "94604": {"view_count": 999}, "100": {"view_count": 10}},
             manbo_counts={**{song_id: {"view_count": 999} for song_id in SONGS}, "200": {"view_count": 20}},
@@ -436,6 +437,8 @@ class CvExclusionDefenseTests(unittest.TestCase):
             generated_at="2026-11-06T00:00:00+00:00",
         )
         self.assertEqual((payload["missevanDramaCount"], payload["manboDramaCount"]), (1, 1))
+        for platform in ("missevan", "manbo"):
+            self.assertEqual(payload["seriesCountRankings"][platform][0]["seriesCount"], 1)
         for result in [full, paid]:
             self.assertEqual(result["missevan"][0]["totalViewCount"], 10)
             self.assertEqual(result["manbo"][0]["totalViewCount"], 20)

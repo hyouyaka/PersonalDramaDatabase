@@ -173,16 +173,18 @@ def publish_rank_string(
     *,
     scope: str,
     upstash: Callable[[list[object]], object],
+    updated_at: str | None = None,
 ) -> dict:
     encoded = json.dumps(payload, ensure_ascii=False)
     digest = hashlib.sha1(encoded.encode("utf-8")).hexdigest()
     byte_count = len(encoded.encode("utf-8"))
-    updated_at = datetime.now(timezone.utc).isoformat()
-    if isinstance(payload, dict):
-        if key == "ranks:latest":
-            updated_at = str((payload.get("_meta") or {}).get("updated_at") or updated_at)
-        elif payload.get("generated_at"):
-            updated_at = str(payload.get("generated_at") or updated_at)
+    if updated_at is None:
+        updated_at = datetime.now(timezone.utc).isoformat()
+        if isinstance(payload, dict):
+            if key == "ranks:latest":
+                updated_at = str((payload.get("_meta") or {}).get("updated_at") or updated_at)
+            elif payload.get("generated_at"):
+                updated_at = str(payload.get("generated_at") or updated_at)
     rank_meta: dict | None = None
     for _attempt in range(3):
         current_meta = upstash(["GET", RANK_META_KEY])
