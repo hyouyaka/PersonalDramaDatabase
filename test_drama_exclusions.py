@@ -21,12 +21,12 @@ class DramaExclusionIngressTests(unittest.TestCase):
         self.assertEqual(set(fetch_ongoing.build_payload("missevan", records)["records"]), {"100"})
         self.assertEqual(set(fetch_ongoing.build_payload("manbo", records)["records"]), set(records))
         manbo = {drama_id: {"dramaId": drama_id}
-                 for drama_id in ("1896908912553099327", "2281413604869669104")}
+                 for drama_id in ("1896908912553099327", "2281413604869669104", "2004883617280426168")}
         self.assertEqual(fetch_ongoing.build_payload("manbo", manbo)["records"], {})
 
     def test_stale_import_queue_cannot_reintroduce_excluded_records(self):
         payload = {"missevan": ["83940", "88641", "100"],
-                   "manbo": ["1896908912553099327", "2281413604869669104", "200"]}
+                   "manbo": ["1896908912553099327", "2281413604869669104", "2004883617280426168", "200"]}
         with patch.object(sync_new_drama_ids, "upstash_request", return_value=json.dumps(payload)):
             self.assertEqual(sync_new_drama_ids.load_queue(), {"missevan": ["100"], "manbo": ["200"]})
 
@@ -34,7 +34,7 @@ class DramaExclusionIngressTests(unittest.TestCase):
         client = Mock(return_value='{"missevan":["100"],"manbo":["200"]}')
         with patch.object(fetch_rank_data, "upstash_request", client), patch("builtins.print"):
             fetch_rank_data.append_new_drama_ids_atomic(
-                ["83940", "100"], ["1896908912553099327", "2281413604869669104", "200"],
+                ["83940", "100"], ["1896908912553099327", "2281413604869669104", "2004883617280426168", "200"],
             )
         self.assertEqual(json.loads(client.call_args.args[0][-2]), ["100"])
         self.assertEqual(json.loads(client.call_args.args[0][-1]), ["200"])
@@ -84,6 +84,7 @@ class DramaExclusionIngressTests(unittest.TestCase):
         for module, drama_id in ((append_missevan_ids, "88641"),
                                  (append_manbo_ids, "1896908912553099327"),
                                  (append_manbo_ids, "2281413604869669104"),
+                                 (append_manbo_ids, "2004883617280426168"),
                                  (append_missevan_ids, "94604")):
             with self.subTest(module=module.__name__), patch.object(module, "download_info_file") as download, patch("builtins.print"):
                 self.assertEqual(module.main(["append.py", drama_id]), 0)
@@ -97,6 +98,8 @@ class DramaExclusionIngressTests(unittest.TestCase):
                 metadata.upsert_manbo_drama_ids(["1896908912553099327"])
             with self.assertRaisesRegex(ValueError, "Excluded"):
                 metadata.upsert_manbo_drama_ids(["2281413604869669104"])
+            with self.assertRaisesRegex(ValueError, "Excluded"):
+                metadata.upsert_manbo_drama_ids(["2004883617280426168"])
             load.assert_not_called()
 
 
