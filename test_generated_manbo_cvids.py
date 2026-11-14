@@ -213,7 +213,7 @@ class GeneratedManboUpgradeTests(unittest.TestCase):
         ):
             self.assertEqual(append_manbo_ids.main(["append_manbo_ids.py", "200"]), 0)
         save.assert_called_once()
-        publish.assert_called_once_with(append_manbo_ids.MANBO_INFO_KEY, append_manbo_ids.MANBO_INFO_PATH, ["200", "201"])
+        publish.assert_called_once_with(append_manbo_ids.MANBO_INFO_KEY, append_manbo_ids.MANBO_INFO_PATH, ["200", "201"], removed_drama_ids=[])
         self.assertEqual(store["records"][0]["mainCvIds"], [1234567890123])
 
     def test_append_rejected_upgrade_stops_migration_and_info_publication(self):
@@ -281,7 +281,7 @@ class GeneratedManboUpgradeTests(unittest.TestCase):
         self.assertEqual(remote_calls, [{}])
         self.assertEqual(store, original)
         save.assert_not_called()
-        publish.assert_called_once_with(append_manbo_ids.MANBO_INFO_KEY, append_manbo_ids.MANBO_INFO_PATH, ["200"])
+        publish.assert_called_once_with(append_manbo_ids.MANBO_INFO_KEY, append_manbo_ids.MANBO_INFO_PATH, ["200"], removed_drama_ids=[])
 
     def test_append_keeps_unconfirmed_current_upgrades_blocked(self):
         old_id, real_id = 340001, 1234567890123
@@ -348,7 +348,7 @@ class GeneratedManboUpgradeTests(unittest.TestCase):
         self.assertEqual(update.call_args.kwargs["persistent_manbo_generated_replacements"], active)
         self.assertEqual(store["records"][1]["mainCvIds"], [2222222222222])
         save.assert_called_once()
-        publish.assert_called_once_with(append_manbo_ids.MANBO_INFO_KEY, append_manbo_ids.MANBO_INFO_PATH, ["200", "201"])
+        publish.assert_called_once_with(append_manbo_ids.MANBO_INFO_KEY, append_manbo_ids.MANBO_INFO_PATH, ["200", "201"], removed_drama_ids=[])
 
 
 if __name__ == "__main__":

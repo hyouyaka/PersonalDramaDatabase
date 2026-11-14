@@ -267,6 +267,12 @@ python sync_new_drama_ids.py --purge-non-target-records --apply
 
 清理会为所有待改写远端键生成 `recovery_backups` 备份，并在目标集合、远端版本或 CV 资源摘要不符合预期时停止。
 
+入库屏蔽规则集中在 `platform_sync.py`：`DRAMA_EXCLUSIONS` 按平台剧目 ID 拦截；
+`MANBO_PRODUCER_BLOCKLIST` 按漫播出品账号 ID 或名称拦截（当前包含“新声社”，账号 `3509860831285`）。
+漫播 ongoing 根据列表中的上传账号/出品信息过滤，metadata 入库前再次检查详情的 `ownerResp`、`ownerId` 和出品署名。
+详情命中出品方屏蔽后，append 会将明确拒绝的 ID 传入 CAS 合并发布，删除远端旧 info；普通详情失败或本地记录缺失不会触发远端删除。
+该规则用于入库，不改变独立的官方榜单展示策略。
+
 Info、普通榜、CV 榜及 trend v2 现为唯一权威数据：正文与 Meta 使用 CAS 原子发布，冲突会重试，发布或校验失败会使任务失败。运行时不会读取或更新已退役的 info/trend/watchcount key；退役数据的人工回滚副本保存在本地 `recovery_backups`，不作为运行时依赖。
 
 用法：

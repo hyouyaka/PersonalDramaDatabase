@@ -12,6 +12,67 @@ import sync_new_drama_ids
 
 
 class DramaExclusionIngressTests(unittest.TestCase):
+    def test_xinshengshe_ids_are_blocked_at_every_id_ingress(self):
+        ids = ["2243454310245466225", "2061950572864471138", "2158106588450128005"]
+        self.assertEqual(fetch_ongoing.build_payload("manbo", {
+            value: {"dramaId": value} for value in ids
+        })["records"], {})
+        with patch.object(sync_new_drama_ids, "upstash_request", return_value=json.dumps({"manbo": ids})):
+            self.assertEqual(sync_new_drama_ids.load_queue()["manbo"], [])
+        for drama_id in ids:
+            with self.subTest(drama_id=drama_id), patch.object(metadata, "load_json") as load:
+                with self.assertRaisesRegex(ValueError, "Excluded"):
+                    metadata.upsert_manbo_drama_ids([drama_id])
+                load.assert_not_called()
+
+    def test_producer_policy_matches_account_renames_and_explicit_credits(self):
+        for data in (
+            {"ownerId": 3509860831285, "ownerResp": {"nickname": "改名后"}},
+            {"ownerResp": {"nickname": " 新声社 "}},
+            {"cvRespList": [{"platUid": 3509860831285, "role": "出品"}]},
+            {"cvRespList": [{"cvNickname": "新声社", "role": "饰:出品方"}]},
+        ):
+            with self.subTest(data=data):
+                self.assertTrue(platform_sync.is_blocked_manbo_producer(data))
+        for data in ({}, {"ownerId": 123}, {"desc": "推荐新声社作品"},
+                     {"cvRespList": [{"cvNickname": "新声社", "role": "饰:角色"}]}):
+            with self.subTest(data=data):
+                self.assertFalse(platform_sync.is_blocked_manbo_producer(data))
+
+    def test_new_id_from_blocked_producer_is_removed_before_ongoing_admission(self):
+        item = {"workUpdateTimeFormat": "12:00", "radioDramaResp": {
+            "radioDramaIdStr": "123", "category": 5, "price": 100,
+            "ownerId": 3509860831285,
+        }}
+        self.assertEqual(fetch_ongoing.collect_manbo_records_from_items([item]), {})
+        item["radioDramaResp"]["ownerId"] = 321
+        self.assertEqual(set(fetch_ongoing.collect_manbo_records_from_items([item])), {"123"})
+
+    def test_metadata_rejects_unknown_id_from_blocked_producer_before_cv_processing(self):
+        for name in ("", "已存在的作品"):
+            info = {"records": [{"dramaId": "123", "name": name}]}
+            cache = {"counts": {"123": {"view_count": 42}}}
+            with (
+                self.subTest(name=name),
+                patch.object(metadata, "load_json", return_value=info),
+                patch.object(metadata, "load_cache", return_value=cache),
+                patch.object(metadata, "build_manbo_cv_name_map", return_value={}),
+                patch.object(metadata, "load_combined_map", return_value={}),
+                patch.object(metadata, "request_manbo_json", return_value={"data": {
+                    "title": "新剧", "category": 5, "ownerId": 3509860831285,
+                }}),
+                patch.object(metadata, "build_manbo_record") as build,
+                patch.object(metadata, "save_json"),
+                patch.object(metadata, "save_cache"),
+                patch("builtins.print"),
+            ):
+                result = metadata.refresh_manbo()
+            self.assertEqual(info["records"], [])
+            self.assertEqual(cache["counts"], {})
+            self.assertEqual(result["rejected"], [{"dramaId": "123", "reason": "blocked producer"}])
+            self.assertEqual(result["blocked_producer_ids"], ["123"])
+            build.assert_not_called()
+
     def test_ongoing_output_filters_record_ids_and_alias_keys_per_platform(self):
         records = {
             "83940": {"dramaId": "83940", "updateType": "weekly"},

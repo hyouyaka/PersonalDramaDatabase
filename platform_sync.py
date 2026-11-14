@@ -61,8 +61,38 @@ DRAMA_EXCLUSIONS = {
         "1896908912553099327": "scc7000遥昇歌曲翻唱大合集",
         "2281413604869669104": "星未眠翻唱合集",
         "2004883617280426168": "审判系统：我手握敌人命门 · 第一季",
+        "2243454310245466225": "阴司渡魂人 · 第二季",
+        "2061950572864471138": "盛世婚赌：奈何boss太多情",
+        "2158106588450128005": "阴司渡魂人 · 第一季",
     },
 }
+
+
+# Match the platform account as well as its name so renames cannot bypass
+# admission checks. This policy does not hide official public rank entries.
+MANBO_PRODUCER_BLOCKLIST = {"3509860831285": "新声社"}
+
+
+def is_blocked_manbo_producer(data: dict) -> bool:
+    """Inspect a dramaDetail/timeline drama's owner and explicit producer credits."""
+    blocked_names = set(MANBO_PRODUCER_BLOCKLIST.values())
+
+    def matches(account_id: object, name: object) -> bool:
+        return (str(account_id or "").strip() in MANBO_PRODUCER_BLOCKLIST
+                or str(name or "").strip() in blocked_names)
+
+    owner = data.get("ownerResp") or {}
+    if matches(data.get("ownerId") or owner.get("id"), owner.get("nickname")):
+        return True
+    for credit in data.get("cvRespList") or []:
+        role = str(credit.get("originRole") or credit.get("role") or "")
+        if "出品" not in role:
+            continue
+        account = credit.get("cvResp") or {}
+        if matches(credit.get("platUid") or account.get("id"),
+                   credit.get("cvNickname") or account.get("nickname")):
+            return True
+    return False
 
 
 RANK_EXCLUSIONS = {

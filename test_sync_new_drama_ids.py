@@ -5,6 +5,59 @@ from pathlib import Path
 from unittest.mock import Mock, call
 
 import sync_new_drama_ids
+from test_upstash_v2 import FakeUpstash
+
+
+class ManboInfoRemovalTests(unittest.TestCase):
+    def test_explicit_removal_wins_over_stale_local_record_and_preserves_missing_records(self):
+        remote = {"records": [{"dramaId": "100"}, {"dramaId": "200"}, {"dramaId": "300"}]}
+        local = {"records": [{"dramaId": "100", "name": "stale blocked record"},
+                             {"dramaId": "300", "name": "refreshed"}]}
+        merged = sync_new_drama_ids.merge_manbo_info_for_ids(
+            remote, local, ["100", "200", "300"], removed_drama_ids=["100"],
+        )
+        self.assertEqual(merged["records"], [{"dramaId": "200"}, {"dramaId": "300", "name": "refreshed"}])
+        self.assertEqual(len(remote["records"]), 3)
+        self.assertEqual(len(local["records"]), 2)
+
+    def test_removal_outside_refresh_scope_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "outside.*scope"):
+            sync_new_drama_ids.merge_manbo_info_for_ids(
+                {"records": [{"dramaId": "100"}]}, {"records": []}, ["200"], removed_drama_ids=["100"],
+            )
+
+    def test_removal_is_not_supported_for_missevan(self):
+        with self.assertRaisesRegex(ValueError, "only.*manbo"):
+            sync_new_drama_ids.merge_info_payload_for_ids(
+                sync_new_drama_ids.MISSEVAN_INFO_KEY, {}, {}, ["100"], removed_drama_ids=["100"],
+            )
+
+    def test_cas_conflict_does_not_delete_remote_or_overwrite_local_work_copy(self):
+        records = [{"dramaId": str(i)} for i in range(100, 152)]
+        original = json.dumps({"version": 1, "records": records})
+        newer = json.dumps({"version": 1, "records": records + [{"dramaId": "999"}]})
+
+        class RacingUpstash(FakeUpstash):
+            def __call__(self, command):
+                if command[0] == "EVAL":
+                    self.strings[sync_new_drama_ids.MANBO_INFO_KEY] = newer
+                return super().__call__(command)
+
+        remote = RacingUpstash()
+        remote.strings[sync_new_drama_ids.MANBO_INFO_KEY] = original
+        remote.strings["manbo:info:meta:v2"] = '{"unchanged":true}'
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "info.json"
+            local_text = json.dumps({"records": [{"dramaId": "101", "name": "local"}]})
+            path.write_text(local_text, encoding="utf-8")
+            with unittest.mock.patch.object(sync_new_drama_ids, "upstash_request", remote):
+                with self.assertRaisesRegex(RuntimeError, "concurrently changed"):
+                    sync_new_drama_ids.merge_and_upload_info_file(
+                        sync_new_drama_ids.MANBO_INFO_KEY, path, ["100"], removed_drama_ids=["100"],
+                    )
+            self.assertEqual(path.read_text(encoding="utf-8"), local_text)
+        self.assertEqual(remote.strings[sync_new_drama_ids.MANBO_INFO_KEY], newer)
+        self.assertEqual(remote.strings["manbo:info:meta:v2"], '{"unchanged":true}')
 
 
 class WatchcountFakeUpstash:

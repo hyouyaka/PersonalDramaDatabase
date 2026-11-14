@@ -94,7 +94,10 @@ def main(argv: list[str]) -> int:
     migrated = replace_manbo_main_cv_ids(manbo_store, replacements, cv_name_map=names)
     if migrated:
         save_json(MANBO_INFO_PATH, manbo_store)
-    merge_and_upload_info_file(MANBO_INFO_KEY, MANBO_INFO_PATH, list(dict.fromkeys([*drama_ids, *sorted(migrated)])))
+    merge_and_upload_info_file(
+        MANBO_INFO_KEY, MANBO_INFO_PATH, list(dict.fromkeys([*drama_ids, *sorted(migrated)])),
+        removed_drama_ids=stats.get("blocked_producer_ids") or [],
+    )
     print("migrated 漫播 dramas:", len(migrated))
     print("漫播 processed:", stats["processed"])
     print("漫播 watch counts updated:", stats["processed"])

@@ -47,6 +47,7 @@ from platform_sync import (
     is_narrator_role,
     is_numeric_drama_id,
     is_excluded_drama,
+    is_blocked_manbo_producer,
     is_missevan_preview_title,
     match_first_episode,
     is_target_catalog,
@@ -1691,6 +1692,12 @@ def refresh_manbo(
         remote_catalog = (data or {}).get("catelog") if isinstance(data, dict) else None
         if remote_catalog is None and isinstance(data, dict):
             remote_catalog = data.get("category")
+        if isinstance(data, dict) and is_blocked_manbo_producer(data):
+            rejected.append({"dramaId": drama_id, "reason": "blocked producer"})
+            rejected_ids.add(drama_id)
+            cache.get("counts", {}).pop(drama_id, None)
+            print(f"[漫播] rejected ID={drama_id}: blocked producer")
+            continue
         if not isinstance(data, dict) or not remote_title or not is_target_catalog("manbo", remote_catalog):
             if not isinstance(data, dict):
                 reason = "missing data"
@@ -1744,6 +1751,7 @@ def refresh_manbo(
         "unknown_catalogs": sorted(unknown_catalogs),
         "missing_catalog": missing_catalog,
         "rejected": rejected,
+        "blocked_producer_ids": sorted(item["dramaId"] for item in rejected if item["reason"] == "blocked producer"),
         "manbo_generated_replacements": map_stats.get("manbo_generated_replacements", {}),
     }
 

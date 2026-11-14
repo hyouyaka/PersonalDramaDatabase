@@ -919,16 +919,27 @@ def merge_missevan_info_for_ids(remote_store: dict, local_store: dict, drama_ids
     return merged
 
 
-def merge_manbo_info_for_ids(remote_store: dict, local_store: dict, drama_ids: list[str]) -> dict:
+def merge_manbo_info_for_ids(
+    remote_store: dict, local_store: dict, drama_ids: list[str], *, removed_drama_ids: list[str] | None = None,
+) -> dict:
+    target_ids = normalize_ids(drama_ids)
+    removed = set(normalize_ids(removed_drama_ids or []))
+    if not removed.issubset(target_ids):
+        raise ValueError("Refusing to remove 漫播 dramaIds outside the refresh scope")
     merged = dict(remote_store)
-    records = list(remote_store.get("records") or [])
+    records = [record for record in remote_store.get("records") or []
+               if normalize(record.get("dramaId")) not in removed]
     local_index = build_manbo_index(local_store)
     position_by_id = {
         normalize(record.get("dramaId")): idx
         for idx, record in enumerate(records)
         if isinstance(record, dict) and normalize(record.get("dramaId"))
     }
-    for drama_id in normalize_ids(drama_ids):
+    for drama_id in target_ids:
+        # Only explicit producer rejections authorize deletion. A missing local
+        # record alone can mean an incomplete fetch and must preserve remote data.
+        if drama_id in removed:
+            continue
         record = local_index.get(drama_id)
         if record is None:
             print(f"[warn] no local 漫播 record to upload for dramaId={drama_id}")
@@ -943,7 +954,12 @@ def merge_manbo_info_for_ids(remote_store: dict, local_store: dict, drama_ids: l
     return merged
 
 
-def merge_info_payload_for_ids(key: str, remote_store: object, local_store: object, drama_ids: list[str]) -> object:
+def merge_info_payload_for_ids(
+    key: str, remote_store: object, local_store: object, drama_ids: list[str], *,
+    removed_drama_ids: list[str] | None = None,
+) -> object:
+    if removed_drama_ids and key != MANBO_INFO_KEY:
+        raise ValueError("Explicit drama removal is supported only for manbo info")
     if key == MISSEVAN_INFO_KEY:
         if not isinstance(remote_store, dict) or not isinstance(local_store, dict):
             raise RuntimeError(f"{key} must be a JSON object.")
@@ -951,17 +967,21 @@ def merge_info_payload_for_ids(key: str, remote_store: object, local_store: obje
     if key == MANBO_INFO_KEY:
         if not isinstance(remote_store, dict) or not isinstance(local_store, dict):
             raise RuntimeError(f"{key} must be a JSON object.")
-        return merge_manbo_info_for_ids(remote_store, local_store, drama_ids)
+        return merge_manbo_info_for_ids(remote_store, local_store, drama_ids, removed_drama_ids=removed_drama_ids)
     raise RuntimeError(f"Unsupported info key for merge upload: {key}")
 
 
-def merge_and_upload_info_file(key: str, path: Path, drama_ids: list[str]) -> None:
+def merge_and_upload_info_file(
+    key: str, path: Path, drama_ids: list[str], *, removed_drama_ids: list[str] | None = None,
+) -> None:
     latest_raw = upstash_request(["GET", key])
     latest_remote = decode_remote_info_payload(key, latest_raw)
     assert_info_download_is_safe(key, latest_remote)
     local_payload = load_json(path, {})
-    merged = merge_info_payload_for_ids(key, latest_remote, local_payload, drama_ids)
-    value = write_info_payload(path, merged)
+    merged = merge_info_payload_for_ids(
+        key, latest_remote, local_payload, drama_ids, removed_drama_ids=removed_drama_ids,
+    )
+    value = json.dumps(merged, ensure_ascii=False, indent=2)
     assert_info_upload_is_safe(key, value, path)
     publish_info_v2(
         key,
@@ -970,6 +990,7 @@ def merge_and_upload_info_file(key: str, path: Path, drama_ids: list[str]) -> No
         force=True,
         source_encoded=latest_raw if isinstance(latest_raw, str) else None,
     )
+    write_info_payload(path, merged)
     print(f"[ok] merged and uploaded authoritative {path.name} -> {key}")
 
 

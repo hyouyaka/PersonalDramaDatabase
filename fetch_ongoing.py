@@ -21,6 +21,7 @@ from platform_sync import (
     MissevanRequester,
     is_numeric_drama_id,
     is_excluded_drama,
+    is_blocked_manbo_producer,
     normalize,
     request_manbo_json,
 )
@@ -815,6 +816,8 @@ def manbo_update_time_allowed(value: object) -> bool:
 
 
 def manbo_item_allowed(item: dict) -> bool:
+    if is_blocked_manbo_producer(item.get("radioDramaResp") or {}):
+        return False
     if "全一期" in manbo_labels(item):
         return False
     return is_paid_manbo_ongoing_item(item) and manbo_update_time_allowed(item.get("workUpdateTimeFormat"))
