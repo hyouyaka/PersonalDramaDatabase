@@ -665,6 +665,7 @@ def _build_metric_payload(store: dict, platform: str, history_date: str, generat
 TREND_METRIC_FIELDS = (
     "view_count",
     "danmaku_uid_count",
+    "PaidEpisodesCount",
     "favorite_count",
     "subscription_num",
     "reward_num",
@@ -1640,6 +1641,8 @@ def _fetch_one_missevan(
         raise RejectedDramaRecord(f"non-target catalog={catalog}")
     episodes_section = info.get("episodes") or {}
     episodes = episodes_section.get("episode") or []
+    if isinstance(episodes_section.get("episode"), list):
+        assign_fetched_metric(entry, "PaidEpisodesCount", len(_missevan_paid_sound_ids(episodes)))
 
     entry["name"] = title
     entry["cover"] = drama.get("cover", entry.get("cover", ""))
@@ -1703,20 +1706,27 @@ def _fetch_one_missevan(
         else:
             entry.setdefault("danmaku_uid_count", None)
     else:
-        _fetch_missevan_danmaku(requester, episodes, entry)
+        _fetch_missevan_danmaku(requester, episodes_section.get("episode"), entry)
 
     entry["fetched_at"] = now_iso()
 
 
-def _fetch_missevan_danmaku(requester: MissevanRequester, episodes: list[dict], entry: dict) -> None:
-    """Fetch danmaku for paid episodes and count unique UIDs."""
-    paid_sounds = []
+def _missevan_paid_sound_ids(episodes: list[dict]) -> list[str]:
+    paid_sounds: list[str] = []
     for ep in episodes:
         if ep.get("need_pay") in (True, 1, "1") or int(ep.get("price") or 0) > 0:
             sid = ep.get("sound_id")
             if sid:
                 paid_sounds.append(str(sid))
 
+    return list(dict.fromkeys(paid_sounds))
+
+
+def _fetch_missevan_danmaku(requester: MissevanRequester, episodes: list[dict] | None, entry: dict) -> None:
+    """Fetch danmaku for paid episodes and count unique UIDs."""
+    paid_sounds = _missevan_paid_sound_ids(episodes or [])
+    if isinstance(episodes, list):
+        assign_fetched_metric(entry, "PaidEpisodesCount", len(paid_sounds))
     if not paid_sounds:
         entry["danmaku_uid_count"] = 0
         mark_metric_fetched(entry, "danmaku_uid_count")
@@ -1816,7 +1826,7 @@ def fetch_manbo_drama_details(
         elif danmaku_ids is None or drama_id in danmaku_ids:
             try:
                 _, uid_count = fetch_one_manbo_danmaku_count(
-                    drama_id, progress=danmaku_progress.setdefault(str(drama_id), {})
+                    drama_id, progress=danmaku_progress.setdefault(str(drama_id), {}), entry=entry
                 )
                 assign_manbo_danmaku_uid_count(entry, drama_id, uid_count)
             except Exception as exc:
@@ -1836,7 +1846,7 @@ def fetch_manbo_drama_details(
     def retry_one_danmaku(drama_id: str) -> None:
         entry = dramas.get(str(drama_id), {})
         _, uid_count = fetch_one_manbo_danmaku_count(
-            str(drama_id), progress=danmaku_progress.setdefault(str(drama_id), {})
+            str(drama_id), progress=danmaku_progress.setdefault(str(drama_id), {}), entry=entry
         )
         assign_manbo_danmaku_uid_count(entry, str(drama_id), uid_count)
         entry["fetched_at"] = now_iso()
@@ -1876,6 +1886,14 @@ def _fetch_one_manbo(drama_id: str, entry: dict) -> None:
     rank_only = is_excluded_drama("manbo", drama_id) and not is_rank_excluded_drama("manbo", drama_id)
     if not is_target_catalog("manbo", catalog) and not rank_only:
         raise RejectedDramaRecord(f"non-target catalog={catalog}")
+
+    if any(isinstance(body.get(field), list) for field in MANBO_SET_LIST_FIELDS):
+        paid_ids = {
+            _extract_manbo_set_id(episode)
+            for episode in _extract_manbo_set_list(body)
+            if _extract_manbo_set_id(episode) and is_paid_manbo_episode(episode)
+        }
+        assign_fetched_metric(entry, "PaidEpisodesCount", len(paid_ids))
 
     entry["name"] = title
     entry["cover"] = body.get("coverPic") or body.get("largePic") or body.get("cover", entry.get("cover", ""))
@@ -1945,7 +1963,7 @@ def fetch_manbo_paid_set_ids(
     *,
     request_json=request_manbo_json,
 ) -> list[str]:
-    """Fetch Manbo drama detail and return paid episode/set IDs."""
+    """Return paid set IDs; reject responses without an observed set list."""
     detail_requests = [
         lambda: request_manbo_web_json(
             f"/web_manbo/dramaDetail?dramaId={drama_id}",
@@ -1956,26 +1974,30 @@ def fetch_manbo_paid_set_ids(
         ),
     ]
     last_error: Exception | None = None
-    had_successful_response = False
     for load_detail in detail_requests:
         try:
             data = load_detail()
         except Exception as exc:
             last_error = exc
             continue
-        had_successful_response = True
         payload = data.get("data") or data.get("b") or {}
+        if not isinstance(payload, dict) or not any(
+            isinstance(payload.get(field), list) for field in MANBO_SET_LIST_FIELDS
+        ):
+            last_error = RuntimeError(
+                "invalid Manbo drama detail response: expected a supported set list field"
+            )
+            continue
         episodes = _extract_manbo_set_list(payload)
         paid_ids = []
         for episode in episodes:
             set_id = _extract_manbo_set_id(episode)
             if set_id and is_paid_manbo_episode(episode):
                 paid_ids.append(set_id)
-        if paid_ids or episodes:
-            return list(dict.fromkeys(paid_ids))
-    if not had_successful_response and last_error is not None:
+        return list(dict.fromkeys(paid_ids))
+    if last_error is not None:
         raise last_error
-    return []
+    raise RuntimeError("Manbo drama detail unavailable: no supported set list")
 
 
 def _request_manbo_danmaku_page(
@@ -2197,6 +2219,7 @@ def fetch_one_manbo_danmaku_count(
     *,
     request_json=request_manbo_json,
     progress: dict | None = None,
+    entry: dict | None = None,
 ) -> tuple[str, int]:
     """Return (drama_id, paid_danmaku_uid_count) for one Manbo drama."""
     result = fetch_manbo_paid_danmaku_benchmark(
@@ -2205,6 +2228,8 @@ def fetch_one_manbo_danmaku_count(
         page_concurrency=MANBO_DANMAKU_PAGE_CONCURRENCY,
         progress=progress,
     )
+    if entry is not None and result.get("paid_set_count") is not None:
+        assign_fetched_metric(entry, "PaidEpisodesCount", int(result["paid_set_count"]))
     print(
         f"    [danmaku] manbo drama {drama_id}: paid_sets={result.get('paid_set_count', 0)} "
         f"total_pages={result.get('total_pages', 0)} fetched_pages={result.get('fetched_pages', 0)} "
@@ -2243,11 +2268,13 @@ def fetch_manbo_danmaku_details(
     save_counter = 0
     failed_danmaku_ids: set[str] = set()
     danmaku_progress: dict[str, dict] = {str(drama_id): {} for drama_id in targets}
+    episode_counts: dict[str, dict] = {str(drama_id): {} for drama_id in targets}
     workers = max(1, min(MANBO_DANMAKU_DRAMA_CONCURRENCY, len(targets)))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_drama = {
             executor.submit(
-                fetch_one_manbo_danmaku_count, drama_id, progress=danmaku_progress[str(drama_id)]
+                fetch_one_manbo_danmaku_count, drama_id, progress=danmaku_progress[str(drama_id)],
+                entry=episode_counts[str(drama_id)],
             ): drama_id
             for drama_id in sorted(targets)
         }
@@ -2267,6 +2294,8 @@ def fetch_manbo_danmaku_details(
             except Exception as exc:
                 print(f"  [manbo] ({completed}/{len(targets)}) ERROR on {drama_id}: {exc}")
                 failed_danmaku_ids.add(str(drama_id))
+            if "PaidEpisodesCount" in episode_counts[str(drama_id)]:
+                assign_fetched_metric(entry, "PaidEpisodesCount", episode_counts[str(drama_id)]["PaidEpisodesCount"])
             entry.pop("danmaku_paid_episode_count", None)
             manbo_dramas[drama_id] = entry
             save_counter += 1
@@ -2279,7 +2308,7 @@ def fetch_manbo_danmaku_details(
     def retry_one_danmaku(drama_id: str) -> None:
         entry = manbo_dramas.get(str(drama_id), {})
         _, uid_count = fetch_one_manbo_danmaku_count(
-            str(drama_id), progress=danmaku_progress[str(drama_id)]
+            str(drama_id), progress=danmaku_progress[str(drama_id)], entry=entry
         )
         assign_manbo_danmaku_uid_count(entry, str(drama_id), uid_count)
         entry["fetched_at"] = now_iso()
@@ -2994,7 +3023,7 @@ def fetch_one_missevan_danmaku_count(drama_id: str, requester: MissevanRequester
     url = f"https://www.missevan.com/dramaapi/getdrama?drama_id={drama_id}"
     data = active_requester.request_json(url)
     info = data.get("info") or {}
-    episodes = (info.get("episodes") or {}).get("episode") or []
+    episodes = (info.get("episodes") or {}).get("episode")
     entry: dict = {}
     _fetch_missevan_danmaku(active_requester, episodes, entry)
     return str(drama_id), safe_int(entry.get("danmaku_uid_count"))
@@ -3143,7 +3172,7 @@ def only_danmaku_mode(store: dict, *, force: bool, do_missevan: bool, do_manbo: 
                 url = f"https://www.missevan.com/dramaapi/getdrama?drama_id={drama_id}"
                 data = requester.request_json(url)
                 info = data.get("info") or {}
-                episodes = (info.get("episodes") or {}).get("episode") or []
+                episodes = (info.get("episodes") or {}).get("episode")
                 _fetch_missevan_danmaku(requester, episodes, missevan_dramas[drama_id])
                 missevan_dramas[drama_id]["fetched_at"] = now_iso()
             except RuntimeError as exc:
@@ -3162,7 +3191,7 @@ def only_danmaku_mode(store: dict, *, force: bool, do_missevan: bool, do_manbo: 
             url = f"https://www.missevan.com/dramaapi/getdrama?drama_id={drama_id}"
             data = requester.request_json(url)
             info = data.get("info") or {}
-            episodes = (info.get("episodes") or {}).get("episode") or []
+            episodes = (info.get("episodes") or {}).get("episode")
             _fetch_missevan_danmaku(requester, episodes, missevan_dramas[str(drama_id)])
             missevan_dramas[str(drama_id)]["fetched_at"] = now_iso()
             save_json(RANKS_PATH, store)

@@ -58,6 +58,20 @@ python restore_retired_upstash.py --env-file F:/VSProjects/PersonalDramaDatabase
 
 验证工具：`python -B -m unittest test_backup_retired_upstash test_upstash_v2`。
 
+### 普通趋势的付费集数
+
+`fetch_rank_data.py` 在猫耳、漫播的每日采集中记录 `PaidEpisodesCount`（大小写固定）。
+该字段写入 `ranks:latest` 的 `{platform}.dramas.{dramaId}.PaidEpisodesCount`，以及
+`ranks:trend:{platform}:v2` 对应剧目 Hash field 的
+`samples.{YYYY-MM-DD}.metrics.PaidEpisodesCount`，均为可选的新增字段，不调整 key、版本或原有指标。
+
+- 数值为按声音/分集 ID 去重的付费集数，沿用弹幕采集的付费及会员判定；与弹幕 UID 数无关。
+- 趋势中 `0` 表示已取得分集列表且没有付费集；`null` 或字段缺失表示没有可用的本轮观测，消费端不能据此判定零集。
+- latest 保留最近一次成功观测的集数；是否属于本次采样，以趋势的对应日期为准。
+- 复用现有详情及弹幕请求；跳过弹幕时，有效详情分集列表仍会更新集数。
+- 仅从新采样开始记录，不回填历史日期。弹幕失败不会清空已取得的集数；后续弹幕修复保留该字段。
+- 每日入口与参数不变。服务器同步本次代码后，下次 `run_daily_update.ps1` 自动采集并发布。
+
 这个仓库现在把数据维护拆成了 3 段：
 
 1. 更新源库和 `missevan&manbo-cvid-map.json`

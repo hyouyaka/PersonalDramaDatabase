@@ -2716,12 +2716,14 @@ class RepairPublicationConcurrencyTests(unittest.TestCase):
                 remote = json.loads(fake.strings["ranks:latest"])
                 remote[other]["new_publication"] = {"peak_count": 50}
                 remote[platform]["dramas"]["600"]["view_count"] = 999
+                remote[platform]["dramas"]["600"]["PaidEpisodesCount"] = 5
                 remote[platform]["dramas"]["601"]["danmaku_uid_count"] = 88
                 fake.strings["ranks:latest"] = json.dumps(remote)
                 hashes_before = copy.deepcopy(fake.hashes)
                 key = upstash_v2.NORMAL_TREND_V2_KEYS[platform]
                 target = json.loads(fake.hashes[key]["600"])
                 target["samples"][self.day]["metrics"]["view_count"] = 999
+                target["samples"][self.day]["metrics"]["PaidEpisodesCount"] = 5
                 fake.hashes[key]["600"] = json.dumps(target)
                 self.publish(fake, payloads, platform, archived={other: {"other"}})
                 result = json.loads(fake.strings["ranks:latest"])
@@ -2730,11 +2732,12 @@ class RepairPublicationConcurrencyTests(unittest.TestCase):
                 self.assertEqual(result[platform]["dramas"]["601"], remote[platform]["dramas"]["601"])
                 entry = result[platform]["dramas"]["600"]
                 self.assertEqual((entry["danmaku_uid_count"], entry["view_count"]), (0, 999))
+                self.assertEqual(entry["PaidEpisodesCount"], 5)
                 self.assertEqual(result["_meta"]["capture_started_at"], "keep")
                 self.assertEqual(fake.hashes[upstash_v2.NORMAL_TREND_V2_KEYS[other]], hashes_before[upstash_v2.NORMAL_TREND_V2_KEYS[other]])
                 self.assertEqual(json.loads(fake.hashes[key]["601"]), json.loads(hashes_before[key]["601"]))
                 metrics = json.loads(fake.hashes[key]["600"])["samples"][self.day]["metrics"]
-                self.assertEqual(metrics, {"view_count": 999, "danmaku_uid_count": 0})
+                self.assertEqual(metrics, {"view_count": 999, "danmaku_uid_count": 0, "PaidEpisodesCount": 5})
                 resources = json.loads(fake.strings["ranks:meta"])["normal"]["resources"]
                 self.assertIn("ranks:latest", resources)
                 self.assertIn(key, resources)
@@ -3250,6 +3253,7 @@ class ManboDanmakuStabilityTests(unittest.TestCase):
                         self.assertEqual(write_layers.call_count, 0 if persistent_failure else 1)
                     else:
                         self.assertEqual(store["manbo"]["dramas"]["600"]["danmaku_uid_count"], None if persistent_failure else 2)
+                        self.assertEqual(store["manbo"]["dramas"]["600"]["PaidEpisodesCount"], 1)
 
     def test_manbo_low_value_within_two_percent_is_allowed(self) -> None:
         store = {
@@ -3447,7 +3451,7 @@ class TargetCatalogAdmissionTests(unittest.TestCase):
         self.assertEqual(entry["subscription_num"], 456)
         self.assertEqual(
             set(entry["_metric_fetched_at"]),
-            {"view_count", "reward_total", "subscription_num"},
+            {"view_count", "reward_total", "subscription_num", "PaidEpisodesCount"},
         )
 
     def test_manbo_detail_marks_only_metrics_returned_by_the_detail_response(self) -> None:
@@ -3505,6 +3509,173 @@ class TargetCatalogAdmissionTests(unittest.TestCase):
             fetch_rank_data._fetch_one_manbo("200", entry)
 
         self.assertEqual(entry["name"], "广播剧")
+
+
+class PaidEpisodesCountTests(unittest.TestCase):
+    captured_at = "2026-11-17T00:10:00+00:00"
+
+    def test_missevan_paid_episodes_with_empty_danmaku_are_not_zero_episodes(self):
+        episodes = [
+            {"sound_id": "free", "need_pay": 0},
+            {"sound_id": "paid", "need_pay": 1},
+            {"sound_id": "member", "need_pay": "1", "vip": 2},
+            {"sound_id": "priced", "price": 10},
+            {"sound_id": "paid", "need_pay": True},
+        ]
+        entry = {}
+        with (
+            patch.object(fetch_rank_data.requests, "get", return_value=Mock(text="<i></i>")) as get,
+            patch.object(fetch_rank_data.time, "sleep"),
+            patch("builtins.print"),
+        ):
+            fetch_rank_data._fetch_missevan_danmaku(None, episodes, entry)
+        self.assertEqual(entry["PaidEpisodesCount"], 3)
+        self.assertEqual(entry["danmaku_uid_count"], 0)
+        self.assertEqual(get.call_count, 3)
+
+    def test_missevan_missing_list_is_unknown_but_explicit_empty_list_is_zero(self):
+        for episodes, expected in ((None, None), ([], 0)):
+            with self.subTest(episodes=episodes), patch("builtins.print"):
+                entry = {}
+                fetch_rank_data._fetch_missevan_danmaku(None, episodes, entry)
+                self.assertEqual(entry.get("PaidEpisodesCount"), expected)
+                self.assertEqual("PaidEpisodesCount" in entry.get("_metric_fetched_at", {}), expected == 0)
+
+    def test_missevan_detail_counts_episodes_when_danmaku_is_skipped(self):
+        requester = Mock()
+        requester.request_json.return_value = {"info": {
+            "drama": {"name": "member drama", "catalog": 89},
+            "episodes": {"episode": [{"sound_id": "paid", "need_pay": 1}]},
+        }}
+        entry = {"danmaku_uid_count": "无需抓取"}
+        with patch.object(fetch_rank_data.requests, "get") as get:
+            fetch_rank_data._fetch_one_missevan(
+                requester, "97187", entry, skip_danmaku=True, clear_danmaku_on_skip=False,
+            )
+        self.assertEqual(entry["PaidEpisodesCount"], 1)
+        self.assertEqual(entry["danmaku_uid_count"], "无需抓取")
+        get.assert_not_called()
+
+    def test_manbo_detail_counts_unique_paid_and_member_sets_only_when_list_exists(self):
+        for sets, expected in ((None, None), ([], 0), ([
+            {"setId": "free", "payType": 0},
+            {"setId": "paid", "payType": 1},
+            {"setId": "member", "vipFree": 1},
+            {"setId": "paid", "payType": 1},
+        ], 2)):
+            with self.subTest(sets=sets):
+                body = {"title": "drama", "category": 1, "setRespList": sets}
+                entry = {}
+                with patch.object(fetch_rank_data, "request_manbo_json", return_value={"data": body}):
+                    fetch_rank_data._fetch_one_manbo("600", entry)
+                self.assertEqual(entry.get("PaidEpisodesCount"), expected)
+
+    def test_manbo_danmaku_records_count_without_changing_return_tuple(self):
+        for failed in (False, True):
+            with self.subTest(failed=failed):
+                entry = {}
+                result = {"paid_set_count": 5, "unique_user_count": 0,
+                          "failed_pages": [{"error": "timeout"}] if failed else []}
+                with (
+                    patch.object(fetch_rank_data, "fetch_manbo_paid_danmaku_benchmark", return_value=result),
+                    patch("builtins.print"),
+                ):
+                    if failed:
+                        with self.assertRaises(RuntimeError):
+                            fetch_rank_data.fetch_one_manbo_danmaku_count("600", entry=entry)
+                    else:
+                        self.assertEqual(fetch_rank_data.fetch_one_manbo_danmaku_count("600", entry=entry), ("600", 0))
+                self.assertEqual(entry["PaidEpisodesCount"], 5)
+
+    def test_manbo_missing_fallback_set_list_preserves_count_and_capture_marker(self):
+        old_marker = "2026-11-16T00:10:00+00:00"
+        for invalid_payload in ({}, {"setRespList": None}, {"setRespList": {}}):
+            for existing in (False, True):
+                with self.subTest(payload=invalid_payload, existing=existing):
+                    entry = {"view_count": 100, "_metric_fetched_at": {"view_count": old_marker}}
+                    if existing:
+                        entry["PaidEpisodesCount"] = 5
+                        entry["_metric_fetched_at"]["PaidEpisodesCount"] = old_marker
+                    original = copy.deepcopy(entry)
+                    progress = {}
+
+                    def requester(url):
+                        if "/web_manbo/dramaDetail" in url:
+                            raise requests.exceptions.ReadTimeout("Web detail unavailable")
+                        self.assertIn("/api/v530/radio/drama/detail", url)
+                        return {"data": invalid_payload}
+
+                    with (
+                        patch.object(fetch_rank_data, "now_iso", return_value=self.captured_at),
+                        patch("builtins.print"),
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "supported set list"):
+                            fetch_rank_data.fetch_one_manbo_danmaku_count(
+                                "600", request_json=requester, progress=progress, entry=entry,
+                            )
+                    self.assertEqual(entry, original)
+                    self.assertEqual(progress, {})
+                    store = {"manbo": {"dramas": {"600": entry}}}
+                    metrics = fetch_rank_data._build_metric_payload(
+                        store, "manbo", "2026-11-17", self.captured_at,
+                    )
+                    self.assertIsNone(metrics["dramas"]["600"]["PaidEpisodesCount"])
+
+    def test_manbo_valid_empty_or_free_fallback_set_list_records_fresh_zero(self):
+        for sets in ([], [{"setId": "free", "payType": 0}]):
+            with self.subTest(sets=sets):
+                entry = {"PaidEpisodesCount": 5}
+
+                def requester(url):
+                    if "/web_manbo/dramaDetail" in url:
+                        raise requests.exceptions.ReadTimeout("Web detail unavailable")
+                    self.assertIn("/api/v530/radio/drama/detail", url)
+                    return {"data": {"setRespList": sets}}
+
+                with (
+                    patch.object(fetch_rank_data, "now_iso", return_value=self.captured_at),
+                    patch("builtins.print"),
+                ):
+                    result = fetch_rank_data.fetch_one_manbo_danmaku_count(
+                        "600", request_json=requester, entry=entry,
+                    )
+                self.assertEqual(result, ("600", 0))
+                self.assertEqual(entry["PaidEpisodesCount"], 0)
+                self.assertEqual(entry["_metric_fetched_at"]["PaidEpisodesCount"], self.captured_at)
+
+    def test_daily_snapshot_and_v2_publish_add_count_preserving_old_metrics_and_history(self):
+        for platform, third in (("missevan", "subscription_num"), ("manbo", "pay_count")):
+            for count in (0, 5):
+                with self.subTest(platform=platform, count=count):
+                    original_metrics = {"view_count": 100, "danmaku_uid_count": 0, third: 20}
+                    entry = {"name": "drama", **original_metrics, "PaidEpisodesCount": count}
+                    entry["_metric_fetched_at"] = {key: self.captured_at for key in (*original_metrics, "PaidEpisodesCount")}
+                    store = {platform: {"ranks": {}, "dramas": {"600": entry}}}
+                    snapshots = fetch_rank_data.build_rank_snapshot_payloads(
+                        store, platforms=(platform,), history_date="2026-11-17", generated_at=self.captured_at,
+                    )
+                    old = {"dates": ["2026-11-16"], "dramas": {"600": {"id": "600", "samples": {
+                        "2026-11-16": {"generated_at": "old", "metrics": original_metrics, "ranks": []},
+                    }}}}
+                    snapshot = snapshots[platform]
+                    trend = fetch_rank_data.build_rank_trend_payload(
+                        old, platform, "2026-11-17", snapshot["metrics"], snapshot["list"],
+                        generated_at=self.captured_at,
+                    )
+                    fake = FakeUpstash()
+                    upstash_v2.publish_normal_trend_v2(platform, trend, upstash=fake)
+                    saved = json.loads(fake.hashes[f"ranks:trend:{platform}:v2"]["600"])
+                    samples = saved["samples"]
+                    self.assertEqual(samples["2026-11-16"]["metrics"], original_metrics)
+                    self.assertEqual(samples["2026-11-17"]["metrics"], {**original_metrics, "PaidEpisodesCount": count})
+                    self.assertEqual(saved["version"], 2)
+
+    def test_cached_count_without_successful_fetch_is_null_in_todays_snapshot(self):
+        entry = {"PaidEpisodesCount": 5, "_metric_fetched_at": {"PaidEpisodesCount": "2026-11-16T00:10:00+00:00"}}
+        store = {"missevan": {"dramas": {"97187": entry}}}
+        metrics = fetch_rank_data._build_metric_payload(store, "missevan", "2026-11-17", self.captured_at)
+        self.assertIsNone(metrics["dramas"]["97187"]["PaidEpisodesCount"])
+        self.assertEqual(entry["PaidEpisodesCount"], 5)
 
 
 if __name__ == "__main__":

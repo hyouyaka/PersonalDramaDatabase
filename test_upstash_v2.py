@@ -408,7 +408,7 @@ class UpstashV2Tests(unittest.TestCase):
                 "samples": {
                     "2026-09-29": {
                         "generated_at": "2026-09-29T02:00:00+00:00",
-                        "metrics": {"view_count": 500, "danmaku_uid_count": 12},
+                        "metrics": {"view_count": 500, "danmaku_uid_count": 12, "PaidEpisodesCount": 5},
                         "ranks": [{"key": "hot", "name": "热榜", "position": 2}],
                     }
                 },
@@ -427,7 +427,7 @@ class UpstashV2Tests(unittest.TestCase):
                 "samples": {
                     "2026-09-29": {
                         "generated_at": "2026-09-29T05:00:00+00:00",
-                        "metrics": {"view_count": None, "danmaku_uid_count": None, "subscription_num": 7},
+                        "metrics": {"view_count": None, "danmaku_uid_count": None, "subscription_num": 7, "PaidEpisodesCount": None},
                         "ranks": None,
                     }
                 },
@@ -441,7 +441,7 @@ class UpstashV2Tests(unittest.TestCase):
             candidate_fields,
         )
         sample = fields["100"]["samples"]["2026-09-29"]
-        self.assertEqual(sample["metrics"], {"view_count": 500, "danmaku_uid_count": 12, "subscription_num": 7})
+        self.assertEqual(sample["metrics"], {"view_count": 500, "danmaku_uid_count": 12, "subscription_num": 7, "PaidEpisodesCount": 5})
         self.assertEqual(sample["ranks"], [{"key": "hot", "name": "热榜", "position": 2}])
 
     def test_same_day_observed_empty_rank_list_clears_prior_rank(self) -> None:

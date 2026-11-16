@@ -430,7 +430,7 @@ def build_normal_trend_v2(payload: dict, platform: str, *, retention_dates: int 
             raw_metrics = raw_sample.get("metrics") if isinstance(raw_sample.get("metrics"), dict) else {}
             metrics = {
                 key: raw_metrics.get(key)
-                for key in ("view_count", "danmaku_uid_count", third_metric)
+                for key in ("view_count", "danmaku_uid_count", third_metric, "PaidEpisodesCount")
                 if key in raw_metrics
             }
             samples[str(date)] = {
