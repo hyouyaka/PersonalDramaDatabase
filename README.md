@@ -58,6 +58,46 @@ python restore_retired_upstash.py --env-file F:/VSProjects/PersonalDramaDatabase
 
 验证工具：`python -B -m unittest test_backup_retired_upstash test_upstash_v2`。
 
+### 每日分集弹幕明细
+
+`run_daily_update.ps1` 自动启用明细日志。主 `.log` 继续记录全剧付费 UID 汇总，
+分集明细追加到 `logs/danmaku-details-YYYY-MM-DD.jsonl`，日期与本次每日主日志的
+服务器当地日期一致；同一每日任务的采集和后续修复共用运行 ID。行内时间为 UTC。
+明细文件留在本地，不发布到 Redis，也不写入已有榜单或趋势结构。
+
+每行固定九个字段：
+
+| 字段 | 含义 |
+|---|---|
+| `time` | 本条记录的 UTC 时间 |
+| `run_id` | 每日任务运行 ID，主日志中可搜索 `[details]` 找到 |
+| `platform` | `missevan` 或 `manbo` |
+| `drama_id` | 剧集 ID，字符串 |
+| `episode_id` | 声音 / 分集 ID，字符串 |
+| `episode_title` | 现有详情响应中的分集标题；接口缺少标题时为空 |
+| `attempt` | 本运行内该分集第几次统计尝试，从 1 开始，后续修复接续编号 |
+| `fetched_count` | 本次分集统计得到的弹幕条数；没有取得有效响应时为 `null`，有效空响应为 `0` |
+| `complete` | 本次接口 / 分页是否采集完成，布尔值 |
+
+- 两平台均复用原有请求，不补抓分集详情、不判断溢出、不统计或记录集内 UID 数。
+- 猫耳按有效 XML 的 `<d>` 节点计数；`complete=true` 不表示拿到平台全部历史弹幕。
+- 漫播将分页条数按分集合计；部分分页失败时记录已抓条数及 `complete=false`。
+  重试复用成功分页，记录的是该次统计累计的有效条数，替换短页不重复计数。
+- `attempt` 指一次分集统计尝试，不是单个 HTTP 请求的内部重试次数。
+  本次完全复用缓存而没有请求的分集不会重复写一行；尚未取得分集列表时不能生成逐集记录。
+- 写入使用进程内锁，逐行落盘。写入失败会在主日志警告并停止该进程的明细写入，采集与发布继续。
+- 不保存弹幕正文和 UID 清单，不自动删除历史日志。
+
+日志网页新增“分集弹幕明细”，按日期文件、平台、剧集 ID、分集 ID、运行 ID 和完整状态筛选，
+每页 100 条，按需翻页；不会随主日志每 5 秒刷新而重复加载明细。
+“下载当日完整 JSONL”下载所选日期全部记录，不受筛选条件和 200 KB 展示上限限制。
+主日志也增加“下载完整主日志”；原有尾部预览及 `/raw` 继续保留。
+更新日志服务代码后需重启 `log_status_server.py` 才能使用新页面。
+
+单独运行 Python 抓榜脚本时，默认关闭明细；可设置 `DRAMA_DANMAKU_DETAIL_LOG=1` 启用。
+可选环境变量 `DRAMA_DANMAKU_LOG_DIR`、`DRAMA_DANMAKU_LOG_DATE`、`DRAMA_DANMAKU_RUN_ID`
+分别指定目录、文件日期和运行 ID；未指定时使用本项目 `logs/`、UTC 日期和新生成的运行 ID。
+
 ### 普通趋势的付费集数
 
 `fetch_rank_data.py` 在猫耳、漫播的每日采集中记录 `PaidEpisodesCount`（大小写固定）。

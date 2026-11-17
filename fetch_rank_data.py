@@ -8,11 +8,15 @@ import os
 import re
 import threading
 import time
+import uuid
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
+
+from danmaku_detail_log import EpisodeDetailLog
 
 from archive_manager import decode_archive_payload
 from platform_sync import (
@@ -71,6 +75,7 @@ RANK_FETCH_418_CHECKPOINT_VERSION = 1
 CACHE_WINDOW = timedelta(hours=12)
 RANK_TREND_RETENTION_DATES = 90
 SAVE_LOCK = threading.Lock()
+DANMAKU_DETAIL_LOG: EpisodeDetailLog | None = None
 
 load_env_file(HERE / ".env")
 
@@ -86,6 +91,28 @@ ONGOING_KEYS = {
 def save_json(path: Path, data) -> None:
     with SAVE_LOCK:
         _save_json(path, data)
+
+
+def configure_episode_detail_log() -> None:
+    global DANMAKU_DETAIL_LOG
+    DANMAKU_DETAIL_LOG = None
+    if os.environ.get("DRAMA_DANMAKU_DETAIL_LOG") != "1":
+        return
+    try:
+        DANMAKU_DETAIL_LOG = EpisodeDetailLog(
+            Path(os.environ.get("DRAMA_DANMAKU_LOG_DIR") or HERE / "logs"),
+            os.environ.get("DRAMA_DANMAKU_LOG_DATE") or datetime.now(timezone.utc).date().isoformat(),
+            os.environ.get("DRAMA_DANMAKU_RUN_ID") or uuid.uuid4().hex,
+        )
+        print(f"[details] run_id={DANMAKU_DETAIL_LOG.run_id} file={DANMAKU_DETAIL_LOG.path}")
+    except (OSError, ValueError) as exc:
+        print(f"[WARN] episode detail log unavailable: {exc}")
+
+
+def record_episode_detail(platform: str, drama_id: str, episode_id: str, title: str,
+                          fetched_count: int | None, complete: bool) -> None:
+    if DANMAKU_DETAIL_LOG is not None:
+        DANMAKU_DETAIL_LOG.record(platform, drama_id, episode_id, title, fetched_count, complete)
 
 
 def _parse_iso_datetime(value: object) -> datetime:
@@ -1706,7 +1733,7 @@ def _fetch_one_missevan(
         else:
             entry.setdefault("danmaku_uid_count", None)
     else:
-        _fetch_missevan_danmaku(requester, episodes_section.get("episode"), entry)
+        _fetch_missevan_danmaku(requester, episodes_section.get("episode"), entry, drama_id=drama_id)
 
     entry["fetched_at"] = now_iso()
 
@@ -1722,7 +1749,8 @@ def _missevan_paid_sound_ids(episodes: list[dict]) -> list[str]:
     return list(dict.fromkeys(paid_sounds))
 
 
-def _fetch_missevan_danmaku(requester: MissevanRequester, episodes: list[dict] | None, entry: dict) -> None:
+def _fetch_missevan_danmaku(requester: MissevanRequester, episodes: list[dict] | None, entry: dict,
+                           *, drama_id: str = "") -> None:
     """Fetch danmaku for paid episodes and count unique UIDs."""
     paid_sounds = _missevan_paid_sound_ids(episodes or [])
     if isinstance(episodes, list):
@@ -1736,13 +1764,23 @@ def _fetch_missevan_danmaku(requester: MissevanRequester, episodes: list[dict] |
     uid_set: set[str] = set()
     failed_sounds: list[str] = []
     success_sounds = 0
+    titles = {str(ep.get("sound_id")): ep.get("name") or ep.get("soundstr") or "" for ep in episodes or []}
     for sound_id in paid_sounds:
+        fetched_count = None
+        complete = False
         try:
             dm_url = f"https://www.missevan.com/sound/getdm?soundid={sound_id}"
             resp = requests.get(dm_url, headers=MISSEVAN_HEADERS, timeout=30)
             resp.raise_for_status()
+            if DANMAKU_DETAIL_LOG is not None:
+                root = ET.fromstring(resp.text)
+                if root.tag not in ("i", "d"):
+                    raise ValueError("invalid Missevan danmaku XML root")
+                fetched_count = sum(1 for _ in root.iter("d"))
+                del root
             _parse_missevan_dm_xml(resp.text, uid_set)
             success_sounds += 1
+            complete = True
         except requests.HTTPError as exc:
             response = getattr(exc, "response", None)
             status_code = getattr(response, "status_code", None)
@@ -1753,6 +1791,8 @@ def _fetch_missevan_danmaku(requester: MissevanRequester, episodes: list[dict] |
         except Exception as exc:
             print(f"    [danmaku] WARN: failed for sound {sound_id}: {exc}")
             failed_sounds.append(sound_id)
+        finally:
+            record_episode_detail("missevan", drama_id, sound_id, titles.get(sound_id, ""), fetched_count, complete)
         time.sleep(0.35)  # small delay per episode
     print(
         f"    [danmaku] paid_sounds={len(paid_sounds)} success={success_sounds} "
@@ -1962,6 +2002,7 @@ def fetch_manbo_paid_set_ids(
     drama_id: str,
     *,
     request_json=request_manbo_json,
+    episode_titles: dict[str, str] | None = None,
 ) -> list[str]:
     """Return paid set IDs; reject responses without an observed set list."""
     detail_requests = [
@@ -1994,6 +2035,8 @@ def fetch_manbo_paid_set_ids(
             set_id = _extract_manbo_set_id(episode)
             if set_id and is_paid_manbo_episode(episode):
                 paid_ids.append(set_id)
+                if episode_titles is not None:
+                    episode_titles[set_id] = str(episode.get("setTitle") or episode.get("setName") or episode.get("name") or "")
         return list(dict.fromkeys(paid_ids))
     if last_error is not None:
         raise last_error
@@ -2080,7 +2123,11 @@ def fetch_manbo_paid_danmaku_benchmark(
     if state and state.get("identity") != identity:
         raise ValueError("Manbo danmaku progress belongs to another drama or page size")
     if not state:
-        paid_set_ids = paid_set_id_loader(drama_id, request_json=request_json)
+        episode_titles: dict[str, str] = {}
+        if DANMAKU_DETAIL_LOG is not None and paid_set_id_loader is fetch_manbo_paid_set_ids:
+            paid_set_ids = paid_set_id_loader(drama_id, request_json=request_json, episode_titles=episode_titles)
+        else:
+            paid_set_ids = paid_set_id_loader(drama_id, request_json=request_json)
         state.update(
             identity=identity,
             paid_set_ids=paid_set_ids,
@@ -2088,12 +2135,14 @@ def fetch_manbo_paid_danmaku_benchmark(
             complete_pages={},
             partial_pages={},
             totals={},
+            episode_titles=episode_titles,
         )
     paid_set_ids = state["paid_set_ids"]
     complete_pages = state["complete_pages"]
     partial_pages = state["partial_pages"]
     total_danmaku_by_set = state["totals"]
     failed_pages: list[dict[str, object]] = []
+    attempted_sets: set[str] = set()
 
     def fetch_and_extract(
         set_id: str,
@@ -2116,6 +2165,7 @@ def fetch_manbo_paid_danmaku_benchmark(
         return set_id, page_no, total_count, total_pages, page_users, entry_count, expected_entries
 
     def fetch_pages(pages: list[tuple[str, int]]) -> None:
+        attempted_sets.update(set_id for set_id, _page_no in pages)
         workers = max(1, min(page_concurrency, len(pages) or 1))
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_page = {
@@ -2194,6 +2244,22 @@ def fetch_manbo_paid_danmaku_benchmark(
                     f"pages={fetched_pages}/{total_pages}, entries={fetched_count}/{expected_count}"
                 ),
             })
+
+    failed_set_ids = {str(page["set_id"]) for page in failed_pages}
+    for set_id in paid_set_ids:
+        if set_id not in attempted_sets:
+            continue
+        observed = set_id in fetched_pages_by_set
+        complete = (
+            set_id in total_pages_by_set
+            and str(set_id) not in failed_set_ids
+            and fetched_pages_by_set.get(set_id, 0) == total_pages_by_set[set_id]
+            and fetched_danmaku_by_set.get(set_id, 0) >= total_danmaku_by_set[set_id]
+        )
+        record_episode_detail(
+            "manbo", drama_id, set_id, state.get("episode_titles", {}).get(set_id, ""),
+            fetched_danmaku_by_set.get(set_id, 0) if observed else None, complete,
+        )
 
     elapsed_seconds = time.perf_counter() - started
     return {
@@ -3025,7 +3091,7 @@ def fetch_one_missevan_danmaku_count(drama_id: str, requester: MissevanRequester
     info = data.get("info") or {}
     episodes = (info.get("episodes") or {}).get("episode")
     entry: dict = {}
-    _fetch_missevan_danmaku(active_requester, episodes, entry)
+    _fetch_missevan_danmaku(active_requester, episodes, entry, drama_id=drama_id)
     return str(drama_id), safe_int(entry.get("danmaku_uid_count"))
 
 
@@ -3173,7 +3239,7 @@ def only_danmaku_mode(store: dict, *, force: bool, do_missevan: bool, do_manbo: 
                 data = requester.request_json(url)
                 info = data.get("info") or {}
                 episodes = (info.get("episodes") or {}).get("episode")
-                _fetch_missevan_danmaku(requester, episodes, missevan_dramas[drama_id])
+                _fetch_missevan_danmaku(requester, episodes, missevan_dramas[drama_id], drama_id=drama_id)
                 missevan_dramas[drama_id]["fetched_at"] = now_iso()
             except RuntimeError as exc:
                 if "HTTP_418" in str(exc):
@@ -3192,7 +3258,7 @@ def only_danmaku_mode(store: dict, *, force: bool, do_missevan: bool, do_manbo: 
             data = requester.request_json(url)
             info = data.get("info") or {}
             episodes = (info.get("episodes") or {}).get("episode")
-            _fetch_missevan_danmaku(requester, episodes, missevan_dramas[str(drama_id)])
+            _fetch_missevan_danmaku(requester, episodes, missevan_dramas[str(drama_id)], drama_id=drama_id)
             missevan_dramas[str(drama_id)]["fetched_at"] = now_iso()
             save_json(RANKS_PATH, store)
 
@@ -3270,6 +3336,7 @@ def main() -> None:
         parser.error("--repair-null-danmaku cannot be combined with another run mode")
 
     do_missevan = not args.manbo_only
+    configure_episode_detail_log()
     do_manbo = not args.missevan_only
     active_platforms = tuple(
         platform

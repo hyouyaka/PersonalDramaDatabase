@@ -10,9 +10,12 @@ from __future__ import annotations
 import html
 import json
 import os
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+from danmaku_detail_log import DETAIL_PREFIX
 
 
 ROOT = Path(os.environ.get("DRAMA_DB_ROOT", Path(__file__).resolve().parent))
@@ -26,6 +29,58 @@ LATEST_LOG = LOG_DIR / os.environ.get("DRAMA_LOG_LATEST", "daily-update-latest.l
 HOST = os.environ.get("DRAMA_LOG_HOST", "0.0.0.0")
 PORT = int(os.environ.get("DRAMA_LOG_PORT", "8765"))
 MAX_LOG_BYTES = int(os.environ.get("DRAMA_LOG_MAX_BYTES", "200000"))
+
+
+def safe_detail_path(name: str) -> Path:
+    if Path(name).name != name or not name.startswith(DETAIL_PREFIX) or not name.endswith(".jsonl"):
+        raise ValueError("invalid detail log name")
+    date.fromisoformat(name[len(DETAIL_PREFIX):-6])
+    path = (LOG_DIR / name).resolve()
+    if path.parent != LOG_DIR.resolve():
+        raise ValueError("invalid detail log path")
+    return path
+
+
+def list_detail_logs() -> list[dict[str, object]]:
+    result = []
+    for path in LOG_DIR.glob(f"{DETAIL_PREFIX}*.jsonl"):
+        try:
+            safe_detail_path(path.name)
+            result.append({"name": path.name, "size": path.stat().st_size})
+        except (ValueError, OSError):
+            continue
+    return sorted(result, key=lambda item: str(item["name"]), reverse=True)
+
+
+def query_episode_details(name: str, filters: dict[str, str], offset: int = 0, limit: int = 100) -> dict:
+    path = safe_detail_path(name)
+    if offset < 0 or not 1 <= limit <= 200:
+        raise ValueError("offset must be >= 0 and limit must be between 1 and 200")
+    rows = []
+    line = b""
+    with path.open("rb") as source:
+        size = path.stat().st_size
+        source.seek(offset)
+        while source.tell() < size:
+            start = source.tell()
+            line = source.readline()
+            if not line.endswith(b"\n"):
+                # A writer may still be finishing the last record.
+                source.seek(start)
+                break
+            try:
+                row = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(row, dict):
+                continue
+            if any(str(row.get(key, "")).lower() != value.lower() for key, value in filters.items() if value):
+                continue
+            rows.append(row)
+            if len(rows) >= limit:
+                break
+        cursor = source.tell()
+    return {"name": name, "rows": rows, "next_offset": cursor if cursor < size and line.endswith(b"\n") else None}
 
 
 def safe_log_path(name: str | None) -> Path:
@@ -126,9 +181,62 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         return
 
+    def download_file(self, path: Path) -> None:
+        try:
+            source = path.open("rb")
+        except FileNotFoundError:
+            json_response(self, 404, {"error": "log not found"})
+            return
+        with source:
+            source.seek(0, 2)
+            remaining = source.tell()
+            source.seek(0)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
+            self.send_header("Content-Length", str(remaining))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                while remaining:
+                    chunk = source.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
+
+        if parsed.path == "/api/detail-logs":
+            json_response(self, 200, {"logs": list_detail_logs()})
+            return
+
+        if parsed.path in ("/api/episode-details", "/download-details"):
+            name = query.get("name", [""])[0]
+            try:
+                path = safe_detail_path(name)
+                if parsed.path == "/download-details":
+                    self.download_file(path)
+                else:
+                    filters = {key: query.get(key, [""])[0] for key in ("platform", "drama_id", "episode_id", "run_id", "complete")}
+                    result = query_episode_details(name, filters, int(query.get("offset", ["0"])[0]), int(query.get("limit", ["100"])[0]))
+                    json_response(self, 200, result)
+            except ValueError as exc:
+                json_response(self, 400, {"error": str(exc)})
+            except FileNotFoundError:
+                json_response(self, 404, {"error": "detail log not found"})
+            return
+
+        if parsed.path == "/download":
+            try:
+                self.download_file(safe_log_path(query.get("name", ["latest"])[0]))
+            except ValueError as exc:
+                json_response(self, 400, {"error": str(exc)})
+            return
 
         if parsed.path == "/api/logs":
             json_response(
@@ -238,7 +346,7 @@ def render_page() -> str:
       flex-wrap: wrap;
       justify-content: flex-end;
     }}
-    select, button, a.button {{
+    select, input, button, a.button {{
       min-height: 34px;
       border: 1px solid var(--line);
       background: var(--panel-2);
@@ -251,6 +359,15 @@ def render_page() -> str:
     button, a.button {{ cursor: pointer; }}
     button:hover, a.button:hover, select:hover {{ border-color: var(--accent); }}
     main {{ padding: 12px 16px 20px; }}
+    details {{ margin-bottom: 16px; padding: 12px; border: 1px solid var(--line); background: var(--panel); }}
+    summary {{ cursor: pointer; font-weight: bold; }}
+    .filters {{ display: flex; gap: 12px; flex-wrap: wrap; margin: 16px 0; align-items: end; }}
+    .filters label {{ display: grid; gap: 6px; font-size: 12px; }}
+    .filters input {{ width: 180px; }}
+    .detail-table {{ overflow: auto; max-height: 440px; margin: 12px 0; }}
+    table {{ border-collapse: collapse; width: 100%; font-size: 12px; }}
+    th, td {{ padding: 8px; border: 1px solid var(--line); text-align: left; white-space: nowrap; }}
+    th {{ position: sticky; top: 0; background: var(--panel-2); }}
     .status {{
       display: flex;
       gap: 10px;
@@ -301,9 +418,30 @@ def render_page() -> str:
       <select id="logSelect" aria-label="选择日志"></select>
       <button id="refreshButton" type="button">刷新</button>
       <a id="rawLink" class="button" href="/raw" target="_blank" rel="noreferrer">原文</a>
+      <a id="downloadLogLink" class="button" href="/download">下载完整主日志</a>
     </div>
   </header>
   <main>
+    <details>
+      <summary>分集弹幕明细</summary>
+      <p class="sub">只记录抓取条数；完整表示本次接口/分页完成，不代表平台全部历史弹幕。每页最多 100 条，完整下载包含所选日期的所有记录。</p>
+      <form id="detailForm" class="filters">
+        <label>日期文件<select id="detailFile" required></select></label>
+        <label>平台<select id="detailPlatform"><option value="">全部</option><option value="missevan">猫耳</option><option value="manbo">漫播</option></select></label>
+        <label>剧集 ID<input id="detailDrama" placeholder="如 93038"></label>
+        <label>分集 ID<input id="detailEpisode"></label>
+        <label>运行 ID<input id="detailRun"></label>
+        <label>采集是否完整<select id="detailComplete"><option value="">全部</option><option value="true">完整</option><option value="false">不完整</option></select></label>
+        <button type="submit">查询</button>
+        <a id="detailDownload" class="button" hidden>下载当日完整 JSONL</a>
+      </form>
+      <div id="detailStatus" class="sub" role="status">尚未查询</div>
+      <div class="detail-table"><table>
+        <thead><tr><th>时间（UTC）</th><th>运行 ID</th><th>平台</th><th>剧集 ID</th><th>分集 ID</th><th>分集标题</th><th>尝试次数</th><th>抓取条数</th><th>采集是否完整</th></tr></thead>
+        <tbody id="detailRows"></tbody>
+      </table></div>
+      <button id="detailNext" type="button" disabled>下一页</button>
+    </details>
     <div class="status">
       <span id="stateBadge" class="badge">loading</span>
       <span id="stepText"></span>
@@ -319,6 +457,85 @@ def render_page() -> str:
     const updatedText = document.getElementById("updatedText");
     const rawLink = document.getElementById("rawLink");
     const refreshButton = document.getElementById("refreshButton");
+    const detailFile = document.getElementById("detailFile");
+    const detailRows = document.getElementById("detailRows");
+    const detailStatus = document.getElementById("detailStatus");
+    const detailNext = document.getElementById("detailNext");
+    let detailFilters = null;
+    let detailOffset = null;
+    let detailQuerySerial = 0;
+
+    function updateDetailDownload() {{
+      const link = document.getElementById("detailDownload");
+      link.hidden = !detailFile.value;
+      link.href = `/download-details?name=${{encodeURIComponent(detailFile.value)}}`;
+    }}
+
+    async function loadDetailFiles() {{
+      const response = await fetch("/api/detail-logs");
+      if (!response.ok) throw new Error("无法读取明细文件列表");
+      const data = await response.json();
+      const selected = detailFile.value;
+      detailFile.replaceChildren();
+      for (const item of data.logs) {{
+        const option = document.createElement("option");
+        option.value = item.name;
+        option.textContent = `${{item.name}} (${{formatSize(item.size)}})`;
+        detailFile.appendChild(option);
+      }}
+      if ([...detailFile.options].some(option => option.value === selected)) detailFile.value = selected;
+      updateDetailDownload();
+      if (!data.logs.length) detailStatus.textContent = "暂无明细文件，下次每日采集后生成";
+    }}
+
+    async function queryDetails(offset = 0) {{
+      const serial = ++detailQuerySerial;
+      detailNext.disabled = true;
+      detailStatus.textContent = "查询中…";
+      try {{
+        const params = new URLSearchParams({{...detailFilters, offset: String(offset)}});
+        const response = await fetch(`/api/episode-details?${{params}}`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "查询失败");
+        if (serial !== detailQuerySerial) return;
+        detailRows.replaceChildren();
+        for (const row of data.rows) {{
+          const tr = document.createElement("tr");
+          const values = [row.time, row.run_id, row.platform, row.drama_id, row.episode_id,
+            row.episode_title, row.attempt, row.fetched_count ?? "未知", row.complete ? "完整" : "不完整"];
+          for (const value of values) {{
+            const td = document.createElement("td");
+            td.textContent = String(value ?? "");
+            tr.appendChild(td);
+          }}
+          detailRows.appendChild(tr);
+        }}
+        detailOffset = data.next_offset;
+        detailNext.disabled = detailOffset == null;
+        detailStatus.textContent = `本页 ${{data.rows.length}} 条${{detailOffset == null ? "，已到末尾" : "，还有更多记录"}}`;
+      }} catch (error) {{
+        if (serial === detailQuerySerial) detailStatus.textContent = error.message;
+      }}
+    }}
+
+    document.getElementById("detailForm").addEventListener("submit", event => {{
+      event.preventDefault();
+      if (!detailFile.value) return;
+      detailFilters = {{name: detailFile.value, platform: document.getElementById("detailPlatform").value,
+        drama_id: document.getElementById("detailDrama").value.trim(),
+        episode_id: document.getElementById("detailEpisode").value.trim(),
+        run_id: document.getElementById("detailRun").value.trim(),
+        complete: document.getElementById("detailComplete").value}};
+      queryDetails();
+    }});
+    detailNext.addEventListener("click", () => {{ if (detailOffset != null) queryDetails(detailOffset); }});
+    detailFile.addEventListener("change", () => {{
+      ++detailQuerySerial;
+      detailNext.disabled = true;
+      detailRows.replaceChildren();
+      detailStatus.textContent = "尚未查询";
+      updateDetailDownload();
+    }});
 
     let currentName = "latest";
 
@@ -365,7 +582,8 @@ def render_page() -> str:
       stepText.textContent = data.current_step || "";
       updatedText.textContent = `更新时间：${{new Date().toLocaleString()}}`;
       rawLink.href = `/raw?name=${{encodeURIComponent(currentName)}}`;
-      window.scrollTo(0, document.body.scrollHeight);
+      document.getElementById("downloadLogLink").href = `/download?name=${{encodeURIComponent(currentName)}}`;
+      if (!document.querySelector("details").open) window.scrollTo(0, document.body.scrollHeight);
     }}
 
     async function refreshAll() {{
@@ -377,9 +595,10 @@ def render_page() -> str:
       currentName = logSelect.value || "latest";
       await loadLog();
     }});
-    refreshButton.addEventListener("click", refreshAll);
+    refreshButton.addEventListener("click", () => {{ refreshAll(); loadDetailFiles().catch(error => detailStatus.textContent = error.message); }});
 
     refreshAll();
+    loadDetailFiles().catch(error => detailStatus.textContent = error.message);
     setInterval(refreshAll, 5000);
   </script>
 </body>

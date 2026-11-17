@@ -14,6 +14,10 @@ $LogDir = Join-Path $Root 'logs'
 $Timestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
 $LogPath = Join-Path $LogDir "daily-update-$Timestamp.log"
 $LatestLogPath = Join-Path $LogDir 'daily-update-latest.log'
+$env:DRAMA_DANMAKU_DETAIL_LOG = '1'
+$env:DRAMA_DANMAKU_LOG_DIR = $LogDir
+$env:DRAMA_DANMAKU_LOG_DATE = $Timestamp.Substring(0, 10)
+$env:DRAMA_DANMAKU_RUN_ID = [guid]::NewGuid().ToString('N')
 
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 Set-Location $Root
