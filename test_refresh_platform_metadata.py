@@ -1396,6 +1396,18 @@ class MissevanIntroCvCandidateTests(unittest.TestCase):
             {"cv_id": 3853, "display_name": "心念多个心"},
         )
 
+    def test_97236_music_statement_is_not_a_main_cv(self) -> None:
+        for heading in ("声明", "版权声明", "音乐声明"):
+            with self.subTest(heading=heading):
+                intro = ("<p>配音组</p><p>西法尔：犬十三</p><p>梅尼耶：妖翎</p>"
+                         f"<p>{heading}：本剧中所出现的音乐</p><p>艾琳：函嘉澍_</p>")
+                self.assertEqual(
+                    refresh_platform_metadata.extract_missevan_intro_cv_candidates(intro, limit=4),
+                    [{"role_name": "西法尔", "display_name": "犬十三"},
+                     {"role_name": "梅尼耶", "display_name": "妖翎"},
+                     {"role_name": "艾琳", "display_name": "函嘉澍_"}],
+                )
+
     def test_filters_all_production_role_keywords_and_compounds(self) -> None:
         roles = [
             "配音团队", "配音导演", "声音导演", "导演", "录音", "录音棚", "录音师", "录制",
@@ -1820,6 +1832,26 @@ class MissevanBatchIntroTests(unittest.TestCase):
 
         self.assertEqual(updated["fallbackCvNames"], ["声展甲", "预告乙"])
         self.assertEqual(updated["fallbackCvRoles"], {"声展甲": "角色甲", "预告乙": "角色乙"})
+
+
+class SevenSecondMemoryManualCvTests(unittest.TestCase):
+    def test_manual_cast_survives_empty_and_conflicting_platform_cv_lists(self):
+        expected_names = {"339335": "没想好.", "330255": "岚夜"}
+        expected_roles = {"339335": "陆沉舟", "330255": "沈微雨"}
+        with patch.object(refresh_platform_metadata, "_get_missevan_cv_name_map", return_value={}):
+            node, entries = refresh_platform_metadata.build_missevan_base_node(
+                {"drama": {"id": 97416, "name": "七秒记忆", "catalog": 89}, "cvs": []}, 4,
+            )
+            self.assertEqual(node["maincvs"], [339335, 330255])
+            self.assertEqual(node["cvnames"], expected_names)
+            self.assertEqual(node["cvroles"], expected_roles)
+            refreshed = refresh_platform_metadata.apply_missevan_main_cv_entries(
+                node, "97416", entries,
+                [{"cv_id": 9999, "display_name": "无关演员", "role_name": "无关角色"}],
+            )
+            self.assertEqual(refreshed["maincvs"], [339335, 330255])
+            self.assertEqual(refreshed["cvnames"], expected_names)
+            self.assertEqual(refreshed["cvroles"], expected_roles)
 
 
 if __name__ == "__main__":

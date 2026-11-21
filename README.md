@@ -415,7 +415,13 @@ python build_cv_ranks.py --no-upload
   `ranks:meta.cv.resources["ranks:cv:latest"].updatedAt` 取原播放量时间与各作品数分项生成时间的较晚者，
   反映完整资源的更新；CAS 原子发布及回读校验保持不变。
 
-合并双平台的总榜仍仅供本地预览，不加入周更发布。
+#### 双平台汇总与搭档榜
+
+- `rankings.combined` 和 `paidRankings.combined` 按统一 CV 合计猫耳和漫播的播放量，再取前 30 名。明细和播放量按平台及 `dramaId` 分列，付费资格按各条剧目记录判定。`workCount` 只统计该 CV 在各榜实际纳入的唯一作品。双平台作品数、播放量和搭档榜共用 `cvKey` 区分 CV。平台 ID 唯一命中 CVID 映射时使用规范身份，其余按平台及 ID 区分，缺少 ID 时按平台及显示名区分。
+- `seriesCountRankings.combined` 先按系列表归并各平台的季度，再匹配两平台的作品。规范化标题、媒介、题材及整组规范主役一致，且两边各有唯一候选时，只计 1 部。同一平台明确标注的原版和重录版，在标题、媒介、题材和整组主役一致且候选唯一时归为一部。作品数榜和搭档榜按同一归并结果计数。作品明细的 `dramaIds` 按平台列出该 CV 实际参与的剧目。对应的 `seriesCountMeta.combined` 记录两平台源库版本。
+- `partnerRankings.workCount` 和 `partnerRankings.viewCount` 只统计纯爱、言情。逐条剧目识别同场主役阵容：两位主役自动成对，多主役读取 `drama:partner-overrides:v1`。同一组合在一个系列计 1 部，播放量按该组合实际参与的各平台剧目累加。次数榜只收录合作满 4 部的搭档，并保留第 30 名并列。播放量榜按播放量取前 30 名。
+- 搭档配置以 `missevan:dramaId` 或 `manbo:dramaId` 为键，每条包含 `pairs`。其中每对由两个 `{cvName, cvId}` 对象组成，CVID 使用该平台的 ID 字符串。仅有姓名的主役可填 `"cvId": null`，此时 `cvName` 必须在该剧当前主役中唯一匹配。空数组表示确认无搭档。缺少确认或已失效的多主役记录列在 `partnerReview.pending`，其余剧目照常进榜。
+- 播放量缺失的记录仍参与作品数统计。搭档明细中缺失的播放量显示为 `null`，源缓存显式为 `null` 的采样沿用现有规则按 0 处理。
 
 每周任务 `run_weekly_cv_update.ps1` 的执行顺序为：
 

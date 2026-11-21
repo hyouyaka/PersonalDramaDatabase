@@ -97,6 +97,7 @@ MANBO_INTRO_CREDIT_LABEL_PATTERN = re.compile(
 MISSEVAN_CV_SUFFIX_PATTERN = re.compile(r"\s*(?:@|＠|【|\[|（|\(|<|《).*$")
 MISSEVAN_CV_ACCOUNT_END_PATTERN = re.compile(r"[\s、，,；;【\[（\(<《]")
 MISSEVAN_INTRO_STAFF_ROLE_NAMES = {
+    "声明",
     "配音团队",
     "配音导演",
     "声音导演",
@@ -151,6 +152,13 @@ MANBO_MAINCV_OVERRIDES = {
     },
 }
 MISSEVAN_MAINCV_OVERRIDES = {
+    "97416": {  # 七秒记忆：用户确认主役，使用内部生成 CVID。
+        "ids": [339335, 330255],
+        "extras": {
+            339335: {"display_name": "没想好.", "role_name": "陆沉舟"},
+            330255: {"display_name": "岚夜", "role_name": "沈微雨"},
+        },
+    },
     "72383": {  # 捡到男鬼后脱单了 第二季：沿用第一、三季主役
         "ids": [1040, 1312],
         "extras": {

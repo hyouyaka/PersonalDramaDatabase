@@ -47,7 +47,12 @@ class SeriesCountMetadataTests(unittest.TestCase):
         canonical_map = '{"演员":{"aliases":["别名"]}}'
         expected = "sha256:" + hashlib.sha256(canonical_map.encode("utf-8")).hexdigest()
         self.assertEqual(payload["seriesCountMeta"]["missevan"]["sourceVersions"][cv.CVID_MAP_KEY], expected)
-        self.assertEqual(set(payload["seriesCountRankings"]), {"missevan", "manbo"})
+        self.assertEqual(set(payload["seriesCountRankings"]), {"missevan", "manbo", "combined"})
+        self.assertEqual(
+            payload["seriesCountMeta"]["combined"]["sourceVersions"],
+            {**payload["seriesCountMeta"]["missevan"]["sourceVersions"],
+             **payload["seriesCountMeta"]["manbo"]["sourceVersions"]},
+        )
 
     def test_repeated_build_updates_count_time_but_preserves_source_versions_and_view_rankings(self):
         first = self.build()
@@ -130,7 +135,7 @@ class SeriesCountMetadataTests(unittest.TestCase):
                     patch.object(cv, "upload_cv_trends") as trends,
                 ):
                     payload = cv.build_and_publish_cv_ranks(
-                        output_path=output, upload=True, upstash=Mock(), generated_at=override,
+                        output_path=output, upload=True, upstash=Mock(return_value=None), generated_at=override,
                     )
                 expected_sample_time = override or self.WATCHCOUNT_TIME
                 self.assertEqual(payload["generated_at"], expected_sample_time)
@@ -185,8 +190,8 @@ class SeriesCountRankTests(unittest.TestCase):
         by_key = {work["seriesKey"]: work for work in manbo["works"]}
         self.assertEqual(by_key["漫播:系列"]["dramaIds"], ["100", "101"])
         self.assertEqual(by_key["manbo:drama:102"]["dramaIds"], ["102"])
-        self.assertEqual(payload["rankings"], {"missevan": [], "manbo": []})
-        self.assertEqual(payload["paidRankings"], {"missevan": [], "manbo": []})
+        self.assertEqual(payload["rankings"], {"missevan": [], "manbo": [], "combined": []})
+        self.assertEqual(payload["paidRankings"], {"missevan": [], "manbo": [], "combined": []})
 
     def test_archived_members_and_their_cvs_cannot_be_resurrected(self):
         # 100 and 200 remain in the series table after being removed from active info.
@@ -243,7 +248,7 @@ class SeriesCountRankTests(unittest.TestCase):
                 missevan={"100": self.missevan("100"), "101": self.missevan("101", "主役未知")},
                 manbo=[self.manbo("100"), self.manbo("101", "主役未知")],
             )
-        self.assertEqual(payload["seriesCountRankings"], {"missevan": [], "manbo": []})
+        self.assertEqual(payload["seriesCountRankings"], {"missevan": [], "manbo": [], "combined": []})
 
     def test_counts_then_name_order_top_30_and_numeric_detail_order(self):
         records = [self.manbo(str(1000 + i), f"CV{i:02d}") for i in reversed(range(35))]
@@ -260,7 +265,7 @@ class SeriesCountRankTests(unittest.TestCase):
         self.assertEqual(series["dramaIds"], ["2", "10"])
 
     def test_empty_platforms_and_smaller_limit(self):
-        self.assertEqual(self.payload()["seriesCountRankings"], {"missevan": [], "manbo": []})
+        self.assertEqual(self.payload()["seriesCountRankings"], {"missevan": [], "manbo": [], "combined": []})
         ranks = self.payload(manbo=[self.manbo("100", "A"), self.manbo("101", "B")], top_n=1)
         self.assertEqual([r["cvName"] for r in ranks["seriesCountRankings"]["manbo"]], ["A", "B"])
         self.assertEqual([r["rank"] for r in ranks["seriesCountRankings"]["manbo"]], [1, 1])
@@ -268,13 +273,20 @@ class SeriesCountRankTests(unittest.TestCase):
     def rankings_for_series_counts(self, counts, *, top_n=30):
         missevan = {}
         manbo = []
+        cvid_map = {}
         for index, count in enumerate(counts):
+            name = f"CV{index:02d}"
+            missevan_id, manbo_id = index + 1, index + 101
+            cvid_map[name] = {"missevanCvId": missevan_id, "manboCvId": manbo_id}
             for work in range(count):
                 drama_id = str(100000 + index * 1000 + work)
-                name = f"CV{index:02d}"
-                missevan[drama_id] = self.missevan(drama_id, name)
-                manbo.append(self.manbo(drama_id, name))
-        return self.payload(missevan=missevan, manbo=manbo, top_n=top_n)["seriesCountRankings"]
+                missevan[drama_id] = self.missevan(
+                    drama_id, name, maincvs=[missevan_id], cvnames={str(missevan_id): name},
+                )
+                manbo.append(self.manbo(drama_id, name, mainCvIds=[manbo_id]))
+        return self.payload(
+            missevan=missevan, manbo=manbo, cvid_map=cvid_map, top_n=top_n,
+        )["seriesCountRankings"]
 
     def test_equal_series_counts_share_rank_and_next_rank_skips_tied_entries(self):
         for platform, ranks in self.rankings_for_series_counts([7, 6, 6, 5, 4, 4, 3]).items():
@@ -310,7 +322,9 @@ class SeriesCountRankTests(unittest.TestCase):
                 self.assertEqual([r["rank"] for r in ranks], list(range(1, 31)))
 
     def test_zero_rank_limit_returns_empty_rankings(self):
-        self.assertEqual(self.rankings_for_series_counts([2, 1, 1], top_n=0), {"missevan": [], "manbo": []})
+        self.assertEqual(
+            self.rankings_for_series_counts([2, 1, 1], top_n=0), {"missevan": [], "manbo": [], "combined": []},
+        )
 
     def test_series_validation_and_conflicting_membership(self):
         valid = self.series("猫耳", ["100"])
@@ -348,6 +362,272 @@ class SeriesCountRankTests(unittest.TestCase):
     def test_remote_read_failure_propagates(self):
         with self.assertRaisesRegex(RuntimeError, "network"):
             cv.fetch_remote_series_info(upstash=Mock(side_effect=RuntimeError("network")))
+
+
+class CombinedCvRanksTests(unittest.TestCase):
+    CV_MAP = {
+        name: {"missevanCvId": number, "manboCvId": number + 10}
+        for number, name in enumerate("ABCD", start=1)
+    }
+
+    def drama(self, platform, drama_id, title, cast, *, medium="有声剧", genre=4, paid=False):
+        if platform == "missevan":
+            ids = [self.CV_MAP[name]["missevanCvId"] for name in cast]
+            return {"dramaId": drama_id, "title": title, "type": genre, "needpay": paid,
+                    "catalog": 93 if medium == "有声剧" else 89, "maincvs": ids,
+                    "cvnames": {str(cv_id): f"{name}的猫耳名" for cv_id, name in zip(ids, cast)}}
+        return {"dramaId": drama_id, "name": title, "type": genre, "needpay": paid,
+                "catalog": 5 if medium == "有声剧" else 1,
+                "mainCvIds": [self.CV_MAP[name]["manboCvId"] for name in cast],
+                "mainCvNames": [f"{name}的漫播名" for name in cast]}
+
+    def build(self, *, missevan=(), manbo=(), series=None, views=None, overrides=None, top_n=30):
+        views = views or {}
+        return cv.build_cv_ranks_payload(
+            missevan_store={row["dramaId"]: row for row in missevan},
+            manbo_store={"records": list(manbo)}, cvid_map=self.CV_MAP,
+            missevan_counts=views.get("missevan", {}), manbo_counts=views.get("manbo", {}),
+            series_info=series or {}, partner_overrides=overrides,
+            generated_at="2026-11-20T00:00:00+00:00", top_n=top_n,
+        )
+
+    def test_same_series_counts_once_and_sums_only_actual_platform_views(self):
+        payload = self.build(
+            missevan=[
+                self.drama("missevan", "100", "作品 第一季", "AB"),
+                self.drama("missevan", "101", "作品 第二季", "AC", paid=True),
+                self.drama("missevan", "102", "作品", "AB", medium="广播剧"),
+            ],
+            manbo=[self.drama("manbo", "100", "作品 有声剧", "CBA", paid=True)],
+            series={"猫耳:作品": {"platform": "猫耳", "category": "有声剧",
+                                  "series title": "作品", "dramaIds": ["100", "101"]}},
+            views={"missevan": {"100": {"view_count": 10}, "101": {"view_count": None},
+                                "102": {"view_count": 2}},
+                   "manbo": {"100": {"view_count": 30}}},
+            overrides={"manbo:100": {"pairs": [[{"cvName": "B", "cvId": "12"}, {"cvName": "A", "cvId": "11"}]]}},
+        )
+        total = payload["rankings"]["combined"][0]
+        paid = payload["paidRankings"]["combined"][0]
+        counts = {row["cvName"]: row for row in payload["seriesCountRankings"]["combined"]}
+        self.assertEqual((total["cvName"], total["totalViewCount"], total["workCount"]), ("A", 42, 2))
+        self.assertEqual((paid["cvName"], paid["totalViewCount"], paid["workCount"]), ("A", 30, 1))
+        self.assertEqual(counts["A"]["seriesCount"], 2)
+        merged = next(work for work in counts["A"]["works"] if work["seriesKey"] == "猫耳:作品")
+        self.assertEqual(merged["dramaIds"], {"missevan": ["100", "101"], "manbo": ["100"]})
+
+        self.assertEqual(payload["partnerRankings"]["workCount"], [])
+        pairs = payload["partnerRankings"]["viewCount"]
+        self.assertEqual([(row["workCount"], row["totalViewCount"]) for row in pairs], [(2, 42), (1, 0)])
+        self.assertEqual([[cv["cvName"] for cv in row["cvs"]] for row in pairs], [["A", "B"], ["A", "C"]])
+        ab = next(work for work in pairs[0]["works"] if work["seriesKey"] == "猫耳:作品")
+        self.assertEqual({(r["platform"], r["dramaId"], r["viewCount"]) for r in ab["releases"]},
+                         {("missevan", "100", 10), ("manbo", "100", 30)})
+        self.assertEqual(pairs[0]["cvs"][0]["manboCvId"], "11")
+
+    def test_rerecording_counts_once_on_the_same_platform_and_across_platforms(self):
+        for platform in ("missevan", "manbo"):
+            for original_paid in (False, True):
+                with self.subTest(rerecording_platform=platform, original_paid=original_paid):
+                    original = self.drama("missevan", "100", "作品 第一季（原版）", "AB", paid=original_paid)
+                    rerecording = self.drama(platform, "101", "作品 第一季【重錄版】", "AB", paid=True)
+                    records = {"missevan": [original], "manbo": []}
+                    records[platform].append(rerecording)
+                    views = {"missevan": {"100": {"view_count": 10}}, "manbo": {}}
+                    views[platform]["101"] = {"view_count": 20}
+                    payload = self.build(**records, views=views)
+
+                    combined_counts = payload["seriesCountRankings"]["combined"]
+                    self.assertEqual([row["seriesCount"] for row in combined_counts], [1, 1])
+                    platform_counts = payload["seriesCountRankings"]["missevan"]
+                    self.assertEqual([row["seriesCount"] for row in platform_counts], [1, 1])
+                    expected_ids = {"missevan": ["100", "101"]} if platform == "missevan" else {
+                        "missevan": ["100"], "manbo": ["101"],
+                    }
+                    self.assertEqual(combined_counts[0]["works"][0]["dramaIds"], expected_ids)
+
+                    total = payload["rankings"]["combined"][0]
+                    self.assertEqual((total["workCount"], total["totalViewCount"]), (1, 30))
+                    self.assertEqual({(w["platform"], w["dramaId"]) for w in total["works"]},
+                                     {("missevan", "100"), (platform, "101")})
+                    paid = payload["paidRankings"]["combined"][0]
+                    self.assertEqual((paid["workCount"], paid["totalViewCount"]), (1, 30 if original_paid else 20))
+                    self.assertEqual([w["dramaId"] for w in paid["works"]],
+                                     ["101", "100"] if original_paid else ["101"])
+
+                    partner, = payload["partnerRankings"]["viewCount"]
+                    self.assertEqual((partner["workCount"], partner["totalViewCount"]), (1, 30))
+                    self.assertEqual({r["dramaId"] for r in partner["works"][0]["releases"]}, {"100", "101"})
+
+    def test_cross_platform_recordings_with_different_casts_count_separately(self):
+        payload = self.build(
+            missevan=[
+                self.drama("missevan", "100", "作品（原版）", "AB", paid=True),
+                self.drama("missevan", "101", "另一部", "AB", paid=True),
+            ],
+            manbo=[self.drama("manbo", "200", "作品（重录版）", "AC", paid=True)],
+            series={
+                "猫耳:作品": {"platform": "猫耳", "category": "有声剧",
+                              "series title": "作品", "dramaIds": ["100"]},
+                "漫播:作品": {"platform": "漫播", "category": "有声剧",
+                              "series title": "作品", "dramaIds": ["200"]},
+            },
+            views={
+                "missevan": {"100": {"view_count": 10}},
+                "manbo": {"200": {"view_count": 20}},
+            },
+        )
+        counts = {row["cvName"]: row["seriesCount"] for row in payload["seriesCountRankings"]["combined"]}
+        self.assertEqual(counts, {"A": 3, "B": 2, "C": 1})
+        for group in ("rankings", "paidRankings"):
+            rows = {row["cvName"]: (row["workCount"], row["totalViewCount"])
+                    for row in payload[group]["combined"]}
+            self.assertEqual(rows, {"A": (2, 30), "B": (1, 10), "C": (1, 20)})
+        pairs = {tuple(cv["cvName"] for cv in row["cvs"]): row
+                 for row in payload["partnerRankings"]["viewCount"]}
+        self.assertEqual(pairs["A", "B"]["totalViewCount"], 10)
+        self.assertEqual(pairs["A", "C"]["totalViewCount"], 20)
+        self.assertEqual(
+            {r["dramaId"]: r["viewCount"] for w in pairs["A", "B"]["works"] for r in w["releases"]},
+            {"100": 10, "101": None},
+        )
+        self.assertEqual([r["dramaId"] for w in pairs["A", "C"]["works"] for r in w["releases"]], ["200"])
+
+    def test_same_platform_same_title_with_different_casts_counts_separately(self):
+        payload = self.build(
+            missevan=[
+                self.drama("missevan", "100", "作品（原版）", "AB"),
+                self.drama("missevan", "101", "作品（重录版）", "AC"),
+            ],
+            views={"missevan": {"100": {"view_count": 10}, "101": {"view_count": 20}}},
+        )
+        for platform in ("missevan", "combined"):
+            counts = payload["seriesCountRankings"][platform]
+            self.assertEqual({row["cvName"]: row["seriesCount"] for row in counts}, {"A": 2, "B": 1, "C": 1})
+        self.assertEqual(payload["rankings"]["combined"][0]["workCount"], 2)
+        self.assertEqual(
+            [(row["workCount"], row["totalViewCount"]) for row in payload["partnerRankings"]["viewCount"]],
+            [(1, 20), (1, 10)],
+        )
+
+    def test_title_conflicts_and_different_cast_genre_or_version_stay_separate(self):
+        for case, title, cast, genre, extra in (
+            ("duplicate candidates", "作品", "AB", 4, True),
+            ("different cast", "作品", "AC", 4, False),
+            ("different genre", "作品", "AB", 6, False),
+            ("different version", "作品 第一季（日语版）", "AB", 4, False),
+        ):
+            with self.subTest(case=case):
+                missevan = [self.drama("missevan", "100", "作品", "AB")]
+                if extra:
+                    missevan.append(self.drama("missevan", "101", "作品", "AB"))
+                payload = self.build(
+                    missevan=missevan, manbo=[self.drama("manbo", "200", title, cast, genre=genre)],
+                )
+                self.assertEqual(payload["seriesCountRankings"]["combined"][0]["seriesCount"], 3 if extra else 2)
+
+    def test_pending_empty_and_stale_overrides_do_not_produce_pairs(self):
+        pair = [{"cvName": "A旧名", "cvId": "1"}, {"cvName": "D", "cvId": "4"}]
+        payload = self.build(
+            missevan=[
+                self.drama("missevan", "100", "未确认", "ABC"),
+                self.drama("missevan", "101", "无搭档", "ABC"),
+                self.drama("missevan", "102", "过期", "ABC"),
+                self.drama("missevan", "103", "已确认", "ABD"),
+                self.drama("missevan", "104", "全年龄", "AB", genre=3),
+                self.drama("missevan", "105", "甲", "AD"),
+                self.drama("missevan", "106", "乙", "AD"),
+                self.drama("missevan", "107", "丙", "AD"),
+            ],
+            overrides={
+                "missevan:101": {"pairs": []},
+                "missevan:102": {"pairs": [pair]},
+                "missevan:103": {"pairs": [pair, pair[::-1]]},
+            },
+            top_n=1,
+        )
+        self.assertEqual(
+            [(row["dramaId"], row["reason"]) for row in payload["partnerReview"]["pending"]],
+            [("100", "missingOverride"), ("102", "invalidOverride")],
+        )
+        self.assertEqual(payload["seriesCountRankings"]["combined"][0]["seriesCount"], 8)
+        pairs = payload["partnerRankings"]["workCount"]
+        self.assertEqual([[cv["cvName"] for cv in row["cvs"]] for row in pairs], [["A", "D"]])
+        self.assertEqual(pairs[0]["workCount"], 4)
+        self.assertIsNone(pairs[0]["works"][0]["releases"][0]["viewCount"])
+        self.assertEqual(payload["partnerRankings"]["viewCount"], [])
+
+    def test_same_names_without_matching_platform_ids_remain_separate(self):
+        missevan = self.drama("missevan", "100", "甲", "AB", paid=True)
+        missevan["maincvs"][0] = 81
+        missevan["cvnames"]["81"] = "A"
+        other = self.drama("missevan", "101", "乙", "AB", paid=True)
+        other["maincvs"][0] = 82
+        other["cvnames"]["82"] = "A"
+        manbo = self.drama("manbo", "200", "丙", "AB", paid=True)
+        manbo["mainCvIds"][0] = 91
+        manbo["mainCvNames"][0] = "A"
+        payload = self.build(
+            missevan=[missevan, other], manbo=[manbo],
+            views={
+                "missevan": {"100": {"view_count": 10}, "101": {"view_count": 20}},
+                "manbo": {"200": {"view_count": 30}},
+            },
+        )
+        expected = {"missevan:id:81": 10, "missevan:id:82": 20, "manbo:id:91": 30}
+        for group in ("rankings", "paidRankings"):
+            rows = payload[group]["combined"]
+            self.assertEqual({row["cvKey"]: row["totalViewCount"] for row in rows if row["cvName"] == "A"}, expected)
+            self.assertEqual(next(row for row in rows if row["cvName"] == "B")["totalViewCount"], 60)
+        counts = payload["seriesCountRankings"]["combined"]
+        self.assertEqual({row["cvKey"]: row["seriesCount"] for row in counts if row["cvName"] == "A"},
+                         dict.fromkeys(expected, 1))
+        partners = payload["partnerRankings"]["viewCount"]
+        self.assertEqual({row["cvs"][0]["cvKey"]: row["totalViewCount"] for row in partners}, expected)
+        self.assertEqual([row["workCount"] for row in partners], [1, 1, 1])
+        self.assertEqual(partners[0]["cvs"][0]["manboCvId"], "91")
+        self.assertEqual(partners[1]["cvs"][0]["missevanCvId"], "82")
+
+    def test_name_only_override_requires_a_unique_current_name(self):
+        confirmed = self.drama("manbo", "200", "唯一主役", "ABC")
+        confirmed["mainCvIds"][2] = None
+        confirmed["mainCvNames"][2] = "无 ID 的 CV"
+        ambiguous = self.drama("manbo", "201", "同名主役", "ABC")
+        ambiguous["mainCvIds"][2] = None
+        ambiguous["mainCvNames"][2] = "B"
+        stale = self.drama("manbo", "202", "过期 ID", "ABC")
+        stale["mainCvIds"][2] = None
+        stale["mainCvNames"][2] = "无 ID 的 CV"
+        payload = self.build(
+            manbo=[confirmed, ambiguous, stale],
+            views={"manbo": {str(i): {"view_count": 10} for i in range(200, 203)}},
+            overrides={
+                "manbo:200": {"pairs": [[{"cvName": "A", "cvId": "11"}, {"cvName": "无 ID 的 CV", "cvId": None}]]},
+                "manbo:201": {"pairs": [[{"cvName": "A", "cvId": "11"}, {"cvName": "B", "cvId": None}]]},
+                "manbo:202": {"pairs": [[{"cvName": "A", "cvId": "11"}, {"cvName": "无 ID 的 CV", "cvId": "13"}]]},
+            },
+        )
+        self.assertEqual(
+            [(row["dramaId"], row["reason"]) for row in payload["partnerReview"]["pending"]],
+            [("201", "invalidOverride"), ("202", "invalidOverride")],
+        )
+        rows = payload["partnerRankings"]["viewCount"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual([cv["cvName"] for cv in rows[0]["cvs"]], ["A", "无 ID 的 CV"])
+        self.assertEqual(rows[0]["totalViewCount"], 10)
+
+    def test_partner_count_requires_four_works_and_preserves_ties_at_rank_limit(self):
+        dramas = [
+            self.drama("missevan", f"{cast_index}{index:02}", f"{cast}-{index}", cast)
+            for cast_index, (cast, count) in enumerate((("AB", 4), ("AC", 4), ("AD", 3)), start=1)
+            for index in range(count)
+        ]
+        for top_n in (1, 30):
+            with self.subTest(top_n=top_n):
+                payload = self.build(missevan=dramas, top_n=top_n)
+                self.assertEqual(
+                    [(row["rank"], row["workCount"]) for row in payload["partnerRankings"]["workCount"]],
+                    [(1, 4), (1, 4)],
+                )
 
 
 if __name__ == "__main__":

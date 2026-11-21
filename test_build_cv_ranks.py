@@ -250,8 +250,10 @@ class BuildCvRanksTests(unittest.TestCase):
             self.assertEqual(payload["version"], 4)
             self.assertEqual(payload["missevanDramaCount"], 2)
             self.assertEqual(payload["manboDramaCount"], 1)
-            self.assertEqual(set(payload["rankings"]), {"missevan", "manbo"})
-            self.assertEqual(set(payload["paidRankings"]), {"missevan", "manbo"})
+            self.assertEqual(set(payload["rankings"]), {"missevan", "manbo", "combined"})
+            self.assertEqual(set(payload["paidRankings"]), {"missevan", "manbo", "combined"})
+            self.assertEqual(payload["rankings"]["combined"][0]["totalViewCount"], 160)
+            self.assertEqual(payload["paidRankings"]["combined"][0]["totalViewCount"], 60)
 
             missevan_cv = payload["rankings"]["missevan"][0]
             self.assertEqual(missevan_cv["cvName"], "Canonical CV")
@@ -507,7 +509,7 @@ class BuildCvRanksTests(unittest.TestCase):
                 commands.append(command)
                 if command[0] == "GET" and str(command[1]) in remote:
                     return remote[str(command[1])]
-                if command[:2] == ["GET", "ranks:meta"]:
+                if command in (["GET", "ranks:meta"], ["GET", build_cv_ranks.PARTNER_OVERRIDES_KEY]):
                     return None
                 if command[0] == "EVAL":
                     remote[str(command[3])] = str(command[5])
@@ -599,7 +601,7 @@ class BuildCvRanksTests(unittest.TestCase):
                     manbo_counts_path=manbo_counts,
                     cvid_map_path=cvid_map,
                     output_path=Path(tmp) / "ranks-cv.json",
-                    upstash=Mock(),
+                    upstash=Mock(return_value=None),
                     generated_at="2026-06-10T12:00:00+00:00",
                     upload=False,
                 )
@@ -661,6 +663,7 @@ class BuildCvRanksTests(unittest.TestCase):
                     json.dumps(remote_missevan, ensure_ascii=False),
                     json.dumps(remote_map, ensure_ascii=False),
                     json.dumps({"猫耳:系列": {"platform": "猫耳", "category": "广播剧", "series title": "系列", "dramaIds": ["100"]}}, ensure_ascii=False),
+                    "{}",
                 ]
             )
 
@@ -682,6 +685,8 @@ class BuildCvRanksTests(unittest.TestCase):
             self.assertEqual(upstash.call_args_list[3].args[0], ["GET", "missevan:info:v2"])
             self.assertEqual(upstash.call_args_list[4].args[0], ["GET", "cvid-map:v1"])
             self.assertEqual(upstash.call_args_list[5].args[0], ["GET", "drama:series-info:v1"])
+            self.assertEqual(upstash.call_args_list[6].args[0], ["GET", build_cv_ranks.PARTNER_OVERRIDES_KEY])
+            self.assertTrue(all(call.args[0][0] == "GET" for call in upstash.call_args_list))
             self.assertEqual(payload["seriesCountRankings"]["missevan"][0]["works"][0]["seriesKey"], "猫耳:系列")
             self.assertEqual(json.loads(manbo_info.read_text(encoding="utf-8")), remote_manbo)
             self.assertEqual(json.loads(missevan_info.read_text(encoding="utf-8")), remote_missevan)
@@ -744,6 +749,7 @@ class BuildCvRanksTests(unittest.TestCase):
                     manbo_counts_path=manbo_counts,
                     cvid_map_path=cvid_map,
                     output_path=Path(tmp) / "ranks-cv.json",
+                    upstash=Mock(return_value=None),
                     upload=False,
                 )
 
@@ -839,6 +845,7 @@ class BuildCvRanksTests(unittest.TestCase):
                     manbo_counts_path=manbo_counts,
                     cvid_map_path=cvid_map,
                     output_path=Path(tmp) / "ranks-cv.json",
+                    upstash=Mock(return_value=None),
                     upload=False,
                 )
 
@@ -866,6 +873,7 @@ class BuildCvRanksTests(unittest.TestCase):
                     manbo_counts_path=manbo_counts,
                     cvid_map_path=cvid_map,
                     output_path=Path(tmp) / "ranks-cv.json",
+                    upstash=Mock(return_value=None),
                     upload=False,
                     force=True,
                 )

@@ -3,14 +3,21 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
+import unicodedata
+from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from platform_sync import (
     COMBINED_CVID_MAP_PATH,
+    GENRE_BY_TYPE,
+    MANBO_CATALOG_NAME_BY_ID,
     MANBO_COUNTS_PATH,
     MANBO_INFO_PATH,
+    MISSEVAN_CATALOG_NAME_BY_ID,
     MISSEVAN_COUNTS_PATH,
     MISSEVAN_INFO_PATH,
     iter_missevan_nodes,
@@ -35,10 +42,16 @@ from upstash_v2 import (
     publish_rank_string,
     publish_trend_v2_best_effort,
 )
+from update_series_info import id_sort, normalize_title, parse_title, without_cv_metadata
 
 
 HERE = Path(__file__).resolve().parent
 CV_RANKS_PATH = HERE / "ranks-cv.json"
+PARTNER_OVERRIDES_KEY = "drama:partner-overrides:v1"
+MIN_PARTNER_WORK_COUNT = 4
+RECORDING_EDITION = re.compile(
+    r"[([【]\s*(原版|重[录錄]版)\s*[)\]】]|(?<!\S)(原版|重[录錄]版)(?!\S)"
+)
 PLATFORMS = ("missevan", "manbo")
 CV_TREND_RETENTION_DATES = 50
 
@@ -177,9 +190,11 @@ def manbo_main_cv_names(record: dict) -> list[str]:
     return manbo_main_cv_display_names(record)
 
 
-def add_work(buckets: dict[str, dict], cv_name: str, work: dict, *, avatar: str = "") -> None:
+def add_work(
+    buckets: dict, cv_name: str, work: dict, *, avatar: str = "", bucket_key: str | None = None,
+) -> None:
     bucket = buckets.setdefault(
-        cv_name,
+        bucket_key if bucket_key is not None else cv_name,
         {
             "cvName": cv_name,
             "avatar": normalize(avatar),
@@ -351,8 +366,19 @@ def fetch_remote_series_info(*, upstash=upstash_request) -> dict:
     return payload
 
 
+def fetch_partner_overrides(*, upstash=upstash_request) -> dict:
+    raw = upstash(["GET", PARTNER_OVERRIDES_KEY])
+    if raw is None:
+        return {}
+    payload = decode_remote_json_payload(PARTNER_OVERRIDES_KEY, raw)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{PARTNER_OVERRIDES_KEY} must be a JSON object")
+    return payload
+
+
 def build_series_count_rankings(
     *, missevan_store: dict, manbo_store: dict, series_info: dict, cvid_map: dict, top_n: int = 30,
+    edition_aliases: dict[str, tuple[str, str]] | None = None,
 ) -> dict[str, list[dict]]:
     series_index = build_series_index(series_info)
     missevan_ids, manbo_ids, name_index, avatars = build_map_indexes(cvid_map)
@@ -373,6 +399,8 @@ def build_series_count_rankings(
                 (platform, drama_id),
                 (f"{platform}:drama:{drama_id}", normalize(record.get("seriesTitle") or record.get(title_key))),
             )
+            if edition_aliases is not None:
+                series_key, title = edition_aliases.get(series_key, (series_key, title))
             for entry in entries(record):
                 if entry.get("unknown"):
                     continue
@@ -424,7 +452,7 @@ def build_series_count_meta(
         CVID_MAP_KEY: content_version(cvid_map),
         SERIES_INFO_KEY: content_version(series_info),
     }
-    return {
+    platform_meta = {
         platform: {
             "generated_at": generated_at,
             "sourceVersions": {info_key: content_version(store), **shared_versions},
@@ -434,6 +462,365 @@ def build_series_count_meta(
             ("manbo", MANBO_INFO_KEY, manbo_store),
         )
     }
+    platform_meta["combined"] = {
+        "generated_at": generated_at,
+        "sourceVersions": {
+            **platform_meta["missevan"]["sourceVersions"],
+            **platform_meta["manbo"]["sourceVersions"],
+        },
+    }
+    return platform_meta
+
+
+@dataclass(frozen=True)
+class RankedCv:
+    key: str
+    name: str
+    platform_id: str
+    canonical: bool
+
+
+@dataclass
+class RankedDrama:
+    platform: str
+    drama_id: str
+    title: str
+    series_key: str
+    series_title: str
+    genre: str
+    medium: str
+    cast: dict[str, RankedCv]
+    complete_mapped_cast: bool
+
+    @property
+    def identity(self) -> tuple[str, str]:
+        return self.platform, self.drama_id
+
+
+def collect_ranked_dramas(
+    missevan_store: dict, manbo_store: dict, series_info: dict, cvid_map: dict,
+) -> list[RankedDrama]:
+    series_index = build_series_index(series_info)
+    missevan_ids, manbo_ids, _, _ = build_map_indexes(cvid_map)
+    result = {}
+    for platform, records, entries, title_key, catalog_names, platform_ids in (
+        ("missevan", (row for _, _, row in iter_missevan_nodes(missevan_store)),
+         missevan_main_cv_entries, "title", MISSEVAN_CATALOG_NAME_BY_ID, missevan_ids),
+        ("manbo", manbo_store.get("records") or [],
+         manbo_main_cv_entries, "name", MANBO_CATALOG_NAME_BY_ID, manbo_ids),
+    ):
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            drama_id = normalize(record.get("dramaId"))
+            if not drama_id or is_excluded_drama(platform, drama_id) or (platform, drama_id) in result:
+                continue
+            title = normalize(record.get(title_key) or record.get("seriesTitle"))
+            series_key, series_title = series_index.get(
+                (platform, drama_id), (f"{platform}:drama:{drama_id}", title),
+            )
+            cast = {}
+            mapped = True
+            for entry in entries(record):
+                cv_id, raw_name = entry["cv_id"], entry["display_name"]
+                if entry.get("unknown") or not (cv_id or raw_name):
+                    mapped = False
+                    continue
+                candidates = platform_ids.get(cv_id, set())
+                canonical = len(candidates) == 1
+                if canonical:
+                    name = next(iter(candidates))
+                    key = f"canonical:{name}"
+                else:
+                    prefix = "猫耳CV" if platform == "missevan" else "漫播CV"
+                    name = raw_name or f"{prefix}_{cv_id}"
+                    key = f"{platform}:id:{cv_id}" if cv_id else f"{platform}:name:{name}"
+                mapped = mapped and canonical
+                cast.setdefault(key, RankedCv(key, name, normalize(cv_id), canonical))
+            drama = RankedDrama(
+                platform, drama_id, title, series_key, series_title,
+                GENRE_BY_TYPE.get(safe_int_or_none(record.get("type")), ""),
+                catalog_names.get(safe_int_or_none(record.get("catalog")), ""),
+                cast, bool(cast) and mapped,
+            )
+            result[drama.identity] = drama
+    return list(result.values())
+
+
+def split_recording_edition(title: str) -> tuple[str, set[str]]:
+    text = unicodedata.normalize("NFKC", title)
+    editions = {
+        (match[1] or match[2]).replace("錄", "录")
+        for match in RECORDING_EDITION.finditer(without_cv_metadata(text))
+    }
+    return RECORDING_EDITION.sub(" ", text).strip() if editions else title, editions
+
+
+@dataclass
+class SeriesMatch:
+    platform: str
+    title: str
+    editions: set[str]
+    cast: set[str]
+    complete_mapped_cast: bool
+
+
+def series_match_candidates(
+    members: dict[str, list[RankedDrama]],
+) -> tuple[dict[tuple[str, str, str], list[str]], dict[str, SeriesMatch]]:
+    candidates = defaultdict(list)
+    matches = {}
+    for series_key, releases in members.items():
+        titles_and_types = set()
+        cast = set()
+        editions = set()
+        for drama in releases:
+            base_title, series_editions = split_recording_edition(drama.series_title)
+            _, release_editions = split_recording_edition(drama.title)
+            title = normalize_title(parse_title(base_title)[0])
+            medium = re.escape(drama.medium)
+            if medium:
+                stripped = re.sub(rf"(?:\({medium}\)|【{medium}】|{medium})$", "", title)
+                title = normalize_title(stripped) or title
+            titles_and_types.add((title, drama.medium, drama.genre))
+            editions.update(series_editions | release_editions)
+            cast.update(drama.cast)
+        if len(titles_and_types) != 1:
+            continue
+        signature, = titles_and_types
+        if not all(signature):
+            continue
+        matches[series_key] = SeriesMatch(
+            releases[0].platform, split_recording_edition(releases[0].series_title)[0],
+            editions, cast, all(row.complete_mapped_cast for row in releases),
+        )
+        candidates[signature].append(series_key)
+    return candidates, matches
+
+
+def build_work_indexes(
+    dramas: list[RankedDrama],
+) -> tuple[dict[str, tuple[str, str]], dict[str, tuple[str, str]]]:
+    members = defaultdict(list)
+    for drama in dramas:
+        members[drama.series_key].append(drama)
+
+    candidates, matches = series_match_candidates(members)
+    local_editions = {}
+    for keys in candidates.values():
+        for platform in PLATFORMS:
+            platform_keys = [key for key in keys if matches[key].platform == platform]
+            if len(platform_keys) != 2:
+                continue
+            first, second = sorted(platform_keys, key=lambda key: ("重录版" in matches[key].editions, key))
+            original, rerecording = matches[first], matches[second]
+            if (
+                original.editions == {"原版"} and rerecording.editions == {"重录版"}
+                and original.cast and original.cast == rerecording.cast
+            ):
+                local_editions[first] = local_editions[second] = (first, original.title)
+
+    grouped_members = defaultdict(list)
+    for key, releases in members.items():
+        group_key, _ = local_editions.get(key, (key, ""))
+        grouped_members[group_key].extend(releases)
+
+    candidates, matches = series_match_candidates(grouped_members)
+    cross_platform = {}
+    for keys in candidates.values():
+        by_cast = defaultdict(list)
+        for key in keys:
+            match = matches[key]
+            if match.complete_mapped_cast:
+                by_cast[frozenset(match.cast)].append(key)
+        for cast_keys in by_cast.values():
+            if len(cast_keys) != 2:
+                continue
+            first, second = sorted(cast_keys, key=lambda key: matches[key].platform != "missevan")
+            if matches[first].platform != matches[second].platform:
+                cross_platform[first] = cross_platform[second] = (first, matches[first].title)
+
+    combined = {}
+    for key, releases in members.items():
+        local = local_editions.get(key, (key, releases[0].series_title))
+        combined[key] = cross_platform.get(local[0], local)
+    return local_editions, combined
+
+
+def works_by_release(full_rankings: dict[str, list[dict]]) -> dict[tuple[str, str], dict]:
+    return {
+        (work["platform"], work["dramaId"]): work
+        for platform_rankings in full_rankings.values()
+        for row in platform_rankings for work in row["works"]
+    }
+
+
+def build_combined_view_rankings(
+    dramas: list[RankedDrama], release_works: dict[tuple[str, str], dict],
+    avatars: dict[str, str], work_index: dict[str, tuple[str, str]], top_n: int,
+) -> list[dict]:
+    buckets = {}
+    counted_works = defaultdict(set)
+    for drama in dramas:
+        work = release_works.get(drama.identity)
+        if work is None:
+            continue
+        series_key, _ = work_index[drama.series_key]
+        for cv in drama.cast.values():
+            avatar = avatars.get(cv.name, "") if cv.canonical else ""
+            add_work(buckets, cv.name, work, avatar=avatar, bucket_key=cv.key)
+            counted_works[cv.key].add(series_key)
+    for key, row in buckets.items():
+        row["cvKey"] = key
+    rankings = build_ranking_from_buckets(buckets, top_n=top_n)
+    for row in rankings:
+        row["workCount"] = len(counted_works[row["cvKey"]])
+    return rankings
+
+
+def rank_by_series_count(rows: list[dict], *, field: str, top_n: int) -> list[dict]:
+    result = []
+    previous = None
+    rank = 0
+    for position, row in enumerate(sorted(rows, key=lambda row: -row[field]), start=1):
+        if row[field] != previous:
+            rank = position
+        if rank > top_n:
+            break
+        result.append({"rank": rank, **row})
+        previous = row[field]
+    return result
+
+
+def configured_pairs(drama: RankedDrama, override: object) -> set[tuple[str, str]] | None:
+    if not isinstance(override, dict) or not isinstance(override.get("pairs"), list):
+        return None
+    cast_by_id = {cv.platform_id: cv.key for cv in drama.cast.values() if cv.platform_id}
+    cast_by_name = defaultdict(list)
+    for cv in drama.cast.values():
+        cast_by_name[normalize_match(cv.name)].append(cv)
+    pairs = set()
+    for pair in override["pairs"]:
+        if not isinstance(pair, list) or len(pair) != 2:
+            return None
+        keys = []
+        for cv in pair:
+            if not isinstance(cv, dict) or not isinstance(cv.get("cvName"), str) or not cv["cvName"].strip():
+                return None
+            cv_id = normalize(cv.get("cvId"))
+            if cv_id:
+                key = cast_by_id.get(cv_id)
+                if key is None:
+                    return None
+            else:
+                candidates = cast_by_name.get(normalize_match(cv["cvName"]), [])
+                if len(candidates) != 1 or candidates[0].platform_id:
+                    return None
+                key = candidates[0].key
+            keys.append(key)
+        first, second = sorted(keys)
+        if first == second:
+            return None
+        pairs.add((first, second))
+    return pairs
+
+
+def build_combined_series_and_partner_ranks(
+    dramas: list[RankedDrama], release_works: dict[tuple[str, str], dict], cvid_map: dict,
+    partner_overrides: dict, work_index: dict[str, tuple[str, str]], *, top_n: int,
+) -> tuple[list[dict], dict[str, list[dict]], list[dict]]:
+    cv_profiles = {normalize(name): cv for name, cv in cvid_map.items() if isinstance(cv, dict)}
+    cv_by_key = {}
+    for drama in dramas:
+        for cv in drama.cast.values():
+            cv_by_key.setdefault(cv.key, cv)
+
+    def cv_order(key: str) -> tuple[str, str]:
+        return cv_by_key[key].name, key
+    cv_works = defaultdict(dict)
+    pair_works = defaultdict(dict)
+    pending = []
+    for drama in sorted(dramas, key=lambda drama: (drama.platform, id_sort(drama.drama_id))):
+        series_key, title = work_index[drama.series_key]
+        for key in drama.cast:
+            work = cv_works[key].setdefault(series_key, {"seriesKey": series_key, "title": title, "dramaIds": {}})
+            work["dramaIds"].setdefault(drama.platform, []).append(drama.drama_id)
+        if drama.genre not in ("纯爱", "言情") or len(drama.cast) < 2:
+            continue
+        identity = ":".join(drama.identity)
+        if len(drama.cast) == 2:
+            pairs = {tuple(sorted(drama.cast))}
+        else:
+            pairs = configured_pairs(drama, partner_overrides.get(identity))
+        if pairs is None:
+            pending.append({
+                "platform": drama.platform, "dramaId": drama.drama_id, "title": drama.title,
+                "seriesKey": series_key, "genre": drama.genre,
+                "mainCvs": [
+                    {"cvName": cv.name, "cvId": cv.platform_id or None}
+                    for cv in sorted(drama.cast.values(), key=lambda cv: (cv.name, cv.key))
+                ],
+                "reason": "invalidOverride" if identity in partner_overrides else "missingOverride",
+            })
+            continue
+        for pair in pairs:
+            work = pair_works[pair].setdefault(
+                series_key, {"seriesKey": series_key, "title": title, "releases": []},
+            )
+            work["releases"].append({
+                "platform": drama.platform, "dramaId": drama.drama_id, "title": drama.title,
+                "viewCount": release_works.get(drama.identity, {}).get("viewCount"),
+            })
+
+    def sorted_works(works: dict) -> list[dict]:
+        return sorted(works.values(), key=lambda work: (work["title"], work["seriesKey"]))
+
+    count_rows = [
+        {
+            "cvKey": key,
+            "cvName": cv_by_key[key].name,
+            "avatar": normalize(cv_profiles.get(cv_by_key[key].name, {}).get("avatar"))
+            if cv_by_key[key].canonical else "",
+            "seriesCount": len(cv_works[key]),
+            "works": sorted_works(cv_works[key]),
+        }
+        for key in sorted(cv_works, key=cv_order)
+    ]
+    count_rank_rows = []
+    measured_rows = []
+    ordered_pairs = [
+        (tuple(sorted(pair, key=cv_order)), works) for pair, works in pair_works.items()
+    ]
+    for pair, works in sorted(ordered_pairs, key=lambda item: tuple(map(cv_order, item[0]))):
+        cvs = []
+        for key in pair:
+            cv = cv_by_key[key]
+            profile = cv_profiles.get(cv.name, {}) if cv.canonical else {}
+            missevan_id = profile.get("missevanCvId", profile.get("cvId"))
+            manbo_id = profile.get("manboCvId")
+            if key.startswith("missevan:id:"):
+                missevan_id = cv.platform_id
+            elif key.startswith("manbo:id:"):
+                manbo_id = cv.platform_id
+            cvs.append({
+                "cvKey": key, "cvName": cv.name, "avatar": normalize(profile.get("avatar")),
+                "missevanCvId": normalize(missevan_id) or None,
+                "manboCvId": normalize(manbo_id) or None,
+            })
+        samples = [
+            entry["viewCount"] for work in works.values() for entry in work["releases"]
+            if entry["viewCount"] is not None
+        ]
+        row = {"cvs": cvs, "workCount": len(works), "totalViewCount": sum(samples), "works": sorted_works(works)}
+        if row["workCount"] >= MIN_PARTNER_WORK_COUNT:
+            count_rank_rows.append(row)
+        if samples:
+            measured_rows.append(row)
+    view_rows = sorted(measured_rows, key=lambda row: -row["totalViewCount"])[:top_n]
+    return rank_by_series_count(count_rows, field="seriesCount", top_n=top_n), {
+        "workCount": rank_by_series_count(count_rank_rows, field="workCount", top_n=top_n),
+        "viewCount": [{"rank": rank, **row} for rank, row in enumerate(view_rows, start=1)],
+    }, pending
 
 
 def build_cv_rank_outputs(
@@ -447,10 +834,13 @@ def build_cv_rank_outputs(
     generated_at: str,
     top_n: int = 30,
     series_count_generated_at: str | None = None,
+    partner_overrides: dict | None = None,
 ) -> tuple[dict, dict[str, list[dict]], dict[str, list[dict]]]:
+    dramas = collect_ranked_dramas(missevan_store, manbo_store, series_info, cvid_map)
+    edition_aliases, work_index = build_work_indexes(dramas)
     series_count_rankings = build_series_count_rankings(
         missevan_store=missevan_store, manbo_store=manbo_store,
-        series_info=series_info, cvid_map=cvid_map, top_n=top_n,
+        series_info=series_info, cvid_map=cvid_map, top_n=top_n, edition_aliases=edition_aliases,
     )
     missevan_ids, manbo_ids, name_index, avatar_index = build_map_indexes(cvid_map)
     missevan_buckets: dict[str, dict] = {}
@@ -486,6 +876,10 @@ def build_cv_rank_outputs(
         "missevan": build_ranking_from_buckets(paid_missevan_buckets, top_n=len(paid_missevan_buckets)),
         "manbo": build_ranking_from_buckets(paid_manbo_buckets, top_n=len(paid_manbo_buckets)),
     }
+    release_works = works_by_release(full_rankings)
+    combined_counts, partner_rankings, pending = build_combined_series_and_partner_ranks(
+        dramas, release_works, cvid_map, partner_overrides or {}, work_index, top_n=top_n,
+    )
 
     payload = {
         "version": 4,
@@ -497,17 +891,23 @@ def build_cv_rank_outputs(
         "rankings": {
             "missevan": full_rankings["missevan"][:top_n],
             "manbo": full_rankings["manbo"][:top_n],
+            "combined": build_combined_view_rankings(dramas, release_works, avatar_index, work_index, top_n),
         },
         "paidRankings": {
             "missevan": full_paid_rankings["missevan"][:top_n],
             "manbo": full_paid_rankings["manbo"][:top_n],
+            "combined": build_combined_view_rankings(
+                dramas, works_by_release(full_paid_rankings), avatar_index, work_index, top_n,
+            ),
         },
-        "seriesCountRankings": series_count_rankings,
+        "seriesCountRankings": {**series_count_rankings, "combined": combined_counts},
         "seriesCountMeta": build_series_count_meta(
             missevan_store=missevan_store, manbo_store=manbo_store,
             cvid_map=cvid_map, series_info=series_info,
             generated_at=series_count_generated_at or now_iso(),
         ),
+        "partnerRankings": partner_rankings,
+        "partnerReview": {"pending": pending},
     }
     return payload, full_rankings, full_paid_rankings
 
@@ -523,6 +923,7 @@ def build_cv_ranks_payload(
     generated_at: str,
     top_n: int = 30,
     series_count_generated_at: str | None = None,
+    partner_overrides: dict | None = None,
 ) -> dict:
     payload, _full_rankings, _full_paid_rankings = build_cv_rank_outputs(
         missevan_store=missevan_store,
@@ -534,6 +935,7 @@ def build_cv_ranks_payload(
         generated_at=generated_at,
         top_n=top_n,
         series_count_generated_at=series_count_generated_at,
+        partner_overrides=partner_overrides,
     )
     return payload
 
@@ -924,6 +1326,7 @@ def build_and_publish_cv_ranks(
         upstash=upstash,
     )
     series_info = fetch_remote_series_info(upstash=upstash)
+    partner_overrides = fetch_partner_overrides(upstash=upstash)
     payload, full_rankings, full_paid_rankings = build_cv_rank_outputs(
         missevan_store=load_json(missevan_info_path, {}),
         manbo_store=load_json(manbo_info_path, {"records": []}),
@@ -931,6 +1334,7 @@ def build_and_publish_cv_ranks(
         manbo_counts=manbo_cache.get("counts", {}),
         cvid_map=cvid_map,
         series_info=series_info,
+        partner_overrides=partner_overrides,
         generated_at=generated,
     )
     save_json(output_path, payload)
@@ -975,7 +1379,9 @@ def main(argv: list[str] | None = None) -> int:
     manbo_count = len(rankings.get("manbo") or [])
     print(
         f"[ok] wrote {CV_RANKS_PATH.name}: "
-        f"missevan_rankings={missevan_count}, manbo_rankings={manbo_count}, date={payload.get('date')}"
+        f"missevan_rankings={missevan_count}, manbo_rankings={manbo_count}, "
+        f"combined_rankings={len(rankings.get('combined') or [])}, "
+        f"pending_partner_works={len(payload['partnerReview']['pending'])}, date={payload.get('date')}"
     )
     return 0
 
