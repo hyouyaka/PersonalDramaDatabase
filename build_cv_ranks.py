@@ -6,6 +6,7 @@ import json
 import re
 import sys
 import unicodedata
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -960,6 +961,8 @@ def _copy_cv_trend_sample(sample: object) -> dict | None:
     copied: dict[str, object] = {"metrics": copied_metrics}
     if sample.get("generated_at") not in (None, ""):
         copied["generated_at"] = sample.get("generated_at")
+    if sample.get("publicationId") not in (None, ""):
+        copied["publicationId"] = sample["publicationId"]
     ranks = sample.get("ranks")
     if isinstance(ranks, dict):
         copied["ranks"] = {
@@ -978,6 +981,7 @@ def build_cv_trend_payload(
     paid_rankings: list[dict],
     *,
     generated_at: str,
+    publication_id: str | None = None,
     retention_dates: int = CV_TREND_RETENTION_DATES,
 ) -> dict:
     if platform not in PLATFORMS:
@@ -1045,6 +1049,8 @@ def build_cv_trend_payload(
             },
             "ranks": {key: value for key, value in ranks.items() if value is not None},
         }
+        if publication_id is not None:
+            samples[history_date]["publicationId"] = publication_id
         cvs[cv_name] = entry
 
     dates = sorted(
@@ -1081,6 +1087,7 @@ def upload_cv_trends(
     *,
     history_date: str,
     generated_at: str,
+    publication_id: str,
     full_rankings: dict[str, list[dict]],
     full_paid_rankings: dict[str, list[dict]],
     upstash=upstash_request,
@@ -1093,12 +1100,13 @@ def upload_cv_trends(
             full_rankings.get(platform) or [],
             full_paid_rankings.get(platform) or [],
             generated_at=generated_at,
+            publication_id=publication_id,
         )
         for platform in PLATFORMS
     }
     publish_trend_v2_best_effort(
         CV_TREND_V2_KEY,
-        lambda: publish_cv_trend_v2(v2_payloads, upstash=upstash),
+        lambda: publish_cv_trend_v2(v2_payloads, publication_id=publication_id, upstash=upstash),
     )
     return v2_payloads
 
@@ -1337,12 +1345,14 @@ def build_and_publish_cv_ranks(
         partner_overrides=partner_overrides,
         generated_at=generated,
     )
+    payload["publicationId"] = str(uuid.uuid4())
     save_json(output_path, payload)
     if upload:
         upload_cv_ranks(payload, upstash=upstash)
         upload_cv_trends(
             history_date=payload["date"],
             generated_at=payload["generated_at"],
+            publication_id=payload["publicationId"],
             full_rankings=full_rankings,
             full_paid_rankings=full_paid_rankings,
             upstash=upstash,

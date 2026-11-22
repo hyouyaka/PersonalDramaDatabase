@@ -1,10 +1,12 @@
 import json
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import build_cv_ranks
+from test_upstash_v2 import FakeUpstash
 
 
 class BuildCvRanksTests(unittest.TestCase):
@@ -390,6 +392,7 @@ class BuildCvRanksTests(unittest.TestCase):
                     "samples": {
                         date: {
                             "generated_at": f"{date}T00:00:00+00:00",
+                            "publicationId": f"historical-{date}",
                             "metrics": {"totalViewCount": idx, "paidViewCount": idx // 2},
                             "ranks": {"total": idx},
                             "works": [{"dramaId": "must-not-survive"}],
@@ -451,6 +454,7 @@ class BuildCvRanksTests(unittest.TestCase):
             total_ranking,
             paid_ranking,
             generated_at="2026-06-10T12:00:00+00:00",
+            publication_id="current-publication",
         )
 
         self.assertEqual(len(payload["dates"]), 50)
@@ -462,9 +466,11 @@ class BuildCvRanksTests(unittest.TestCase):
         self.assertEqual([work["dramaId"] for work in cv["works"]], ["101", "100"])
         self.assertEqual(cv["samples"]["2026-06-10"]["metrics"], {"totalViewCount": 300, "paidViewCount": 200})
         self.assertEqual(cv["samples"]["2026-06-10"]["ranks"], {"total": 1, "paid": 1})
+        self.assertEqual(cv["samples"]["2026-06-10"]["publicationId"], "current-publication")
         older_sample = cv["samples"]["2026-04-50"]
         self.assertEqual(older_sample["metrics"], {"totalViewCount": 50, "paidViewCount": 25})
         self.assertNotIn("works", older_sample)
+        self.assertEqual(older_sample["publicationId"], "historical-2026-04-50")
 
     def test_build_and_publish_uploads_cv_trends_after_rank_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -502,48 +508,45 @@ class BuildCvRanksTests(unittest.TestCase):
             missevan_counts = self.write_json(tmp, "missevan-counts.json", {"_meta": {}, "counts": {"100": {"view_count": 100}}})
             manbo_counts = self.write_json(tmp, "manbo-counts.json", {"_meta": {}, "counts": {"200": {"view_count": 60}}})
             cvid_map = self.write_json(tmp, "map.json", {})
-            commands: list[list[object]] = []
-            remote: dict[str, str] = {}
-
-            def fake_upstash(command: list[object]) -> object:
-                commands.append(command)
-                if command[0] == "GET" and str(command[1]) in remote:
-                    return remote[str(command[1])]
-                if command in (["GET", "ranks:meta"], ["GET", build_cv_ranks.PARTNER_OVERRIDES_KEY]):
-                    return None
-                if command[0] == "EVAL":
-                    remote[str(command[3])] = str(command[5])
-                    remote[str(command[4])] = str(command[6])
-                    return 1
-                if command[0] == "EXISTS":
-                    return 1
-                if command[:2] in (["GET", "ranks:trend:cv:missevan"], ["GET", "ranks:trend:cv:manbo"]):
-                    return None
-                if command[0] == "SET":
-                    return "OK"
-                raise AssertionError(command)
+            fake_upstash = FakeUpstash()
 
             with (
                 patch.object(build_cv_ranks, "fetch_remote_series_info", return_value={}),
                 patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value={}),
                 patch.object(build_cv_ranks, "sync_remote_watchcount_inputs"),
-                patch.object(build_cv_ranks, "publish_trend_v2_best_effort") as publish_v2,
                 patch("builtins.print"),
             ):
-                build_cv_ranks.build_and_publish_cv_ranks(
-                    missevan_info_path=missevan_info,
-                    manbo_info_path=manbo_info,
-                    missevan_counts_path=missevan_counts,
-                    manbo_counts_path=manbo_counts,
-                    cvid_map_path=cvid_map,
-                    output_path=Path(tmp) / "ranks-cv.json",
-                    upstash=fake_upstash,
-                    generated_at="2026-06-10T12:00:00+00:00",
-                    upload=True,
-                )
+                publication_ids = []
+                for _ in range(2):
+                    payload = build_cv_ranks.build_and_publish_cv_ranks(
+                        missevan_info_path=missevan_info,
+                        manbo_info_path=manbo_info,
+                        missevan_counts_path=missevan_counts,
+                        manbo_counts_path=manbo_counts,
+                        cvid_map_path=cvid_map,
+                        output_path=Path(tmp) / "ranks-cv.json",
+                        upstash=fake_upstash,
+                        generated_at="2026-06-10T12:00:00+00:00",
+                        upload=True,
+                    )
+                    publication_id = payload["publicationId"]
+                    self.assertEqual(uuid.UUID(publication_id).version, 4)
+                    publication_ids.append(publication_id)
+                    self.assertEqual(json.loads(fake_upstash.strings["ranks:cv:latest"]), payload)
+                    self.assertEqual(json.loads((Path(tmp) / "ranks-cv.json").read_text(encoding="utf-8")), payload)
+                    trend = fake_upstash.hashes[build_cv_ranks.CV_TREND_V2_KEY]
+                    self.assertEqual(json.loads(trend["__meta__"])["publicationId"], publication_id)
+                    for field, raw in trend.items():
+                        if field != "__meta__":
+                            sample = json.loads(raw)["samples"][payload["date"]]
+                            self.assertEqual(sample["publicationId"], publication_id)
+                            self.assertEqual(sample["generated_at"], payload["generated_at"])
 
-            self.assertFalse(any(command[:1] == ["SET"] for command in commands))
-            publish_v2.assert_called_once()
+            self.assertNotEqual(*publication_ids)
+            commands = fake_upstash.commands
+            rank_publish = next(i for i, command in enumerate(commands) if command[0] == "EVAL")
+            trend_stage = next(i for i, command in enumerate(commands) if command[0] == "HSET")
+            self.assertLess(rank_publish, trend_stage)
 
     def test_upload_cv_trends_propagates_v2_publish_failure(self) -> None:
         with (
@@ -553,6 +556,7 @@ class BuildCvRanksTests(unittest.TestCase):
             build_cv_ranks.upload_cv_trends(
                 history_date="2026-06-10",
                 generated_at="2026-06-10T12:00:00+00:00",
+                publication_id="failed-publication",
                 full_rankings={"missevan": [], "manbo": []},
                 full_paid_rankings={"missevan": [], "manbo": []},
                 upstash=Mock(),

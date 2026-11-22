@@ -948,10 +948,18 @@ def publish_peak_trend_v2(payload: dict, *, upstash: Callable[[list[object]], ob
     )
 
 
-def publish_cv_trend_v2(payloads: dict[str, dict], *, upstash: Callable[[list[object]], object], force: bool = False) -> None:
+def publish_cv_trend_v2(
+    payloads: dict[str, dict],
+    *,
+    upstash: Callable[[list[object]], object],
+    publication_id: str | None = None,
+    force: bool = False,
+) -> None:
     if force and int(upstash(["EXISTS", CV_TREND_V2_KEY]) or 0) == 1:
         raise RuntimeError(f"Refusing legacy backfill: authoritative v2 already exists: {CV_TREND_V2_KEY}")
     candidate_meta, candidate_fields = build_cv_trend_v2(payloads)
+    if publication_id is not None:
+        candidate_meta["publicationId"] = publication_id
     current_meta, current_fields, current_meta_raw = _load_hash_snapshot(CV_TREND_V2_KEY, upstash=upstash)
     if current_fields:
         meta, fields = merge_cv_v2_authoritative(

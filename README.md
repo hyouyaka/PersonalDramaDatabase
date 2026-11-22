@@ -417,6 +417,13 @@ python build_cv_ranks.py --no-upload
 
 #### 双平台汇总与搭档榜
 
+每次运行 `build_cv_ranks.py` 都会生成新的 UUID `publicationId`，写入本地及远端
+`ranks:cv:latest` 顶层、两个平台的当期 CV 趋势样本，以及 `ranks:trend:cv:v2`
+的 `__meta__`。同一采样时间重发也使用新标识；历史样本保留原有标识，旧样本不补填。
+榜单和趋势沿用各自的 CAS 原子发布，网页端须等同批次的趋势及所需平台当期样本到齐后
+才显示周增。旧快照仍可展示榜单和历史趋势，缺少匹配标识时周增显示「暂无数据」。
+部署后运行一次 `python build_cv_ranks.py` 可按远端最新播放量补发榜单和趋势，无需重新抓取播放量。
+
 - `rankings.combined` 和 `paidRankings.combined` 按统一 CV 合计猫耳和漫播的播放量，再取前 30 名。明细和播放量按平台及 `dramaId` 分列，付费资格按各条剧目记录判定。`workCount` 只统计该 CV 在各榜实际纳入的唯一作品。双平台作品数、播放量和搭档榜共用 `cvKey` 区分 CV。平台 ID 唯一命中 CVID 映射时使用规范身份，其余按平台及 ID 区分，缺少 ID 时按平台及显示名区分。
 - `seriesCountRankings.combined` 先按系列表归并各平台的季度，再匹配两平台的作品。规范化标题、媒介、题材及整组规范主役一致，且两边各有唯一候选时，只计 1 部。同一平台明确标注的原版和重录版，在标题、媒介、题材和整组主役一致且候选唯一时归为一部。作品数榜和搭档榜按同一归并结果计数。作品明细的 `dramaIds` 按平台列出该 CV 实际参与的剧目。对应的 `seriesCountMeta.combined` 记录两平台源库版本。
 - `partnerRankings.workCount` 和 `partnerRankings.viewCount` 只统计纯爱、言情。逐条剧目识别同场主役阵容：两位主役自动成对，多主役读取 `drama:partner-overrides:v1`。同一组合在一个系列计 1 部，播放量按该组合实际参与的各平台剧目累加。次数榜只收录合作满 4 部的搭档，并保留第 30 名并列。播放量榜按播放量取前 30 名。
