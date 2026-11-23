@@ -347,6 +347,16 @@ class FirstEpisodeMonthTests(unittest.TestCase):
 
 
 class ManboAuthorTests(unittest.TestCase):
+    def test_source_prefix_is_removed_from_author_credit(self) -> None:
+        for source, author in (("长佩阅读", "二弯月"), ("克拉有读", "秋小天"),
+                               ("椿和文化", "夏星倦"), ("椿和文化", "陆渔"),
+                               ("椿和文化", "关山月明")):
+            for separator in ("", " ", "　"):
+                for credit in ("原著", "原作"):
+                    desc = f"{source}{separator}{author}{credit}，广播剧《测试》。"
+                    with self.subTest(desc=desc):
+                        self.assertEqual(refresh_platform_metadata.extract_manbo_author(desc), author)
+
     def test_existing_author_is_preserved_without_extracting_description(self) -> None:
         for author in ("手写作者", "  手写作者  "):
             for desc in ("其他作者原著", "没有作者署名"):

@@ -300,6 +300,18 @@ class RejectedDramaRecord(RuntimeError):
     """Raised when platform detail proves an ID is outside the supported libraries."""
 
 
+def manbo_set_list_is_known(payload: dict) -> bool:
+    """An explicit zero online count also proves an omitted set list is empty."""
+    if any(isinstance(payload.get(field), list) for field in MANBO_SET_LIST_FIELDS):
+        return True
+    count = payload.get("onlineSetCount")
+    return (
+        type(count) in (int, str)
+        and count in (0, "0")
+        and all(payload.get(field) is None for field in MANBO_SET_LIST_FIELDS)
+    )
+
+
 def validate_manbo_web_response(path: str, data: object) -> dict:
     """Reject successful HTTP responses that are not usable Manbo Web API payloads."""
     if not isinstance(data, dict):
@@ -331,7 +343,7 @@ def validate_manbo_web_response(path: str, data: object) -> dict:
         except (TypeError, ValueError) as exc:
             raise RuntimeError(f"invalid Manbo danmaku count: {payload.get('count')!r}") from exc
     elif endpoint_path.endswith("/dramaDetail"):
-        if not any(isinstance(payload.get(field), list) for field in MANBO_SET_LIST_FIELDS):
+        if not manbo_set_list_is_known(payload):
             raise RuntimeError(
                 "invalid Manbo drama detail response: expected a supported set list field"
             )
@@ -1927,7 +1939,7 @@ def _fetch_one_manbo(drama_id: str, entry: dict) -> None:
     if not is_target_catalog("manbo", catalog) and not rank_only:
         raise RejectedDramaRecord(f"non-target catalog={catalog}")
 
-    if any(isinstance(body.get(field), list) for field in MANBO_SET_LIST_FIELDS):
+    if manbo_set_list_is_known(body):
         paid_ids = {
             _extract_manbo_set_id(episode)
             for episode in _extract_manbo_set_list(body)
@@ -2004,7 +2016,7 @@ def fetch_manbo_paid_set_ids(
     request_json=request_manbo_json,
     episode_titles: dict[str, str] | None = None,
 ) -> list[str]:
-    """Return paid set IDs; reject responses without an observed set list."""
+    """Return paid set IDs; require a set list or an explicit zero online count."""
     detail_requests = [
         lambda: request_manbo_web_json(
             f"/web_manbo/dramaDetail?dramaId={drama_id}",
@@ -2022,9 +2034,7 @@ def fetch_manbo_paid_set_ids(
             last_error = exc
             continue
         payload = data.get("data") or data.get("b") or {}
-        if not isinstance(payload, dict) or not any(
-            isinstance(payload.get(field), list) for field in MANBO_SET_LIST_FIELDS
-        ):
+        if not isinstance(payload, dict) or not manbo_set_list_is_known(payload):
             last_error = RuntimeError(
                 "invalid Manbo drama detail response: expected a supported set list field"
             )

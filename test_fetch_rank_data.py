@@ -2868,6 +2868,46 @@ class QueueDramaIdValidationTests(unittest.TestCase):
 
 
 class ManboDanmakuStabilityTests(unittest.TestCase):
+    def test_zero_online_sets_succeed_without_pages_or_retries_in_all_refresh_modes(self):
+        benchmark = fetch_rank_data.fetch_manbo_paid_danmaku_benchmark
+        for mode in ("daily", "only-danmaku", "repair"):
+            for count in (0, "0"):
+                for lists in ({}, {"setRespList": None}, {"setRespList": []}):
+                    with self.subTest(mode=mode, count=count, lists=lists):
+                        body = {"title": "drama", "category": 1, "onlineSetCount": count, **lists}
+                        requester = Mock(return_value={"code": 200, "data": body})
+                        store = {"manbo": {"dramas": {"600": {"danmaku_uid_count": None}}}}
+
+                        def fetch_benchmark(drama_id, **kwargs):
+                            kwargs["request_json"] = requester
+                            return benchmark(drama_id, **kwargs)
+
+                        with (
+                            patch.object(fetch_rank_data, "request_manbo_json", requester),
+                            patch.object(fetch_rank_data, "fetch_manbo_paid_danmaku_benchmark", side_effect=fetch_benchmark),
+                            patch.object(fetch_rank_data, "save_json"),
+                            patch.object(fetch_rank_data, "collect_null_danmaku_ids_from_layers", return_value=({"600"}, {"600": ["latest", "trend"]}, {})),
+                            patch.object(fetch_rank_data, "write_repaired_danmaku_layers") as write_layers,
+                            patch("builtins.print"),
+                        ):
+                            if mode == "daily":
+                                fetch_rank_data.fetch_manbo_drama_details({"600"}, store, skip_danmaku=False)
+                            elif mode == "only-danmaku":
+                                fetch_rank_data.fetch_manbo_danmaku_details({"600"}, store, force=True)
+                            else:
+                                result = fetch_rank_data.repair_null_danmaku_for_platform("manbo", "2026-11-23")
+                        self.assertEqual(requester.call_count, 2 if mode == "daily" else 1)
+                        self.assertTrue(all("drama/detail" in call.args[0] or "/dramaDetail" in call.args[0]
+                                            for call in requester.call_args_list))
+                        if mode == "repair":
+                            self.assertEqual(result["repaired"], {"600": 0})
+                            self.assertEqual(result["failed"], [])
+                            write_layers.assert_called_once_with("manbo", "2026-11-23", {"600": 0}, {})
+                        else:
+                            entry = store["manbo"]["dramas"]["600"]
+                            self.assertEqual(entry["danmaku_uid_count"], 0)
+                            self.assertEqual(entry["PaidEpisodesCount"], 0)
+
     def test_manbo_web_api_prefers_current_host(self) -> None:
         request_json = Mock(return_value={"code": 200, "data": {}})
 
@@ -3513,6 +3553,63 @@ class TargetCatalogAdmissionTests(unittest.TestCase):
 
 class PaidEpisodesCountTests(unittest.TestCase):
     captured_at = "2026-11-17T00:10:00+00:00"
+
+    def test_zero_online_sets_are_accepted_by_app_fallback(self):
+        for count in (0, "0"):
+            with self.subTest(count=count):
+                requester = Mock(side_effect=[
+                    requests.exceptions.ReadTimeout("Web detail unavailable"),
+                    {"b": {"onlineSetCount": count}},
+                ])
+                entry = {"PaidEpisodesCount": 5}
+                with patch("builtins.print"):
+                    result = fetch_rank_data.fetch_one_manbo_danmaku_count(
+                        "600", request_json=requester, entry=entry,
+                    )
+                self.assertEqual(result, ("600", 0))
+                self.assertEqual(entry["PaidEpisodesCount"], 0)
+                self.assertEqual(requester.call_count, 2)
+
+    def test_zero_online_sets_refresh_detail_count_when_danmaku_is_skipped(self):
+        entry = {"PaidEpisodesCount": 5}
+        with (
+            patch.object(fetch_rank_data, "request_manbo_json", return_value={"b": {
+                "title": "drama", "category": 1, "onlineSetCount": 0,
+            }}),
+            patch.object(fetch_rank_data, "now_iso", return_value=self.captured_at),
+        ):
+            fetch_rank_data._fetch_one_manbo("600", entry)
+        self.assertEqual(entry["PaidEpisodesCount"], 0)
+        self.assertEqual(entry["_metric_fetched_at"]["PaidEpisodesCount"], self.captured_at)
+
+    def test_missing_sets_with_nonzero_or_invalid_online_count_still_fail(self):
+        for count in (None, 1, "1", -1, False, True, "", "invalid", 0.0, [], {}):
+            with self.subTest(count=count):
+                requester = Mock(return_value={"code": 200, "data": {"onlineSetCount": count}})
+                entry = {"PaidEpisodesCount": 5}
+                with self.assertRaisesRegex(RuntimeError, "supported set list"):
+                    fetch_rank_data.fetch_one_manbo_danmaku_count("600", request_json=requester, entry=entry)
+                self.assertEqual(entry, {"PaidEpisodesCount": 5})
+                self.assertEqual(requester.call_count, 2)
+
+    def test_zero_online_count_does_not_hide_malformed_set_lists(self):
+        for field in fetch_rank_data.MANBO_SET_LIST_FIELDS:
+            for malformed in ({}, "invalid", 0, False):
+                with self.subTest(field=field, malformed=malformed):
+                    requester = Mock(return_value={"code": 200, "data": {"onlineSetCount": 0, field: malformed}})
+                    with self.assertRaisesRegex(RuntimeError, "supported set list"):
+                        fetch_rank_data.fetch_manbo_paid_set_ids("600", request_json=requester)
+
+    def test_zero_online_count_does_not_hide_web_business_failure(self):
+        requester = Mock(return_value={"code": 403, "msg": "forbidden", "data": {"onlineSetCount": 0}})
+        with self.assertRaisesRegex(RuntimeError, "business failure"):
+            fetch_rank_data.request_manbo_web_json("/web_manbo/dramaDetail?dramaId=600", request_json=requester)
+
+    def test_zero_online_count_does_not_override_returned_paid_sets(self):
+        requester = Mock(return_value={"code": 200, "data": {
+            "onlineSetCount": 0, "setRespList": [{"setId": "paid", "payType": 1}],
+        }})
+        self.assertEqual(fetch_rank_data.fetch_manbo_paid_set_ids("600", request_json=requester), ["paid"])
 
     def test_missevan_paid_episodes_with_empty_danmaku_are_not_zero_episodes(self):
         episodes = [
