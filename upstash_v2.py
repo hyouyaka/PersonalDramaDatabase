@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import uuid
 from datetime import datetime, timezone
 from typing import Callable
+
+from cv_identity import CvIdentityIndex, confirmed_key, ensure_cv_identities, trend_key
 
 from platform_sync import is_excluded_drama
 from upstash_editor import (
@@ -27,9 +28,9 @@ NORMAL_TREND_V2_KEYS = {
     "manbo": "ranks:trend:manbo:v2",
 }
 PEAK_TREND_V2_KEY = "ranks:trend:peak:missevan:v2"
-CV_TREND_V2_KEY = "ranks:trend:cv:v2"
+CV_TREND_V3_KEY = "ranks:trend:cv:v3"
 NORMAL_TREND_V2_RETENTION_DATES = 45
-CV_TREND_V2_RETENTION_DATES = 50
+CV_TREND_V3_RETENTION_DATES = 50
 STAGING_TTL_SECONDS = 24 * 60 * 60
 HASH_WRITE_CHUNK_SIZE = 100
 _SOURCE_UNSET = object()
@@ -274,9 +275,11 @@ def publish_cvid_map(
 ) -> dict:
     if not isinstance(payload, dict):
         raise ValueError(f"{CVID_MAP_KEY} payload must be a JSON object")
-    encoded = compact_json(payload)
     if source_encoded is _SOURCE_UNSET:
         source_encoded = upstash(["GET", CVID_MAP_KEY])
+    previous = json.loads(source_encoded) if isinstance(source_encoded, str) else {}
+    ensure_cv_identities(payload, previous)
+    encoded = compact_json(payload)
     expected = string_cas_token(source_encoded)
     meta = build_cvid_map_meta(encoded, payload)
     result = upstash(
@@ -506,55 +509,6 @@ def build_peak_trend_v2(payload: dict, *, retention_dates: int = NORMAL_TREND_V2
     return meta, fields
 
 
-def normalize_cv_name(value: object) -> str:
-    return re.sub(r"\s+", " ", str(value or "")).strip()
-
-
-def build_cv_trend_v2(payloads: dict[str, dict]) -> tuple[dict, dict[str, dict]]:
-    fields: dict[str, dict] = {}
-    platforms_meta: dict[str, dict] = {}
-    for platform in ("missevan", "manbo"):
-        payload = payloads.get(platform) or {}
-        dates = sorted({str(value) for value in payload.get("dates") or [] if value})[-CV_TREND_V2_RETENTION_DATES:]
-        kept = set(dates)
-        for raw_name, raw_entry in (payload.get("cvs") or {}).items():
-            if not isinstance(raw_entry, dict):
-                continue
-            name = normalize_cv_name(raw_entry.get("cvName") or raw_name)
-            if not name:
-                continue
-            samples = {
-                str(date): sample
-                for date, sample in (raw_entry.get("samples") or {}).items()
-                if str(date) in kept
-            }
-            if not samples:
-                continue
-            field_key = f"{platform}:{name}"
-            existing = fields.get(field_key) or {}
-            fields[field_key] = {
-                **existing,
-                **raw_entry,
-                "version": 2,
-                "cvName": name,
-                "samples": {**(existing.get("samples") or {}), **samples},
-            }
-        platforms_meta[platform] = {
-            "updated_at": str(payload.get("updated_at") or ""),
-            "dates": dates,
-            "entityCount": sum(1 for field in fields if field.startswith(f"{platform}:")),
-            "retentionDates": CV_TREND_V2_RETENTION_DATES,
-        }
-    meta = {
-        "version": 2,
-        "kind": "cv",
-        "updated_at": max((item["updated_at"] for item in platforms_meta.values()), default=""),
-        "platforms": platforms_meta,
-        "entityCount": len(fields),
-    }
-    return meta, fields
-
-
 def _load_hash_snapshot(
     key: str,
     *,
@@ -565,7 +519,7 @@ def _load_hash_snapshot(
         return {}, {}, None
     raw_meta = raw.get("__meta__")
     if raw_meta is None:
-        raise RuntimeError(f"Invalid authoritative v2 Hash: {key} is missing __meta__")
+        raise RuntimeError(f"Invalid authoritative trend Hash: {key} is missing __meta__")
     try:
         meta = json.loads(raw_meta)
         fields = {
@@ -574,9 +528,9 @@ def _load_hash_snapshot(
             if field != "__meta__"
         }
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Invalid authoritative v2 Hash: {key}") from exc
+        raise RuntimeError(f"Invalid authoritative trend Hash: {key}") from exc
     if not isinstance(meta, dict) or not all(isinstance(value, dict) for value in fields.values()):
-        raise RuntimeError(f"Invalid authoritative v2 Hash shape: {key}")
+        raise RuntimeError(f"Invalid authoritative trend Hash shape: {key}")
     return meta, fields, raw_meta
 
 
@@ -667,7 +621,7 @@ def merge_normal_v2_authoritative(
     return meta, fields
 
 
-def merge_cv_v2_authoritative(
+def merge_cv_trend_authoritative(
     current_meta: dict,
     current_fields: dict[str, dict],
     candidate_meta: dict,
@@ -681,7 +635,7 @@ def merge_cv_v2_authoritative(
         retention = int(
             current_platform.get("retentionDates")
             or candidate_platform.get("retentionDates")
-            or CV_TREND_V2_RETENTION_DATES
+            or CV_TREND_V3_RETENTION_DATES
         )
         candidate_dates = [str(value) for value in candidate_platform.get("dates") or [] if value]
         incoming_dates = {max(candidate_dates)} if candidate_dates else set()
@@ -729,7 +683,7 @@ def merge_cv_v2_authoritative(
 
 
 def _rank_scope_for_hash(key: str) -> str:
-    return "cv" if key == CV_TREND_V2_KEY else "normal"
+    return "cv" if key == CV_TREND_V3_KEY else "normal"
 
 
 def decorate_hash_meta(meta: dict, fields: dict[str, dict]) -> tuple[dict, dict[str, str]]:
@@ -740,7 +694,7 @@ def decorate_hash_meta(meta: dict, fields: dict[str, dict]) -> tuple[dict, dict[
     digest, byte_count = hash_content_stats(encoded_fields)
     decorated = {
         **meta,
-        "version": 2,
+        "version": meta.get("version", 2),
         "updated_at": str(meta.get("updated_at") or datetime.now(timezone.utc).isoformat()),
         "revision": uuid.uuid4().hex,
         "contentSha1": digest,
@@ -948,35 +902,116 @@ def publish_peak_trend_v2(payload: dict, *, upstash: Callable[[list[object]], ob
     )
 
 
-def publish_cv_trend_v2(
-    payloads: dict[str, dict],
-    *,
+def _merge_cv_identity_history(existing: dict, incoming: dict) -> dict:
+    """Aliases can share history; never sum duplicate historical observations."""
+    samples = dict(existing.get("samples") or {})
+    for date, sample in (incoming.get("samples") or {}).items():
+        previous = samples.get(date)
+        if previous is None:
+            samples[date] = sample
+            continue
+        old_time = str(previous.get("generated_at") or "")
+        new_time = str(sample.get("generated_at") or "")
+        if old_time != new_time:
+            samples[date] = sample if new_time > old_time else previous
+            continue
+        merged = {**previous, **sample}
+        for field in ("generated_at", "publicationId"):
+            if sample.get(field) in (None, "") and previous.get(field) not in (None, ""):
+                merged[field] = previous[field]
+        for group in ("metrics", "ranks"):
+            values = dict(previous.get(group) or {})
+            for metric, value in (sample.get(group) or {}).items():
+                if value is not None and values.get(metric) not in (None, value):
+                    raise ValueError(f"Conflicting CV history for {incoming['cvKey']} on {date}: {metric}")
+                if value is not None:
+                    values[metric] = value
+            merged[group] = values
+        samples[date] = merged
+    record = {**existing, **incoming, "samples": samples}
+    def works_freshness(entry: dict) -> tuple[str, str, bool]:
+        history = entry.get("samples") or {}
+        latest = max(history, default="")
+        return latest, str((history.get(latest) or {}).get("generated_at") or ""), bool(entry.get("works"))
+    if existing and works_freshness(existing) > works_freshness(incoming):
+        record["works"] = list(existing.get("works") or [])
+    if not record.get("avatar") and existing.get("avatar"):
+        record["avatar"] = existing["avatar"]
+    return record
+
+
+def build_cv_trend_v3(
+    total_rankings: dict[str, list[dict]], paid_rankings: dict[str, list[dict]], *,
+    history_date: str, generated_at: str, publication_id: str,
+) -> tuple[dict, dict[str, dict]]:
+    fields = {}
+    platforms = {}
+    for platform in ("missevan", "manbo"):
+        groups = []
+        for rows in (total_rankings.get(platform) or [], paid_rankings.get(platform) or []):
+            keyed = {}
+            for row in rows:
+                key = row.get("cvKey")
+                if not trend_key(key):
+                    continue  # Name-only rows remain displayable, without personal history.
+                if not confirmed_key(key) and not key.startswith(f"{platform}:id:"):
+                    raise ValueError(f"Wrong CV trend platform: {platform}/{key}")
+                if key in keyed:
+                    raise ValueError(f"Duplicate CV ranking identity: {platform}/{key}")
+                keyed[key] = row
+            groups.append(keyed)
+        totals, paid = groups
+        for key in sorted(totals.keys() | paid.keys()):
+            total, paid_row = totals.get(key), paid.get(key)
+            row = total or paid_row
+            works = {(str(w.get("platform") or platform), str(w.get("dramaId") or w.get("seriesKey"))): w
+                     for item in (total, paid_row) if item for w in item.get("works") or []}
+            fields[f"{platform}:{key}"] = {
+                "version": 3, "cvKey": key, "cvName": row.get("cvName"),
+                "avatar": row.get("avatar") or "", "works": list(works.values()),
+                "samples": {history_date: {
+                    "cvKey": key, "generated_at": generated_at, "publicationId": publication_id,
+                    "metrics": {"totalViewCount": (total or {}).get("totalViewCount", 0),
+                                "paidViewCount": (paid_row or {}).get("totalViewCount", 0)},
+                    "ranks": {group: item["rank"] for group, item in (("total", total), ("paid", paid_row))
+                              if item and item.get("rank") is not None},
+                }},
+            }
+        platforms[platform] = {"updated_at": generated_at, "dates": [history_date],
+                               "entityCount": sum(f.startswith(f"{platform}:") for f in fields),
+                               "retentionDates": CV_TREND_V3_RETENTION_DATES}
+    return {"version": 3, "kind": "cv", "cvIdentityVersion": 1, "updated_at": generated_at,
+            "publicationId": publication_id, "platforms": platforms, "entityCount": len(fields)}, fields
+
+
+def publish_cv_trend_v3(
+    total_rankings: dict[str, list[dict]], paid_rankings: dict[str, list[dict]], *,
+    cvid_map: dict, history_date: str, generated_at: str, publication_id: str,
     upstash: Callable[[list[object]], object],
-    publication_id: str | None = None,
-    force: bool = False,
 ) -> None:
-    if force and int(upstash(["EXISTS", CV_TREND_V2_KEY]) or 0) == 1:
-        raise RuntimeError(f"Refusing legacy backfill: authoritative v2 already exists: {CV_TREND_V2_KEY}")
-    candidate_meta, candidate_fields = build_cv_trend_v2(payloads)
-    if publication_id is not None:
-        candidate_meta["publicationId"] = publication_id
-    current_meta, current_fields, current_meta_raw = _load_hash_snapshot(CV_TREND_V2_KEY, upstash=upstash)
-    if current_fields:
-        meta, fields = merge_cv_v2_authoritative(
-            current_meta,
-            current_fields,
-            candidate_meta,
-            candidate_fields,
-        )
-    else:
-        meta, fields = candidate_meta, candidate_fields
-    publish_hash_snapshot_atomic(
-        CV_TREND_V2_KEY,
-        meta,
-        fields,
-        upstash=upstash,
-        expected_meta_raw=current_meta_raw,
+    current_meta, current_fields, raw_meta = _load_hash_snapshot(CV_TREND_V3_KEY, upstash=upstash)
+    identities = CvIdentityIndex(cvid_map)
+    resolved_fields = {}
+    for field, existing in current_fields.items():
+        platform, _, key = field.partition(":")
+        if key.startswith(f"{platform}:id:"):
+            key, _, _ = identities.resolve(platform, key[len(f"{platform}:id:"):], existing.get("cvName") or "")
+        record = {**existing, "cvKey": key, "samples": {
+            date: {**sample, "cvKey": key} for date, sample in (existing.get("samples") or {}).items()
+        }}
+        if key in identities.profiles:
+            record["cvName"] = identities.profiles[key][0]
+        target = f"{platform}:{key}"
+        resolved_fields[target] = _merge_cv_identity_history(resolved_fields.get(target) or {}, record)
+    current_fields = resolved_fields
+    candidate_meta, candidate_fields = build_cv_trend_v3(
+        total_rankings, paid_rankings, history_date=history_date,
+        generated_at=generated_at, publication_id=publication_id,
     )
+    meta, fields = merge_cv_trend_authoritative(current_meta, current_fields, candidate_meta, candidate_fields)
+    for record in fields.values():
+        record.setdefault("works", [])
+    publish_hash_snapshot_atomic(CV_TREND_V3_KEY, meta, fields, upstash=upstash, expected_meta_raw=raw_meta)
 
 
 def publish_trend_v2_best_effort(label: str, publish: Callable[[], None]) -> None:

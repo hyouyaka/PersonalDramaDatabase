@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from cv_identity import legacy_id
+
 import html
 import re
 import sqlite3
@@ -15,8 +17,8 @@ from cvid_map_tools import (
     ensure_generated_manbo_cv_entry,
     ensure_name_only_cv_entry,
     has_conflicting_manbo_cvid,
-    is_generated_missevan_cvid,
-    is_generated_manbo_cvid,
+    is_virtual_missevan_cvid as is_generated_missevan_cvid,
+    is_virtual_manbo_cvid as is_generated_manbo_cvid,
     load_combined_map,
     save_combined_map,
     update_combined_cvid_map,
@@ -231,7 +233,7 @@ def build_manbo_cv_name_map() -> dict[int, str]:
             continue
         if not display_name:
             continue
-        mapped.setdefault(int(manbo_id), display_name)
+        mapped.setdefault(legacy_id(manbo_id), display_name)
     return mapped
 
 
@@ -244,7 +246,7 @@ def build_missevan_cv_name_map() -> dict[int, str]:
             continue
         if not display_name:
             continue
-        mapped.setdefault(int(msv_id), display_name)
+        mapped.setdefault(legacy_id(msv_id), display_name)
     return mapped
 
 
@@ -353,18 +355,18 @@ def _apply_missevan_maincv_override(drama_id: str, entries: list[dict], main_ent
     else:
         override_ids = override.get("ids") or []
         extras = override.get("extras") or {}
-    indexed = {int(entry["cv_id"]): entry for entry in entries}
+    indexed = {legacy_id(entry["cv_id"]): entry for entry in entries}
     overridden: list[dict] = []
     for cv_id in override_ids:
         if cv_id in indexed:
             overridden.append(indexed[cv_id])
             continue
-        extra = extras.get(int(cv_id))
+        extra = extras.get(legacy_id(cv_id))
         if extra:
             overridden.append(
                 {
                     "index": len(overridden),
-                    "cv_id": int(cv_id),
+                    "cv_id": legacy_id(cv_id),
                     "display_name": normalize(extra.get("display_name")),
                     "role_name": normalize(extra.get("role_name")),
                     "raw_role_name": normalize(extra.get("role_name")),
@@ -378,7 +380,7 @@ def _missevan_cv_maps(main_entries: list[dict], missevan_cv_name_map: dict[int, 
     cvnames: dict[str, str] = {}
     for entry in main_entries:
         cv_id = str(entry["cv_id"])
-        cvnames[cv_id] = (missevan_cv_name_map or {}).get(int(entry["cv_id"]), entry["display_name"])
+        cvnames[cv_id] = (missevan_cv_name_map or {}).get(legacy_id(entry["cv_id"]), entry["display_name"])
         if entry["role_name"]:
             cvroles[cv_id] = entry["role_name"]
     return cvroles, cvnames
@@ -508,7 +510,7 @@ def _missevan_cv_entries_from_combined_map(
         if cv_id in (None, ""):
             continue
         mapped_name = normalize(payload.get("displayName") or key or display_name)
-        matches.append((str(key), int(cv_id), mapped_name))
+        matches.append((str(key), legacy_id(cv_id), mapped_name))
     return sorted({(key, cv_id, name) for key, cv_id, name in matches})
 
 
@@ -539,7 +541,7 @@ def search_missevan_cv(name: str, requester: MissevanRequester) -> dict | None:
     display_name = normalize(candidate.get("name"))
     if cv_id in (None, "") or not display_name:
         return None
-    return {"cv_id": int(cv_id), "display_name": display_name}
+    return {"cv_id": legacy_id(cv_id), "display_name": display_name}
 
 
 @dataclass(frozen=True)
@@ -562,16 +564,16 @@ def upsert_missevan_cv_map_entry(
     payload = dict(combined_map.get(key) or {})
     existing = payload.get("missevanCvId") or payload.get("cvId")
     replaced_generated_id: int | None = None
-    if existing not in (None, "") and int(existing) != int(cv_id):
+    if existing not in (None, "") and legacy_id(existing) != legacy_id(cv_id):
         if not is_generated_missevan_cvid(existing) or is_generated_missevan_cvid(cv_id):
             return MissevanCvMapUpsertResult("ambiguous", conflicting_keys=(key,))
-        replaced_generated_id = int(existing)
+        replaced_generated_id = legacy_id(existing)
     real_id_keys = [
         str(candidate_key)
         for candidate_key, candidate_payload in combined_map.items()
         if str(candidate_key) != key
         and (candidate_payload.get("missevanCvId") or candidate_payload.get("cvId")) not in (None, "")
-        and int(candidate_payload.get("missevanCvId") or candidate_payload.get("cvId")) == int(cv_id)
+        and legacy_id(candidate_payload.get("missevanCvId") or candidate_payload.get("cvId")) == legacy_id(cv_id)
     ]
     if len(real_id_keys) > 1:
         return MissevanCvMapUpsertResult("ambiguous", conflicting_keys=tuple(sorted(real_id_keys)))
@@ -600,21 +602,23 @@ def upsert_missevan_cv_map_entry(
                 if normalize(alias) and normalize_match(alias) != normalize_match(target_name)
             )
         )
+        if not target.get("cvKey") and payload.get("cvKey"):
+            target["cvKey"] = payload["cvKey"]
         if not target.get("avatar") and payload.get("avatar"):
             target["avatar"] = payload.get("avatar")
         if target.get("manboCvId") in (None, "") and payload.get("manboCvId") not in (None, ""):
             target["manboCvId"] = payload.get("manboCvId")
         target["updatedAt"] = utc_now()
         if replaced_generated_id is not None:
-            upgrade_note = f"自动生成 CVID {replaced_generated_id} 已合并到真实猫耳 CVID {int(cv_id)}"
+            upgrade_note = f"自动生成 CVID {replaced_generated_id} 已合并到真实猫耳 CVID {legacy_id(cv_id)}"
             current_notes = normalize(target.get("notes"))
             if upgrade_note not in current_notes:
                 target["notes"] = f"{current_notes}；{upgrade_note}" if current_notes else upgrade_note
         combined_map[target_key] = target
         del combined_map[key]
         return MissevanCvMapUpsertResult("updated", replaced_generated_id)
-    payload["cvId"] = int(cv_id)
-    payload["missevanCvId"] = int(cv_id)
+    payload["cvId"] = legacy_id(cv_id)
+    payload["missevanCvId"] = legacy_id(cv_id)
     payload.setdefault("manboCvId", None)
     previous_name = normalize(payload.get("displayName") or key)
     next_name = normalize(display_name) or previous_name
@@ -631,7 +635,7 @@ def upsert_missevan_cv_map_entry(
     payload["source"] = "missevan_intro_search"
     payload["updatedAt"] = utc_now()
     if replaced_generated_id is not None:
-        payload["notes"] = f"自动生成 CVID {replaced_generated_id} 已升级为真实猫耳 CVID {int(cv_id)}"
+        payload["notes"] = f"自动生成 CVID {replaced_generated_id} 已升级为真实猫耳 CVID {legacy_id(cv_id)}"
     else:
         payload.setdefault("notes", "")
     combined_map[key] = payload
@@ -682,7 +686,7 @@ def apply_missevan_intro_cv_fallback(
         display_name_only_keys = _missevan_cv_name_only_keys_from_combined_map(display_name, active_map)
         matched_map_key: str | None = None
         if len(existing_matches) == 1:
-            cv_id = int(existing_matches[0]["cv_id"])
+            cv_id = legacy_id(existing_matches[0]["cv_id"])
             mapped_name = normalize(existing_matches[0]["display_name"])
             if len(display_map_matches) == 1:
                 matched_map_key = display_map_matches[0][0]
@@ -715,7 +719,7 @@ def apply_missevan_intro_cv_fallback(
 
         def accept_real_match(found_cv_id: int, found_name: str) -> None:
             nonlocal cv_id, final_name, changed_map, resolution_ambiguous
-            previous_generated_id = int(cv_id) if is_generated_missevan_cvid(cv_id) else None
+            previous_generated_id = legacy_id(cv_id) if is_generated_missevan_cvid(cv_id) else None
             upsert_map = active_map if update_combined_map else dict(active_map)
             upsert_result = upsert_missevan_cv_map_entry(
                 upsert_map,
@@ -800,7 +804,7 @@ def apply_missevan_intro_cv_fallback(
                 found = search_func(search_name)
                 if not found:
                     continue
-                found_cv_id = int(found["cv_id"])
+                found_cv_id = legacy_id(found["cv_id"])
                 found_name = normalize(found.get("display_name") or search_name)
                 if normalize_match(found_name) != normalize_match(search_name):
                     continue
@@ -811,7 +815,7 @@ def apply_missevan_intro_cv_fallback(
                 report_ambiguity(f"search returned conflicting ids={','.join(map(str, sorted(found_by_id)))}")
             elif len(found_by_id) == 1:
                 found = next(iter(found_by_id.values()))
-                accept_real_match(int(found["cv_id"]), normalize(found["display_name"]))
+                accept_real_match(legacy_id(found["cv_id"]), normalize(found["display_name"]))
 
         if cv_id is None and not resolution_ambiguous:
             if update_combined_map and generated_cv_id_allocator is not None:
@@ -833,7 +837,7 @@ def apply_missevan_intro_cv_fallback(
         resolved_entries.append(
             {
                 "index": idx,
-                "cv_id": int(cv_id),
+                "cv_id": legacy_id(cv_id),
                 "display_name": final_name,
                 "role_name": role_name,
                 "raw_role_name": role_name,
@@ -858,7 +862,7 @@ def apply_missevan_intro_cv_fallback(
             final_resolved_entries.append(
                 {
                     "index": len(final_resolved_entries),
-                    "cv_id": int(cv_id),
+                    "cv_id": legacy_id(cv_id),
                     "display_name": entry["display_name"],
                     "role_name": entry["role_name"],
                     "raw_role_name": entry["role_name"],
@@ -898,7 +902,7 @@ def apply_missevan_intro_cv_fallback(
     unresolved_roles = {name: unresolved_roles[name] for name in unresolved_names if name in unresolved_roles}
 
     if final_resolved_entries:
-        updated_node["maincvs"] = [int(entry["cv_id"]) for entry in final_resolved_entries]
+        updated_node["maincvs"] = [legacy_id(entry["cv_id"]) for entry in final_resolved_entries]
         cvroles, cvnames = _missevan_cv_maps(final_resolved_entries, _get_missevan_cv_name_map())
         updated_node["cvnames"] = cvnames
         updated_node["cvroles"] = cvroles
@@ -994,7 +998,7 @@ def build_missevan_base_node(
         "title": normalize(drama.get("name")),
         "dramaId": int(drama["id"]),
         "soundIds": all_sound_ids(info),
-        "maincvs": [int(entry["cv_id"]) for entry in main_entries],
+        "maincvs": [legacy_id(entry["cv_id"]) for entry in main_entries],
         "type": None if drama_type is None else int(drama_type),
         "cvroles": cvroles,
         "cvnames": cvnames,
@@ -1029,7 +1033,7 @@ def merge_missevan_main_cv_entries(sound_infos: list[dict]) -> list[dict]:
     seen_cv_ids: set[int] = set()
     for sound_info in sound_infos:
         for entry in build_missevan_main_cv_entries(sound_info):
-            cv_id = int(entry["cv_id"])
+            cv_id = legacy_id(entry["cv_id"])
             if cv_id in seen_cv_ids:
                 continue
             seen_cv_ids.add(cv_id)
@@ -1041,7 +1045,7 @@ def append_unique_missevan_main_cv_entries(target: list[dict], entries: list[dic
     for entry in entries:
         if stop_at is not None and len(target) >= stop_at:
             return
-        cv_id = int(entry["cv_id"])
+        cv_id = legacy_id(entry["cv_id"])
         if cv_id in seen_cv_ids:
             continue
         seen_cv_ids.add(cv_id)
@@ -1084,7 +1088,7 @@ def apply_missevan_main_cv_entries(node: dict, drama_id: str, base_entries: list
     final_entries = _apply_missevan_maincv_override(drama_id, base_entries, main_entries)
     cvroles, cvnames = _missevan_cv_maps(final_entries, _get_missevan_cv_name_map())
     updated_node = dict(node)
-    updated_node["maincvs"] = [int(entry["cv_id"]) for entry in final_entries]
+    updated_node["maincvs"] = [legacy_id(entry["cv_id"]) for entry in final_entries]
     updated_node["cvroles"] = cvroles
     updated_node["cvnames"] = cvnames
     return updated_node
@@ -1517,13 +1521,13 @@ def apply_manbo_intro_cv_fallback(
             print(f"[漫播] ambiguous intro CV skipped: {name}")
             continue
         mapped = combined_map[keys[0]] if keys else {}
-        cv_id = safe_int(mapped.get("manboCvId")) or None
-        missevan_id = safe_int(mapped.get("missevanCvId") or mapped.get("cvId")) or None
+        cv_id = legacy_id(mapped.get("manboCvId")) or None
+        missevan_id = legacy_id(mapped.get("missevanCvId") or mapped.get("cvId")) or None
         canonical = normalize(mapped.get("displayName") or (keys[0] if keys else name))
         if (cv_id is None or is_generated_manbo_cvid(cv_id)) and search_cv is not None:
             found = search_cv(name) or {}
-            cv_id = safe_int(found.get("manboCvId")) or cv_id
-            missevan_id = safe_int(found.get("missevanCvId")) or missevan_id
+            cv_id = legacy_id(found.get("manboCvId")) or cv_id
+            missevan_id = legacy_id(found.get("missevanCvId")) or missevan_id
         if cv_id is None and generated_cv_id_allocator is not None:
             cv_id, _created = ensure_generated_manbo_cv_entry(
                 combined_map, canonical, allocator=generated_cv_id_allocator,
@@ -1561,19 +1565,19 @@ def build_manbo_record(
     main_entries = select_main_cv_entries(entries, drama_type)
     override_main = MANBO_MAINCV_OVERRIDES.get(str(record.get("dramaId") or ""))
     if override_main:
-        indexed = {int(entry["cv_id"]): entry for entry in entries}
+        indexed = {legacy_id(entry["cv_id"]): entry for entry in entries}
         extras = override_main.get("extras") or {}
         main_entries = []
         for cv_id in override_main.get("ids") or []:
             if cv_id in indexed:
                 main_entries.append(indexed[cv_id])
                 continue
-            extra = extras.get(int(cv_id))
+            extra = extras.get(legacy_id(cv_id))
             if extra:
                 main_entries.append(
                     {
                         "index": len(main_entries),
-                        "cv_id": int(cv_id),
+                        "cv_id": legacy_id(cv_id),
                         "display_name": normalize(extra.get("display_name")),
                         "role_name": normalize(extra.get("role_name")),
                         "raw_role_name": normalize(extra.get("role_name")),
@@ -1597,7 +1601,7 @@ def build_manbo_record(
     updated["catalogName"] = catalog_name
     updated["type"] = drama_type
     updated["genre"] = GENRE_BY_TYPE.get(drama_type, "")
-    updated["mainCvIds"] = [int(entry["cv_id"]) for entry in main_entries]
+    updated["mainCvIds"] = [legacy_id(entry["cv_id"]) for entry in main_entries]
     updated["mainCvNicknames"] = [entry["display_name"] for entry in main_entries]
     updated["mainCvNames"] = [
         normalize((manbo_cv_name_map or {}).get(cv_id)) or updated["mainCvNicknames"][idx]

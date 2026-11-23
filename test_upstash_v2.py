@@ -635,35 +635,8 @@ class UpstashV2Tests(unittest.TestCase):
 
         self.assertEqual(fake.commands, [])
 
-    def test_cv_v2_combines_platforms_with_normalized_field_names(self) -> None:
-        meta, fields = upstash_v2.build_cv_trend_v2({
-            "missevan": {
-                "updated_at": "2026-07-10",
-                "dates": ["2026-07-10"],
-                "cvs": {"CV  A": {"cvName": "CV  A", "samples": {"2026-07-10": {"metrics": {}}}}},
-            },
-            "manbo": {"updated_at": "2026-07-10", "dates": [], "cvs": {}},
-        })
 
-        self.assertIn("missevan:CV A", fields)
-        self.assertEqual(meta["platforms"]["missevan"]["entityCount"], 1)
-
-    def test_cv_v2_merges_names_that_normalize_to_the_same_hash_field(self) -> None:
-        meta, fields = upstash_v2.build_cv_trend_v2({
-            "missevan": {
-                "dates": ["2026-07-03", "2026-07-10"],
-                "cvs": {
-                    "CV A": {"samples": {"2026-07-03": {"metrics": {"totalViewCount": 1}}}},
-                    "CV  A": {"samples": {"2026-07-10": {"metrics": {"totalViewCount": 2}}}},
-                },
-            },
-            "manbo": {"dates": [], "cvs": {}},
-        })
-
-        self.assertEqual(meta["platforms"]["missevan"]["entityCount"], 1)
-        self.assertEqual(set(fields["missevan:CV A"]["samples"]), {"2026-07-03", "2026-07-10"})
-
-    def test_cv_v2_clears_stale_works_when_cv_is_absent_from_current_rankings(self) -> None:
+    def test_cv_merge_clears_stale_works_when_cv_is_absent_from_current_rankings(self) -> None:
         current_meta = {
             "platforms": {
                 "missevan": {
@@ -699,7 +672,7 @@ class UpstashV2Tests(unittest.TestCase):
             }
         }
 
-        _meta, fields = upstash_v2.merge_cv_v2_authoritative(
+        _meta, fields = upstash_v2.merge_cv_trend_authoritative(
             current_meta,
             current_fields,
             candidate_meta,
@@ -710,46 +683,6 @@ class UpstashV2Tests(unittest.TestCase):
         self.assertIn("2026-07-10", fields["missevan:旧CV"]["samples"])
         self.assertEqual(fields["missevan:当前CV"]["works"], [{"dramaId": "100"}])
 
-    def test_cv_republication_replaces_batch_and_preserves_historical_sample_ids(self) -> None:
-        fake = FakeUpstash()
-        history = {
-            "2026-07-03": {"metrics": {"totalViewCount": 10}},
-            "2026-07-10": {"publicationId": "historical", "metrics": {"totalViewCount": 20}},
-        }
-        payloads = {
-            platform: {
-                "updated_at": "2026-07-17T12:00:00+00:00",
-                "dates": [*history, "2026-07-17"],
-                "cvs": {"CV": {"samples": {
-                    **history,
-                    "2026-07-17": {"metrics": {"totalViewCount": 30}},
-                }}},
-            }
-            for platform in ("missevan", "manbo")
-        }
-        upstash_v2.publish_cv_trend_v2(payloads, upstash=fake)
-        self.assertNotIn("publicationId", json.loads(fake.hashes[upstash_v2.CV_TREND_V2_KEY]["__meta__"]))
-
-        for publication_id in ("first-batch", "replacement-batch"):
-            candidate = {
-                platform: {
-                    "updated_at": "2026-07-17T12:00:00+00:00",
-                    "dates": ["2026-07-17"],
-                    "cvs": {"CV": {"samples": {"2026-07-17": {
-                        "publicationId": publication_id,
-                        "metrics": {"totalViewCount": 40},
-                    }}}},
-                }
-                for platform in payloads
-            }
-            upstash_v2.publish_cv_trend_v2(candidate, publication_id=publication_id, upstash=fake)
-            snapshot = fake.hashes[upstash_v2.CV_TREND_V2_KEY]
-            self.assertEqual(json.loads(snapshot["__meta__"])["publicationId"], publication_id)
-            for platform in payloads:
-                samples = json.loads(snapshot[f"{platform}:CV"])["samples"]
-                self.assertEqual(samples["2026-07-17"]["publicationId"], publication_id)
-                for date, sample in history.items():
-                    self.assertEqual(samples[date], sample)
 
     def test_cv_batch_meta_is_not_activated_when_staging_verification_fails(self) -> None:
         class InvalidLengthUpstash(FakeUpstash):
@@ -759,11 +692,11 @@ class UpstashV2Tests(unittest.TestCase):
                 return super().__call__(command)
 
         fake = InvalidLengthUpstash()
-        original = {"__meta__": upstash_v2.compact_json({"version": 2, "publicationId": "old"})}
-        fake.hashes[upstash_v2.CV_TREND_V2_KEY] = original.copy()
+        original = {"__meta__": upstash_v2.compact_json({"version": 3, "publicationId": "old"})}
+        fake.hashes[upstash_v2.CV_TREND_V3_KEY] = original.copy()
         with self.assertRaisesRegex(RuntimeError, "Hash verification failed"):
-            upstash_v2.publish_cv_trend_v2({}, publication_id="new", upstash=fake)
-        self.assertEqual(fake.hashes[upstash_v2.CV_TREND_V2_KEY], original)
+            upstash_v2.publish_cv_trend_v3({}, {}, cvid_map={}, history_date="2026-07-17", generated_at="2026-07-17T00:00:00Z", publication_id="new", upstash=fake)
+        self.assertEqual(fake.hashes[upstash_v2.CV_TREND_V3_KEY], original)
         self.assertNotIn(upstash_v2.RANK_META_KEY, fake.strings)
 
     def test_normal_publish_merges_latest_sample_into_authoritative_v2(self) -> None:

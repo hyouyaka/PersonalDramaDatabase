@@ -7,7 +7,7 @@ from cvid_map_tools import (
     BestEffortAvatarLookup,
     CvAvatarLookup,
     load_generated_missevan_cvid_replacements,
-    UpstashGeneratedMissevanCvIdAllocator,
+    UpstashCvUuidAllocator as UpstashGeneratedMissevanCvIdAllocator,
     seed_generated_missevan_cvid_registry,
     update_combined_cvid_map,
 )

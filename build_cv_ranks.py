@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from cv_identity import CvIdentityIndex, account_id, ensure_cv_identities
+
 from platform_sync import (
     COMBINED_CVID_MAP_PATH,
     GENRE_BY_TYPE,
@@ -37,11 +39,10 @@ from sync_new_drama_ids import CVID_MAP_KEY, MANBO_INFO_KEY, MISSEVAN_INFO_KEY, 
 from sync_remote_libraries import fetch_cvid_map_payload, fetch_info_payload, write_payloads
 from upstash_editor import decode_hgetall
 from upstash_v2 import (
-    CV_TREND_V2_KEY,
-    publish_cv_trend_v2,
+    CV_TREND_V3_KEY,
+    publish_cv_trend_v3,
     publish_hash_snapshot_atomic,
     publish_rank_string,
-    publish_trend_v2_best_effort,
 )
 from update_series_info import id_sort, normalize_title, parse_title, without_cv_metadata
 
@@ -54,7 +55,6 @@ RECORDING_EDITION = re.compile(
     r"[([【]\s*(原版|重[录錄]版)\s*[)\]】]|(?<!\S)(原版|重[录錄]版)(?!\S)"
 )
 PLATFORMS = ("missevan", "manbo")
-CV_TREND_RETENTION_DATES = 50
 
 
 def now_iso() -> str:
@@ -127,9 +127,9 @@ def count_manbo_dramas(store: dict) -> int:
     )
 
 
-def build_map_indexes(cvid_map: dict) -> tuple[dict[int, set[str]], dict[int, set[str]], dict[str, set[str]], dict[str, str]]:
-    missevan_ids: dict[int, set[str]] = {}
-    manbo_ids: dict[int, set[str]] = {}
+def build_map_indexes(cvid_map: dict) -> tuple[dict[str, set[str]], dict[str, set[str]], dict[str, set[str]], dict[str, str]]:
+    missevan_ids: dict[str, set[str]] = {}
+    manbo_ids: dict[str, set[str]] = {}
     names: dict[str, set[str]] = {}
     avatars: dict[str, str] = {}
     for key, payload in (cvid_map or {}).items():
@@ -139,6 +139,7 @@ def build_map_indexes(cvid_map: dict) -> tuple[dict[int, set[str]], dict[int, se
         if not canonical:
             continue
         avatars[canonical] = normalize(payload.get("avatar"))
+        avatars[normalize(payload.get("displayName") or canonical)] = avatars[canonical]
         for candidate in [canonical, payload.get("displayName"), *(payload.get("aliases") or [])]:
             norm = normalize_match(candidate)
             if norm:
@@ -146,25 +147,25 @@ def build_map_indexes(cvid_map: dict) -> tuple[dict[int, set[str]], dict[int, se
         missevan_id = payload.get("missevanCvId", payload.get("cvId"))
         manbo_id = payload.get("manboCvId")
         if missevan_id not in (None, ""):
-            missevan_ids.setdefault(int(missevan_id), set()).add(canonical)
+            missevan_ids.setdefault(account_id(missevan_id), set()).add(canonical)
         if manbo_id not in (None, ""):
-            manbo_ids.setdefault(int(manbo_id), set()).add(canonical)
+            manbo_ids.setdefault(account_id(manbo_id), set()).add(canonical)
     return missevan_ids, manbo_ids, names, avatars
 
 
 def resolve_cv_name(
     raw_name: object,
-    cv_id: int | None,
+    cv_id: str | int | None,
     *,
     platform: str,
-    missevan_ids: dict[int, set[str]],
-    manbo_ids: dict[int, set[str]],
+    missevan_ids: dict[str, set[str]],
+    manbo_ids: dict[str, set[str]],
     name_index: dict[str, set[str]],
 ) -> str:
     candidates: set[str] = set()
     if cv_id is not None:
         by_id = missevan_ids if platform == "missevan" else manbo_ids
-        candidates.update(by_id.get(int(cv_id), set()))
+        candidates.update(by_id.get(account_id(cv_id), set()))
     if len(candidates) == 1:
         return next(iter(candidates))
     norm = normalize_match(raw_name)
@@ -182,7 +183,7 @@ def resolve_cv_name(
 def missevan_main_cv_names(node: dict) -> list[str]:
     return [
         normalize(entry["display_name"])
-        for entry in missevan_main_cv_entries(node)
+        for entry in missevan_main_cv_entries(node, preserve_ids=True)
         if normalize(entry["display_name"])
     ]
 
@@ -205,6 +206,7 @@ def add_work(
     )
     if avatar and not bucket.get("avatar"):
         bucket["avatar"] = normalize(avatar)
+    bucket["cvKey"] = bucket_key if bucket_key is not None else cv_name
     bucket["totalViewCount"] += int(work["viewCount"])
     bucket["works"].append(work)
 
@@ -215,10 +217,11 @@ def collect_missevan_works(
     paid_buckets: dict[str, dict] | None = None,
     store: dict,
     counts: dict,
-    missevan_ids: dict[int, set[str]],
-    manbo_ids: dict[int, set[str]],
+    missevan_ids: dict[str, set[str]],
+    manbo_ids: dict[str, set[str]],
     name_index: dict[str, set[str]],
     avatar_index: dict[str, str],
+    identities: CvIdentityIndex | None = None,
 ) -> None:
     for _series_title, _season_key, node in iter_missevan_nodes(store):
         drama_id = normalize(node.get("dramaId"))
@@ -246,7 +249,8 @@ def collect_missevan_works(
             "viewCount": view_count,
             "isPaid": is_paid,
         }
-        for cv_entry in missevan_main_cv_entries(node):
+        seen_cv_keys = set()
+        for cv_entry in missevan_main_cv_entries(node, preserve_ids=True):
             if cv_entry.get("unknown"):
                 continue
             cv_id = cv_entry["cv_id"]
@@ -259,9 +263,13 @@ def collect_missevan_works(
                 manbo_ids=manbo_ids,
                 name_index=name_index,
             )
-            add_work(buckets, cv_name, dict(base_work), avatar=avatar_index.get(cv_name, ""))
+            cv_key, cv_name, _ = (identities or CvIdentityIndex({})).resolve("missevan", cv_id, cv_name)
+            if cv_key in seen_cv_keys:
+                continue
+            seen_cv_keys.add(cv_key)
+            add_work(buckets, cv_name, dict(base_work), avatar=avatar_index.get(cv_name, ""), bucket_key=cv_key if identities is not None else cv_name)
             if is_paid and paid_buckets is not None:
-                add_work(paid_buckets, cv_name, dict(base_work), avatar=avatar_index.get(cv_name, ""))
+                add_work(paid_buckets, cv_name, dict(base_work), avatar=avatar_index.get(cv_name, ""), bucket_key=cv_key if identities is not None else cv_name)
 
 
 def collect_manbo_works(
@@ -270,10 +278,11 @@ def collect_manbo_works(
     paid_buckets: dict[str, dict] | None = None,
     store: dict,
     counts: dict,
-    missevan_ids: dict[int, set[str]],
-    manbo_ids: dict[int, set[str]],
+    missevan_ids: dict[str, set[str]],
+    manbo_ids: dict[str, set[str]],
     name_index: dict[str, set[str]],
     avatar_index: dict[str, str],
+    identities: CvIdentityIndex | None = None,
 ) -> None:
     for record in store.get("records") or []:
         if not isinstance(record, dict):
@@ -302,7 +311,8 @@ def collect_manbo_works(
             "viewCount": view_count,
             "isPaid": is_paid,
         }
-        for entry in manbo_main_cv_entries(record):
+        seen_cv_keys = set()
+        for entry in manbo_main_cv_entries(record, preserve_ids=True):
             cv_id = entry["cv_id"]
             raw_name = entry["display_name"]
             cv_name = resolve_cv_name(
@@ -313,9 +323,13 @@ def collect_manbo_works(
                 manbo_ids=manbo_ids,
                 name_index=name_index,
             )
-            add_work(buckets, cv_name, dict(base_work), avatar=avatar_index.get(cv_name, ""))
+            cv_key, cv_name, _ = (identities or CvIdentityIndex({})).resolve("manbo", cv_id, cv_name)
+            if cv_key in seen_cv_keys:
+                continue
+            seen_cv_keys.add(cv_key)
+            add_work(buckets, cv_name, dict(base_work), avatar=avatar_index.get(cv_name, ""), bucket_key=cv_key if identities is not None else cv_name)
             if is_paid and paid_buckets is not None:
-                add_work(paid_buckets, cv_name, dict(base_work), avatar=avatar_index.get(cv_name, ""))
+                add_work(paid_buckets, cv_name, dict(base_work), avatar=avatar_index.get(cv_name, ""), bucket_key=cv_key if identities is not None else cv_name)
 
 
 def sort_work_key(work: dict) -> tuple[int, str, str, str]:
@@ -381,6 +395,9 @@ def build_series_count_rankings(
     *, missevan_store: dict, manbo_store: dict, series_info: dict, cvid_map: dict, top_n: int = 30,
     edition_aliases: dict[str, tuple[str, str]] | None = None,
 ) -> dict[str, list[dict]]:
+    ensure_cv_identities(cvid_map)
+    identities = CvIdentityIndex(cvid_map)
+    cv_names = {}
     series_index = build_series_index(series_info)
     missevan_ids, manbo_ids, name_index, avatars = build_map_indexes(cvid_map)
     result: dict[str, list[dict]] = {}
@@ -402,22 +419,24 @@ def build_series_count_rankings(
             )
             if edition_aliases is not None:
                 series_key, title = edition_aliases.get(series_key, (series_key, title))
-            for entry in entries(record):
+            for entry in entries(record, preserve_ids=True):
                 if entry.get("unknown"):
                     continue
                 cv_name = resolve_cv_name(
                     entry["display_name"], entry["cv_id"], platform=platform,
                     missevan_ids=missevan_ids, manbo_ids=manbo_ids, name_index=name_index,
                 )
-                work = buckets.setdefault(cv_name, {}).setdefault(
+                cv_key, cv_name, _ = identities.resolve(platform, entry["cv_id"], cv_name)
+                cv_names[cv_key] = cv_name
+                work = buckets.setdefault(cv_key, {}).setdefault(
                     series_key, {"seriesKey": series_key, "title": title, "dramaIds": set()},
                 )
                 work["dramaIds"].add(drama_id)
         rankings = []
         previous_count = None
         rank = 0
-        for position, (cv_name, works) in enumerate(
-            sorted(buckets.items(), key=lambda item: (-len(item[1]), item[0])), start=1,
+        for position, (cv_key, works) in enumerate(
+            sorted(buckets.items(), key=lambda item: (-len(item[1]), cv_names[item[0]], item[0])), start=1,
         ):
             if len(works) != previous_count:
                 rank = position
@@ -425,7 +444,7 @@ def build_series_count_rankings(
                 break
             previous_count = len(works)
             rankings.append({
-                "rank": rank, "cvName": cv_name, "avatar": avatars.get(cv_name, ""),
+                "rank": rank, "cvKey": cv_key, "cvName": cv_names[cv_key], "avatar": avatars.get(cv_names[cv_key], ""),
                 "seriesCount": len(works),
                 "works": [
                     {
@@ -501,14 +520,15 @@ class RankedDrama:
 def collect_ranked_dramas(
     missevan_store: dict, manbo_store: dict, series_info: dict, cvid_map: dict,
 ) -> list[RankedDrama]:
+    ensure_cv_identities(cvid_map)
+    identities = CvIdentityIndex(cvid_map)
     series_index = build_series_index(series_info)
-    missevan_ids, manbo_ids, _, _ = build_map_indexes(cvid_map)
     result = {}
-    for platform, records, entries, title_key, catalog_names, platform_ids in (
+    for platform, records, entries, title_key, catalog_names in (
         ("missevan", (row for _, _, row in iter_missevan_nodes(missevan_store)),
-         missevan_main_cv_entries, "title", MISSEVAN_CATALOG_NAME_BY_ID, missevan_ids),
+         missevan_main_cv_entries, "title", MISSEVAN_CATALOG_NAME_BY_ID),
         ("manbo", manbo_store.get("records") or [],
-         manbo_main_cv_entries, "name", MANBO_CATALOG_NAME_BY_ID, manbo_ids),
+         manbo_main_cv_entries, "name", MANBO_CATALOG_NAME_BY_ID),
     ):
         for record in records:
             if not isinstance(record, dict):
@@ -522,20 +542,14 @@ def collect_ranked_dramas(
             )
             cast = {}
             mapped = True
-            for entry in entries(record):
+            for entry in entries(record, preserve_ids=True):
                 cv_id, raw_name = entry["cv_id"], entry["display_name"]
                 if entry.get("unknown") or not (cv_id or raw_name):
                     mapped = False
                     continue
-                candidates = platform_ids.get(cv_id, set())
-                canonical = len(candidates) == 1
-                if canonical:
-                    name = next(iter(candidates))
-                    key = f"canonical:{name}"
-                else:
-                    prefix = "猫耳CV" if platform == "missevan" else "漫播CV"
-                    name = raw_name or f"{prefix}_{cv_id}"
-                    key = f"{platform}:id:{cv_id}" if cv_id else f"{platform}:name:{name}"
+                prefix = "猫耳CV" if platform == "missevan" else "漫播CV"
+                name = raw_name or f"{prefix}_{cv_id}"
+                key, name, canonical = identities.resolve(platform, cv_id, name)
                 mapped = mapped and canonical
                 cast.setdefault(key, RankedCv(key, name, normalize(cv_id), canonical))
             drama = RankedDrama(
@@ -730,7 +744,7 @@ def build_combined_series_and_partner_ranks(
     dramas: list[RankedDrama], release_works: dict[tuple[str, str], dict], cvid_map: dict,
     partner_overrides: dict, work_index: dict[str, tuple[str, str]], *, top_n: int,
 ) -> tuple[list[dict], dict[str, list[dict]], list[dict]]:
-    cv_profiles = {normalize(name): cv for name, cv in cvid_map.items() if isinstance(cv, dict)}
+    cv_profiles = {cv["cvKey"]: cv for cv in cvid_map.values() if isinstance(cv, dict) and cv.get("cvKey")}
     cv_by_key = {}
     for drama in dramas:
         for cv in drama.cast.values():
@@ -758,7 +772,7 @@ def build_combined_series_and_partner_ranks(
                 "platform": drama.platform, "dramaId": drama.drama_id, "title": drama.title,
                 "seriesKey": series_key, "genre": drama.genre,
                 "mainCvs": [
-                    {"cvName": cv.name, "cvId": cv.platform_id or None}
+                    {"cvKey": cv.key, "cvName": cv.name, "cvId": cv.platform_id or None}
                     for cv in sorted(drama.cast.values(), key=lambda cv: (cv.name, cv.key))
                 ],
                 "reason": "invalidOverride" if identity in partner_overrides else "missingOverride",
@@ -780,7 +794,7 @@ def build_combined_series_and_partner_ranks(
         {
             "cvKey": key,
             "cvName": cv_by_key[key].name,
-            "avatar": normalize(cv_profiles.get(cv_by_key[key].name, {}).get("avatar"))
+            "avatar": normalize(cv_profiles.get(key, {}).get("avatar"))
             if cv_by_key[key].canonical else "",
             "seriesCount": len(cv_works[key]),
             "works": sorted_works(cv_works[key]),
@@ -796,7 +810,7 @@ def build_combined_series_and_partner_ranks(
         cvs = []
         for key in pair:
             cv = cv_by_key[key]
-            profile = cv_profiles.get(cv.name, {}) if cv.canonical else {}
+            profile = cv_profiles.get(key, {}) if cv.canonical else {}
             missevan_id = profile.get("missevanCvId", profile.get("cvId"))
             manbo_id = profile.get("manboCvId")
             if key.startswith("missevan:id:"):
@@ -837,6 +851,8 @@ def build_cv_rank_outputs(
     series_count_generated_at: str | None = None,
     partner_overrides: dict | None = None,
 ) -> tuple[dict, dict[str, list[dict]], dict[str, list[dict]]]:
+    ensure_cv_identities(cvid_map)
+    identities = CvIdentityIndex(cvid_map)
     dramas = collect_ranked_dramas(missevan_store, manbo_store, series_info, cvid_map)
     edition_aliases, work_index = build_work_indexes(dramas)
     series_count_rankings = build_series_count_rankings(
@@ -857,6 +873,7 @@ def build_cv_rank_outputs(
         manbo_ids=manbo_ids,
         name_index=name_index,
         avatar_index=avatar_index,
+        identities=identities,
     )
     collect_manbo_works(
         manbo_buckets,
@@ -867,6 +884,7 @@ def build_cv_rank_outputs(
         manbo_ids=manbo_ids,
         name_index=name_index,
         avatar_index=avatar_index,
+        identities=identities,
     )
 
     full_rankings = {
@@ -884,6 +902,7 @@ def build_cv_rank_outputs(
 
     payload = {
         "version": 4,
+        "cvIdentityVersion": 1,
         "date": generated_at[:10],
         "generated_at": generated_at,
         "source": {"scope": "all", "platforms": list(PLATFORMS)},
@@ -941,136 +960,6 @@ def build_cv_ranks_payload(
     return payload
 
 
-def _cv_rank_by_name(rankings: list[dict]) -> dict[str, dict]:
-    return {str(item.get("cvName") or ""): item for item in rankings if normalize(item.get("cvName"))}
-
-
-def _copy_cv_trend_sample(sample: object) -> dict | None:
-    if not isinstance(sample, dict):
-        return None
-    metrics = sample.get("metrics")
-    if not isinstance(metrics, dict):
-        metrics = {}
-    copied_metrics = {
-        field: safe_int_or_none(metrics.get(field))
-        for field in ("totalViewCount", "paidViewCount")
-        if metrics.get(field) is not None
-    }
-    if not copied_metrics:
-        return None
-    copied: dict[str, object] = {"metrics": copied_metrics}
-    if sample.get("generated_at") not in (None, ""):
-        copied["generated_at"] = sample.get("generated_at")
-    if sample.get("publicationId") not in (None, ""):
-        copied["publicationId"] = sample["publicationId"]
-    ranks = sample.get("ranks")
-    if isinstance(ranks, dict):
-        copied["ranks"] = {
-            str(key): safe_int_or_none(value)
-            for key, value in ranks.items()
-            if safe_int_or_none(value) is not None
-        }
-    return copied
-
-
-def build_cv_trend_payload(
-    current: dict | None,
-    platform: str,
-    history_date: str,
-    total_rankings: list[dict],
-    paid_rankings: list[dict],
-    *,
-    generated_at: str,
-    publication_id: str | None = None,
-    retention_dates: int = CV_TREND_RETENTION_DATES,
-) -> dict:
-    if platform not in PLATFORMS:
-        raise ValueError(f"Unsupported platform: {platform}")
-
-    payload = current if isinstance(current, dict) else {}
-    dates = {str(value) for value in (payload.get("dates") or []) if value not in (None, "")}
-    dates.add(history_date)
-    kept_dates = sorted(dates)[-retention_dates:]
-    kept_date_set = set(kept_dates)
-
-    cvs: dict[str, dict] = {}
-    for cv_name, entry in (payload.get("cvs") or {}).items():
-        if not isinstance(entry, dict):
-            continue
-        samples = {}
-        for date_key, sample in (entry.get("samples") or {}).items():
-            date_text = str(date_key)
-            if date_text not in kept_date_set:
-                continue
-            copied_sample = _copy_cv_trend_sample(sample)
-            if copied_sample is not None:
-                samples[date_text] = copied_sample
-        if not samples:
-            continue
-        cv_name_text = str(entry.get("cvName") or cv_name)
-        copied = {
-            "cvName": cv_name_text,
-            "samples": samples,
-        }
-        avatar = normalize(entry.get("avatar"))
-        if avatar:
-            copied["avatar"] = avatar
-        works = entry.get("works")
-        if isinstance(works, list):
-            copied["works"] = works
-        cvs[cv_name_text] = copied
-
-    total_by_name = _cv_rank_by_name(total_rankings)
-    paid_by_name = _cv_rank_by_name(paid_rankings)
-    for cv_name, total_item in total_by_name.items():
-        if not cv_name:
-            continue
-        paid_item = paid_by_name.get(cv_name)
-        entry = cvs.get(cv_name, {"cvName": cv_name, "samples": {}})
-        entry["cvName"] = cv_name
-        avatar = normalize(total_item.get("avatar"))
-        if avatar:
-            entry["avatar"] = avatar
-        else:
-            entry.setdefault("avatar", normalize(entry.get("avatar")))
-        entry["works"] = list(total_item.get("works") or [])
-        samples = entry.setdefault("samples", {})
-        if not isinstance(samples, dict):
-            samples = {}
-            entry["samples"] = samples
-        ranks = {"total": safe_int_or_none(total_item.get("rank"))}
-        if paid_item is not None and safe_int_or_none(paid_item.get("rank")) is not None:
-            ranks["paid"] = safe_int_or_none(paid_item.get("rank"))
-        samples[history_date] = {
-            "generated_at": generated_at,
-            "metrics": {
-                "totalViewCount": int(total_item.get("totalViewCount") or 0),
-                "paidViewCount": int((paid_item or {}).get("totalViewCount") or 0),
-            },
-            "ranks": {key: value for key, value in ranks.items() if value is not None},
-        }
-        if publication_id is not None:
-            samples[history_date]["publicationId"] = publication_id
-        cvs[cv_name] = entry
-
-    dates = sorted(
-        {
-            str(date_key)
-            for entry in cvs.values()
-            for date_key in (entry.get("samples") or {})
-            if str(date_key) in kept_date_set
-        }
-    )
-    return {
-        "version": 1,
-        "kind": "cv",
-        "platform": platform,
-        "updated_at": generated_at,
-        "dates": dates,
-        "cvs": cvs,
-    }
-
-
 def upload_cv_ranks(payload: dict, *, upstash=upstash_request) -> None:
     encoded = json.dumps(payload, ensure_ascii=False)
     key = "ranks:cv:latest"
@@ -1090,25 +979,14 @@ def upload_cv_trends(
     publication_id: str,
     full_rankings: dict[str, list[dict]],
     full_paid_rankings: dict[str, list[dict]],
+    cvid_map: dict | None = None,
     upstash=upstash_request,
-) -> dict[str, dict]:
-    v2_payloads = {
-        platform: build_cv_trend_payload(
-            None,
-            platform,
-            history_date,
-            full_rankings.get(platform) or [],
-            full_paid_rankings.get(platform) or [],
-            generated_at=generated_at,
-            publication_id=publication_id,
-        )
-        for platform in PLATFORMS
-    }
-    publish_trend_v2_best_effort(
-        CV_TREND_V2_KEY,
-        lambda: publish_cv_trend_v2(v2_payloads, publication_id=publication_id, upstash=upstash),
+) -> None:
+    publish_cv_trend_v3(
+        full_rankings, full_paid_rankings, cvid_map=cvid_map or {},
+        history_date=history_date, generated_at=generated_at,
+        publication_id=publication_id, upstash=upstash,
     )
-    return v2_payloads
 
 
 def remove_cv_trend_samples_by_generated_at(payload: dict, generated_at: str) -> tuple[dict, dict[str, int]]:
@@ -1161,19 +1039,19 @@ def cleanup_remote_cv_trends_by_generated_at(
     target_dir = backup_dir or (ROOT / "recovery_backups")
     target_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    raw_snapshot = upstash(["HGETALL", CV_TREND_V2_KEY])
+    raw_snapshot = upstash(["HGETALL", CV_TREND_V3_KEY])
     decoded = decode_hgetall(raw_snapshot)
     meta_raw = decoded.pop("__meta__", None)
     if not isinstance(meta_raw, str):
-        raise RuntimeError(f"Refusing to clean {CV_TREND_V2_KEY}: __meta__ is missing")
+        raise RuntimeError(f"Refusing to clean {CV_TREND_V3_KEY}: __meta__ is missing")
     try:
         meta = json.loads(meta_raw)
         fields = {field: json.loads(value) for field, value in decoded.items()}
     except (TypeError, ValueError) as exc:
-        raise RuntimeError(f"Refusing to clean {CV_TREND_V2_KEY}: invalid JSON") from exc
-    if not isinstance(meta, dict) or int(meta.get("version") or 0) != 2 or meta.get("kind") != "cv":
-        raise RuntimeError(f"Refusing to clean {CV_TREND_V2_KEY}: invalid metadata")
-    backup_path = target_dir / f"{stamp}_{CV_TREND_V2_KEY.replace(':', '-')}.json"
+        raise RuntimeError(f"Refusing to clean {CV_TREND_V3_KEY}: invalid JSON") from exc
+    if not isinstance(meta, dict) or int(meta.get("version") or 0) != 3 or meta.get("kind") != "cv":
+        raise RuntimeError(f"Refusing to clean {CV_TREND_V3_KEY}: invalid metadata")
+    backup_path = target_dir / f"{stamp}_{CV_TREND_V3_KEY.replace(':', '-')}.json"
     backup_path.write_text(json.dumps(raw_snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
     results: dict[str, dict[str, object]] = {}
     for platform in PLATFORMS:
@@ -1211,22 +1089,22 @@ def cleanup_remote_cv_trends_by_generated_at(
         default="",
     )
     publish_hash_snapshot_atomic(
-        CV_TREND_V2_KEY,
+        CV_TREND_V3_KEY,
         meta,
         fields,
         upstash=upstash,
         expected_meta_raw=meta_raw,
     )
-    verified = decode_hgetall(upstash(["HGETALL", CV_TREND_V2_KEY]))
+    verified = decode_hgetall(upstash(["HGETALL", CV_TREND_V3_KEY]))
     verified_meta_raw = verified.get("__meta__")
     if not isinstance(verified_meta_raw, str):
-        raise RuntimeError(f"Failed to verify {CV_TREND_V2_KEY}: __meta__ is missing")
+        raise RuntimeError(f"Failed to verify {CV_TREND_V3_KEY}: __meta__ is missing")
     try:
         verified_meta = json.loads(verified_meta_raw)
     except (TypeError, ValueError) as exc:
-        raise RuntimeError(f"Failed to verify {CV_TREND_V2_KEY}: invalid __meta__") from exc
+        raise RuntimeError(f"Failed to verify {CV_TREND_V3_KEY}: invalid __meta__") from exc
     if not isinstance(verified_meta, dict):
-        raise RuntimeError(f"Failed to verify {CV_TREND_V2_KEY}: invalid __meta__ shape")
+        raise RuntimeError(f"Failed to verify {CV_TREND_V3_KEY}: invalid __meta__ shape")
     residual = 0
     for field, raw in verified.items():
         if field == "__meta__":
@@ -1240,7 +1118,7 @@ def cleanup_remote_cv_trends_by_generated_at(
             if isinstance(sample, dict) and sample.get("generated_at") == generated_at
         )
     if residual:
-        raise RuntimeError(f"Failed to clean {CV_TREND_V2_KEY}: {residual} matching samples remain")
+        raise RuntimeError(f"Failed to clean {CV_TREND_V3_KEY}: {residual} matching samples remain")
     for platform in PLATFORMS:
         prefix = f"{platform}:"
         platform_meta = ((verified_meta.get("platforms") or {}).get(platform) or {})
@@ -1254,14 +1132,14 @@ def cleanup_remote_cv_trends_by_generated_at(
             or platform_meta.get("updated_at") != expected["updated_at"]
         ):
             raise RuntimeError(
-                f"Failed to verify {CV_TREND_V2_KEY}: inconsistent {platform} metadata"
+                f"Failed to verify {CV_TREND_V3_KEY}: inconsistent {platform} metadata"
             )
     expected_top_updated = max(
         (normalize(results[platform]["updated_at"]) for platform in PLATFORMS if normalize(results[platform]["updated_at"])),
         default="",
     )
     if expected_top_updated and verified_meta.get("updated_at") != expected_top_updated:
-        raise RuntimeError(f"Failed to verify {CV_TREND_V2_KEY}: inconsistent updated_at")
+        raise RuntimeError(f"Failed to verify {CV_TREND_V3_KEY}: inconsistent updated_at")
     return results
 
 
@@ -1335,6 +1213,16 @@ def build_and_publish_cv_ranks(
     )
     series_info = fetch_remote_series_info(upstash=upstash)
     partner_overrides = fetch_partner_overrides(upstash=upstash)
+    if upload:
+        from upstash_v2 import publish_cvid_map
+        source_raw = upstash(["GET", CVID_MAP_KEY])
+        if not isinstance(source_raw, str) or json.loads(source_raw) != cvid_map:
+            raise RuntimeError("CV map changed since rank inputs were loaded; retry the build")
+        if ensure_cv_identities(cvid_map):
+            publish_cvid_map(cvid_map, upstash=upstash, source_encoded=source_raw)
+            save_json(cvid_map_path, cvid_map)
+    elif ensure_cv_identities(cvid_map):
+        save_json(cvid_map_path, cvid_map)
     payload, full_rankings, full_paid_rankings = build_cv_rank_outputs(
         missevan_store=load_json(missevan_info_path, {}),
         manbo_store=load_json(manbo_info_path, {"records": []}),
@@ -1355,6 +1243,7 @@ def build_and_publish_cv_ranks(
             publication_id=payload["publicationId"],
             full_rankings=full_rankings,
             full_paid_rankings=full_paid_rankings,
+            cvid_map=cvid_map,
             upstash=upstash,
         )
     return payload

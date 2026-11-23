@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from cv_identity import account_id, legacy_id
+
 import json
 import random
 import re
@@ -430,7 +432,7 @@ def manbo_main_cv_display_names(record: dict | None) -> list[str]:
     return resolved
 
 
-def manbo_main_cv_entries(record: dict) -> list[dict]:
+def manbo_main_cv_entries(record: dict, *, preserve_ids: bool = False) -> list[dict]:
     """Keep aligned name-only leads without inventing a Manbo account ID."""
     if manbo_has_unknown_main_cv(record):
         return []
@@ -441,7 +443,7 @@ def manbo_main_cv_entries(record: dict) -> list[dict]:
     missevan_ids = record.get("mainCvMissevanIds") or []
     entries = []
     for index in range(max(len(ids), len(names), len(nicknames))):
-        cv_id = safe_int(ids[index]) if index < len(ids) else 0
+        cv_id = (account_id(ids[index]) if preserve_ids else legacy_id(ids[index])) if index < len(ids) else None
         name = normalize(names[index]) if index < len(names) else ""
         nickname = normalize(nicknames[index]) if index < len(nicknames) else ""
         if not (name or nickname or cv_id):
@@ -451,7 +453,7 @@ def manbo_main_cv_entries(record: dict) -> list[dict]:
             "display_name": name or nickname,
             "nickname": nickname or name,
             "role_name": normalize(roles[index]) if index < len(roles) else "",
-            "missevan_cv_id": (safe_int(missevan_ids[index]) or None) if index < len(missevan_ids) else None,
+            "missevan_cv_id": ((account_id(missevan_ids[index]) if preserve_ids else legacy_id(missevan_ids[index])) or None) if index < len(missevan_ids) else None,
         })
     return entries
 
@@ -480,7 +482,7 @@ def safe_int(value: object, default: int = 0) -> int:
         return default
 
 
-def missevan_main_cv_entries(node: dict) -> list[dict]:
+def missevan_main_cv_entries(node: dict, *, preserve_ids: bool = False) -> list[dict]:
     """Return numeric and name-only Missevan main CVs in display order."""
     if missevan_has_unknown_main_cv(node):
         return [
@@ -500,10 +502,10 @@ def missevan_main_cv_entries(node: dict) -> list[dict]:
 
     for raw_cv_id in node.get("maincvs") or []:
         try:
-            cv_id = int(raw_cv_id)
+            cv_id = account_id(raw_cv_id) if preserve_ids else legacy_id(raw_cv_id)
         except (TypeError, ValueError):
             continue
-        if cv_id in seen_ids:
+        if not cv_id or cv_id in seen_ids:
             continue
         seen_ids.add(cv_id)
         display_name = normalize(cvnames.get(str(raw_cv_id)) or cvnames.get(str(cv_id)))
@@ -544,7 +546,7 @@ def missevan_main_cv_entries(node: dict) -> list[dict]:
 
 
 def replace_missevan_main_cv_ids(store: dict, replacements: dict[int, int]) -> set[str]:
-    normalized_replacements = {int(old): int(new) for old, new in replacements.items() if int(old) != int(new)}
+    normalized_replacements = {legacy_id(old): legacy_id(new) for old, new in replacements.items() if account_id(old) != account_id(new)}
     affected_drama_ids: set[str] = set()
     if not normalized_replacements:
         return affected_drama_ids
@@ -557,7 +559,7 @@ def replace_missevan_main_cv_ids(store: dict, replacements: dict[int, int]) -> s
         cvroles = dict(node.get("cvroles") or {})
         for raw_id in original_ids:
             try:
-                old_id = int(raw_id)
+                old_id = legacy_id(raw_id)
             except (TypeError, ValueError):
                 continue
             new_id = normalized_replacements.get(old_id, old_id)

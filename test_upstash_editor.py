@@ -450,11 +450,11 @@ class UpstashEditorTests(unittest.TestCase):
 
     def test_hash_save_builds_digest_meta_and_preserves_other_cv_fields(self) -> None:
         fake = FakeUpstash()
-        key = "ranks:trend:cv:v2"
+        key = "ranks:trend:cv:v3"
         fake.hashes[key] = {
             "__meta__": upstash_editor.compact_json(
                 {
-                    "version": 2,
+                    "version": 3,
                     "kind": "cv",
                     "updated_at": "old",
                     "platforms": {
@@ -463,11 +463,11 @@ class UpstashEditorTests(unittest.TestCase):
                     },
                 }
             ),
-            "missevan:甲": upstash_editor.compact_json(
-                {"version": 2, "cvName": "甲", "samples": {"2026-07-10": {"metrics": {}}}}
+            "missevan:missevan:id:1": upstash_editor.compact_json(
+                {"version": 3, "cvKey": "missevan:id:1", "cvName": "甲", "works": [], "samples": {"2026-07-10": {"cvKey": "missevan:id:1", "generated_at": "old", "publicationId": "historical", "metrics": {}, "ranks": {}}}}
             ),
-            "manbo:乙": upstash_editor.compact_json(
-                {"version": 2, "cvName": "乙", "samples": {"2026-07-10": {"metrics": {}}}}
+            "manbo:manbo:id:2": upstash_editor.compact_json(
+                {"version": 3, "cvKey": "manbo:id:2", "cvName": "乙", "works": [], "samples": {"2026-07-10": {"cvKey": "manbo:id:2", "generated_at": "old", "publicationId": "historical", "metrics": {}, "ranks": {}}}}
             ),
         }
         fake.strings["ranks:meta"] = upstash_editor.compact_json(
@@ -479,7 +479,7 @@ class UpstashEditorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             loaded = upstash_editor.load_resource(key, upstash=fake, backup_root=Path(temp_dir))
         payload = dict(loaded.payload)
-        payload["missevan:甲"]["samples"]["2026-07-17"] = {"metrics": {"totalViewCount": 2}}
+        payload["missevan:missevan:id:1"]["samples"]["2026-07-17"] = {"cvKey": "missevan:id:1", "generated_at": "new", "publicationId": "current", "metrics": {"totalViewCount": 2}, "ranks": {}}
         with patch.object(upstash_editor, "_write_local_mirrors"):
             result = upstash_editor.save_resource(
                 loaded,
@@ -487,7 +487,7 @@ class UpstashEditorTests(unittest.TestCase):
                 upstash=fake,
                 now=lambda: "2026-07-20T12:00:00+00:00",
             )
-        self.assertIn("manbo:乙", fake.hashes[key])
+        self.assertIn("manbo:manbo:id:2", fake.hashes[key])
         meta = json.loads(fake.hashes[key]["__meta__"])
         self.assertEqual(meta["contentSha1"], result.content_sha1)
         self.assertEqual(meta["entityCount"], 2)

@@ -327,7 +327,7 @@ python sync_new_drama_ids.py --purge-non-target-records --apply
 详情命中出品方屏蔽后，append 会将明确拒绝的 ID 传入 CAS 合并发布，删除远端旧 info；普通详情失败或本地记录缺失不会触发远端删除。
 该规则用于入库，不改变独立的官方榜单展示策略。
 
-Info、普通榜、CV 榜及 trend v2 现为唯一权威数据：正文与 Meta 使用 CAS 原子发布，冲突会重试，发布或校验失败会使任务失败。运行时不会读取或更新已退役的 info/trend/watchcount key；退役数据的人工回滚副本保存在本地 `recovery_backups`，不作为运行时依赖。
+Info v2、普通榜及其 trend v2、CV 榜及其 trend v3 现为权威数据：正文与 Meta 使用 CAS 原子发布，冲突会重试，发布或校验失败会使任务失败。运行时不会读取或更新已退役的 info/trend/watchcount key；退役数据的人工回滚副本保存在本地 `recovery_backups`，不作为运行时依赖。
 
 用法：
 
@@ -418,11 +418,13 @@ python build_cv_ranks.py --no-upload
 #### 双平台汇总与搭档榜
 
 每次运行 `build_cv_ranks.py` 都会生成新的 UUID `publicationId`，写入本地及远端
-`ranks:cv:latest` 顶层、两个平台的当期 CV 趋势样本，以及 `ranks:trend:cv:v2`
+`ranks:cv:latest` 顶层、两个平台的当期 CV 趋势样本，以及 `ranks:trend:cv:v3`
 的 `__meta__`。同一采样时间重发也使用新标识；历史样本保留原有标识，旧样本不补填。
 榜单和趋势沿用各自的 CAS 原子发布，网页端须等同批次的趋势及所需平台当期样本到齐后
 才显示周增。旧快照仍可展示榜单和历史趋势，缺少匹配标识时周增显示「暂无数据」。
 部署后运行一次 `python build_cv_ranks.py` 可按远端最新播放量补发榜单和趋势，无需重新抓取播放量。
+
+CV 趋势仅发布 v3，field 使用 `<平台>:<cvKey>`，快照带 `cvIdentityVersion: 1`。发布和维护入口不再读取或写入 CV trend v2，也不再执行自动迁移回退。现存远端 v2 数据和本地备份暂时保留，后续删除 v2 不会被榜单发布重新创建。既有 v3 历史及迁移审计标记继续保留；本期重发只替换对应日期样本，其他日期按 50 个采样日期的保留策略合并。
 
 - `rankings.combined` 和 `paidRankings.combined` 按统一 CV 合计猫耳和漫播的播放量，再取前 30 名。明细和播放量按平台及 `dramaId` 分列，付费资格按各条剧目记录判定。`workCount` 只统计该 CV 在各榜实际纳入的唯一作品。双平台作品数、播放量和搭档榜共用 `cvKey` 区分 CV。平台 ID 唯一命中 CVID 映射时使用规范身份，其余按平台及 ID 区分，缺少 ID 时按平台及显示名区分。
 - `seriesCountRankings.combined` 先按系列表归并各平台的季度，再匹配两平台的作品。规范化标题、媒介、题材及整组规范主役一致，且两边各有唯一候选时，只计 1 部。同一平台明确标注的原版和重录版，在标题、媒介、题材和整组主役一致且候选唯一时归为一部。作品数榜和搭档榜按同一归并结果计数。作品明细的 `dramaIds` 按平台列出该 CV 实际参与的剧目。对应的 `seriesCountMeta.combined` 记录两平台源库版本。

@@ -118,7 +118,9 @@ flowchart LR
 #### `missevan&manbo-cvid-map.json`
 
 - 双平台 CV 的统一映射表
-- 记录 canonical 名称、`missevanCvId`、`manboCvId`、`displayName`、`aliases`、`notes`、`updatedAt`
+- 记录 canonical 名称、`cvKey`、`missevanCvId`、`manboCvId`、`displayName`、`aliases`、`notes`、`updatedAt`
+- 已确认档案的 `cvKey` 为只分配一次的 `person:<uuid>`；改名保持该键并保留旧名为 alias。平台 CVID 保存为字符串，反查时同时匹配平台与完整 ID。
+- 新 CV 需要自建 ID 时，猫耳、漫播共享一个 UUID，并以 `person:<同一uuid>` 作为个人键；已有真实平台 ID 保留。旧整数自建 ID 仍支持读取和升级。
 - 当前策略是“保守更新”：只补充 ID 和 alias，不自动合并歧义记录
 
 #### `drama-series-info.json`
@@ -386,16 +388,22 @@ CV 聚合也会跳过旧源库中残留的入库排除记录。
 - `ranks:latest`：合并后的完整最新 store
 - `ranks:trend:missevan:v2` / `ranks:trend:manbo:v2`：普通榜单趋势 Hash
 - `ranks:trend:peak:missevan:v2`：猫耳巅峰榜趋势 Hash
-- `ranks:cv:latest`：最新 CV 榜单
-- `ranks:trend:cv:v2`：按平台和规范化 CV 名分 field 的趋势 Hash，保留最近 50 个日期样本
+- `ranks:cv:latest`：最新 CV 榜单，带 `cvIdentityVersion: 1`；播放、付费、勤劳的单平台及汇总行和搭档成员均带 `cvKey`
+- `ranks:trend:cv:v3`：按平台和 `cvKey` 分 field 的趋势 Hash，保留最近 50 个日期样本
+- `ranks:trend:cv:v2`：旧姓名趋势，已停止读写，远端历史暂时保留待后续删除；榜单发布和维护入口不会重新创建此 key
 - `ranks:meta`：普通榜单与 CV 榜单的发布完成时间
 
-v2 趋势层由 `upstash_v2.py` 生成并以 staging Hash + `RENAME` 原子替换：
+趋势层由 `upstash_v2.py` 生成并以 staging Hash + `RENAME` 原子替换：
 
 - `ranks:trend:missevan:v2` / `ranks:trend:manbo:v2`：field 为 dramaId，保留 45 天完整样本和更早一次 `lastRank`
 - `ranks:trend:peak:missevan:v2`：field 为系列名，保留 45 天完整样本和更早一次 `lastRank`
-- `ranks:trend:cv:v2`：field 为 `missevan:{规范化CV名}` 或 `manbo:{规范化CV名}`，保留 50 个周采样日期
+- `ranks:trend:cv:v3`：field 为 `<平台>:<cvKey>`，保留 50 个周采样日期；总播放与付费播放按同一个键合并。记录带 `cvKey` 和当前 `works`，每个样本带 `cvKey`、`generated_at`、`publicationId`、`metrics`、`ranks`。
+- 未映射的平台 CVID 使用 `missevan:id:<id>` 或 `manbo:id:<id>`；后续确认身份时，v3 历史随该平台 ID 并入个人键。只有姓名的记录继续显示在榜单中，不进入个人趋势。
 - 每个 Hash 均含 `__meta__`；staging 设置 24 小时 TTL，按最多 100 个 field 分批 `HSET`，通过 `HLEN` 和抽样 JSON 校验后，以同一 Lua 操作执行 `RENAME` 与 `PERSIST`，避免稳定 key 继承 staging TTL
+
+CV 身份的一次性远端迁移已完成，消费端已确认读取正常，独立迁移脚本已删除。正常执行 `build_cv_ranks.py` 继续补齐新档案身份，只更新 latest 和 v3，不再执行 v2 兼容写入或自动迁移回退。已有的 v3 历史、`__meta__.migratedFrom` 及其他迁移审计标记保持保留。删除 v2 后，后续发布仍只创建或更新 v3；手动样本清理和编辑器也仅操作 CV trend v3。
+
+历史迁移只接受可通过对应平台档案唯一确认的姓名或 alias。无法确认的字段留在 v2，并列入 `__meta__.migrationSkippedFields`，原有备份和验证报告保留。旧样本已有的 `publicationId`、时间、指标和榜位原样保留；缺失的时间和发布 ID 以 `null` 表示。同一身份同日的重复 alias 样本不累加；相同时间但指标冲突时终止迁移，不激活 v3。
 
 旧聚合 String 的回填入口已从 v2-only 版本移除；任何恢复操作必须使用部署前备份和兼容标签。
 

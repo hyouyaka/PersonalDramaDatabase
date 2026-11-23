@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from cv_identity import account_id, ensure_cv_identities, is_uuid, trend_key
+
 import hashlib
 import json
 import os
@@ -182,10 +184,10 @@ RESOURCE_SPECS: dict[str, ResourceSpec] = {
             rank_scope="normal",
         ),
         ResourceSpec(
-            "ranks:trend:cv:v2",
-            "合并 CV 趋势榜",
+            "ranks:trend:cv:v3",
+            "合并 CV 身份趋势榜",
             "hash",
-            "trend_cv",
+            "trend_cv_v3",
             rank_scope="cv",
         ),
     )
@@ -484,8 +486,8 @@ def validate_payload(spec: ResourceSpec, payload: object, *, hash_meta: dict | N
         root = _require_dict(payload, spec.key)
         if len(root) < 50:
             raise ValueError(f"{spec.key} contains fewer than 50 records.")
-        missevan_ids: dict[int, str] = {}
-        manbo_ids: dict[int, str] = {}
+        missevan_ids: dict[str, str] = {}
+        manbo_ids: dict[str, str] = {}
         for field, record in root.items():
             name = str(field).strip()
             if not name:
@@ -501,13 +503,14 @@ def validate_payload(spec: ResourceSpec, payload: object, *, hash_meta: dict | N
             for id_field in ("cvId", "missevanCvId", "manboCvId"):
                 value = item.get(id_field)
                 if value not in (None, ""):
-                    _validate_numeric_id(value, f"{spec.key}[{field!r}].{id_field}")
+                    if not is_uuid(value):
+                        _validate_numeric_id(value, f"{spec.key}[{field!r}].{id_field}")
             cv_id = item.get("cvId")
             missevan_cv_id = item.get("missevanCvId")
             if (
                 cv_id not in (None, "")
                 and missevan_cv_id not in (None, "")
-                and int(cv_id) != int(missevan_cv_id)
+                and account_id(cv_id) != account_id(missevan_cv_id)
             ):
                 raise ValueError(
                     f"{spec.key}[{field!r}].cvId and missevanCvId must match."
@@ -521,7 +524,7 @@ def validate_payload(spec: ResourceSpec, payload: object, *, hash_meta: dict | N
             ):
                 if value in (None, ""):
                     continue
-                numeric_id = int(value)
+                numeric_id = account_id(value)
                 previous = seen.get(numeric_id)
                 if previous is not None:
                     raise ValueError(
@@ -549,9 +552,10 @@ def validate_payload(spec: ResourceSpec, payload: object, *, hash_meta: dict | N
                 for item in records:
                     record = _require_dict(item, f"{spec.key}.{group}.{platform} item")
                     name = str(record.get("cvName") or "").strip()
-                    if not name or name in names:
+                    identity = record.get("cvKey") or name
+                    if not name or identity in names:
                         raise ValueError(f"Missing or duplicate cvName in {spec.key}.{group}.{platform}: {name!r}")
-                    names.add(name)
+                    names.add(identity)
         return
     if spec.kind == "ranks_weekly_growth_latest":
         root = _require_dict(payload, spec.key)
@@ -627,12 +631,21 @@ def validate_payload(spec: ResourceSpec, payload: object, *, hash_meta: dict | N
         elif spec.kind == "trend_peak":
             if str(item.get("name") or "") != str(field):
                 raise ValueError(f"{spec.key}[{field}].name does not match its Hash field.")
-        elif spec.kind == "trend_cv":
-            platform, separator, cv_name = str(field).partition(":")
+        elif spec.kind == "trend_cv_v3":
+            platform, separator, cv_key = str(field).partition(":")
             if separator != ":" or platform not in ("missevan", "manbo"):
                 raise ValueError(f"Invalid CV trend field: {field}")
-            if str(item.get("cvName") or "").strip() != cv_name:
-                raise ValueError(f"{spec.key}[{field}].cvName does not match its Hash field.")
+            key = item.get("cvKey")
+            if not trend_key(key) or key != cv_key or (not key.startswith("person:") and not key.startswith(f"{platform}:id:")):
+                raise ValueError(f"Invalid CV trend identity: {field}")
+            if not isinstance(item.get("works"), list):
+                raise ValueError(f"{spec.key}[{field}].works must be a JSON array.")
+            samples = _require_dict(item.get("samples"), f"{spec.key}[{field}].samples")
+            for sample in samples.values():
+                if not isinstance(sample, dict) or sample.get("cvKey") != key:
+                    raise ValueError(f"Invalid CV sample identity: {field}")
+                if any(required not in sample for required in ("generated_at", "publicationId", "metrics", "ranks")):
+                    raise ValueError(f"Incomplete CV sample: {field}")
         if not isinstance(item.get("samples"), dict):
             raise ValueError(f"{spec.key}[{field}].samples must be a JSON object.")
     if hash_meta is not None and not isinstance(hash_meta, dict):
@@ -714,7 +727,7 @@ def _normalize_hash_payload(
     encoded_fields = {str(field): compact_json(value) for field, value in sorted(fields.items())}
     digest, byte_count = hash_content_stats(encoded_fields)
     meta = dict(previous_meta)
-    meta["version"] = 2
+    meta["version"] = 3 if spec.kind == "trend_cv_v3" else 2
     meta["updated_at"] = now
     meta["revision"] = uuid.uuid4().hex
     meta["contentSha1"] = digest
@@ -730,7 +743,7 @@ def _normalize_hash_payload(
         )
         retention = int(meta.get("retentionDates") or 45)
         meta["dates"] = dates[-retention:]
-    elif spec.kind == "trend_cv":
+    elif spec.kind == "trend_cv_v3":
         platforms_meta = meta.get("platforms")
         if not isinstance(platforms_meta, dict):
             platforms_meta = {}
@@ -827,6 +840,8 @@ def _generated_missevan_cvid_identities(payload: object, *, platform: str = "mis
             value = item.get("cvId")
         if value in (None, ""):
             continue
+        if is_uuid(value):
+            continue  # Stable cvKey validation protects UUID identities across renames.
         cv_id = int(value)
         minimum, maximum = ((GENERATED_MANBO_CVID_MIN, GENERATED_MANBO_CVID_MAX) if platform == "manbo"
                             else (GENERATED_MISSEVAN_CVID_MIN, GENERATED_MISSEVAN_CVID_MAX))
@@ -965,6 +980,9 @@ def save_resource(
     if spec.redis_type == "string":
         if loaded.raw_string is None:
             raise RuntimeError("Loaded String resource is missing its original body.")
+        if spec.kind == "cvid_map":
+            payload = json.loads(json.dumps(payload, ensure_ascii=False))
+            ensure_cv_identities(payload, _parse_string_payload(spec, loaded.raw_string))
         normalized, encoded = _normalize_string_payload(spec, payload, timestamp)
         digest = sha1_text(encoded)
         byte_count = len(encoded.encode("utf-8"))

@@ -51,6 +51,18 @@ class CommandBuilderTests(unittest.TestCase):
 
 
 class UpstashEditorStateTests(unittest.TestCase):
+    def test_cv_v3_edit_cannot_change_the_hash_identity_key(self) -> None:
+        identity = "missevan:missevan:id:1"
+        page = SimpleNamespace(
+            current_identity=identity,
+            current_collection=lambda: SimpleNamespace(container={identity: {}}, identity_field=None),
+            _parse_detail=lambda: {"cvKey": "missevan:id:2", "cvName": "Name"},
+            loaded=SimpleNamespace(spec=SimpleNamespace(kind="trend_cv_v3")),
+        )
+        with patch.object(commen_tasks_gui.QMessageBox, "warning") as warning:
+            self.assertFalse(commen_tasks_gui.UpstashEditorPage.apply_current_edit(page))
+        warning.assert_called_once()
+
     def test_collection_switch_clears_previous_edit_target(self) -> None:
         page = SimpleNamespace(
             current_identity="old-id",

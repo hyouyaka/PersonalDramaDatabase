@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import sys
+from cv_identity import legacy_id
 
 from cvid_map_tools import (
     BestEffortAvatarLookup, CvAvatarLookup, update_combined_cvid_map,
-    UpstashGeneratedManboCvIdAllocator, seed_generated_manbo_cvid_registry,
+    UpstashCvUuidAllocator as UpstashGeneratedManboCvIdAllocator, seed_generated_manbo_cvid_registry,
     load_generated_manbo_cvid_replacements,
 )
 from platform_sync import is_numeric_drama_id, load_json, MANBO_INFO_PATH, MISSEVAN_INFO_PATH
@@ -89,7 +90,7 @@ def main(argv: list[str]) -> int:
         )
     replacements = confirmed
     combined_map = load_json(COMBINED_CVID_MAP_PATH, {})
-    names = {int(row["manboCvId"]): row.get("displayName") or key
+    names = {legacy_id(row["manboCvId"]): row.get("displayName") or key
              for key, row in combined_map.items() if row.get("manboCvId") not in (None, "")}
     migrated = replace_manbo_main_cv_ids(manbo_store, replacements, cv_name_map=names)
     if migrated:

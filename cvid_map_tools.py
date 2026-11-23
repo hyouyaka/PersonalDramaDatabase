@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import math
 import secrets
+import uuid
+
+from cv_identity import account_id, ensure_cv_identities, is_uuid, legacy_id
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
@@ -78,6 +81,14 @@ def is_generated_manbo_cvid(value: object) -> bool:
         return False
 
 
+def is_virtual_missevan_cvid(value: object) -> bool:
+    return is_uuid(value) or is_generated_missevan_cvid(value)
+
+
+def is_virtual_manbo_cvid(value: object) -> bool:
+    return is_uuid(value) or is_generated_manbo_cvid(value)
+
+
 def collect_generated_manbo_cvids(combined_map: dict, manbo_store: dict | None = None) -> set[int]:
     values = [row.get("manboCvId") for row in combined_map.values()]
     values.extend(cv_id for row in (manbo_store or {}).get("records", []) for cv_id in row.get("mainCvIds") or [])
@@ -116,7 +127,7 @@ def has_conflicting_manbo_cvid(left: object, right: object) -> bool:
     if left in (None, "") or right in (None, ""):
         return False
     try:
-        return int(left) != int(right)
+        return account_id(left) != account_id(right)
     except (TypeError, ValueError):
         return True
 
@@ -195,7 +206,7 @@ def load_generated_missevan_cvid_replacements(*, upstash, registry_key=GENERATED
         field = str(field)
         if not field.startswith("upgrade:"):
             continue
-        replacements[int(field.split(":", 1)[1])] = int(value)
+        replacements[legacy_id(field.split(":", 1)[1])] = legacy_id(value)
     return replacements
 
 
@@ -203,14 +214,14 @@ def persist_generated_missevan_cvid_replacements(replacements: dict[int, int], *
     if not replacements:
         return
     command: list[object] = ["HSET", registry_key]
-    for old_id, new_id in sorted(replacements.items()):
-        command.extend([f"upgrade:{int(old_id)}", str(int(new_id))])
+    for old_id, new_id in sorted(replacements.items(), key=lambda pair: str(pair[0])):
+        command.extend([f"upgrade:{old_id}", str(new_id)])
     upstash(command)
 
 
 def load_generated_manbo_cvid_replacements(*, upstash) -> dict[int, int]:
     replacements = load_generated_missevan_cvid_replacements(upstash=upstash, registry_key=GENERATED_MANBO_CVID_REGISTRY_KEY)
-    if any(not is_generated_manbo_cvid(old) or new <= 0 or is_generated_manbo_cvid(new) for old, new in replacements.items()):
+    if any(not is_virtual_manbo_cvid(old) or not isinstance(new, int) or new <= 0 or is_virtual_manbo_cvid(new) for old, new in replacements.items()):
         raise RuntimeError("Invalid generated Manbo CVID replacement registry")
     return replacements
 
@@ -278,6 +289,25 @@ class UpstashGeneratedManboCvIdAllocator(UpstashGeneratedMissevanCvIdAllocator):
     label = "Manbo"
 
 
+class UpstashCvUuidAllocator:
+    """Use one name reservation across both platforms; UUIDs need no ID range."""
+    def __init__(self, *, upstash):
+        self.upstash = upstash
+
+    def __call__(self, combined_map: dict, display_name: object) -> str:
+        field = "name:" + normalize_match(display_name)
+        proposed = str(uuid.uuid4())
+        result = self.upstash(["EVAL", """
+local existing = redis.call('HGET', KEYS[1], ARGV[1])
+if existing then return existing end
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+return ARGV[2]
+""", 1, "cvid:generated:uuid", field, proposed])
+        if not is_uuid(result):
+            raise RuntimeError("Invalid UUID CV reservation")
+        return str(result)
+
+
 class RemoteCombinedMap(dict):
     def __init__(self, payload: dict, *, source_encoded: str | None) -> None:
         super().__init__(payload)
@@ -306,13 +336,15 @@ def load_remote_combined_map(*, upstash=None) -> dict[str, dict]:
 def save_remote_combined_map(data: dict[str, dict], *, upstash=None) -> None:
     from sync_new_drama_ids import CVID_MAP_KEY, upload_json_payload, upstash_request
 
-    save_combined_map(data)
     upload_json_payload(
         CVID_MAP_KEY,
         data,
         upstash=upstash or upstash_request,
         source_encoded=getattr(data, "source_encoded", None),
     )
+    # The authoritative source already protected identity keys during publication.
+    # A stale local work copy must not veto an otherwise successful remote save.
+    save_json(COMBINED_CVID_MAP_PATH, data)
 
 
 def normalize_avatar_url(value: object) -> str:
@@ -382,13 +414,13 @@ def payload_avatar(payload: dict, *, avatar_lookup=None, force: bool = False) ->
     if (current and not force) or avatar_lookup is None:
         return current
     missevan_id = payload.get("missevanCvId", payload.get("cvId"))
-    if missevan_id not in (None, "") and not is_generated_missevan_cvid(missevan_id):
-        avatar = normalize_avatar_url(avatar_lookup("猫耳", int(missevan_id)))
+    if missevan_id not in (None, "") and not is_virtual_missevan_cvid(missevan_id):
+        avatar = normalize_avatar_url(avatar_lookup("猫耳", legacy_id(missevan_id)))
         if avatar:
             return avatar
     manbo_id = payload.get("manboCvId")
-    if manbo_id not in (None, "") and not is_generated_manbo_cvid(manbo_id):
-        avatar = normalize_avatar_url(avatar_lookup("漫播", int(manbo_id)))
+    if manbo_id not in (None, "") and not is_virtual_manbo_cvid(manbo_id):
+        avatar = normalize_avatar_url(avatar_lookup("漫播", legacy_id(manbo_id)))
         if avatar and missevan_id not in (None, "") and hasattr(avatar_lookup, "fallback_to_manbo"):
             avatar_lookup.fallback_to_manbo += 1
         return avatar
@@ -455,8 +487,8 @@ def ensure_generated_missevan_cv_entry(combined_map: dict, display_name: object,
     payload = dict(combined_map.get(target_key) or {})
     existing = payload.get("missevanCvId") or payload.get("cvId")
     if existing not in (None, ""):
-        return int(existing), False
-    generated_id = int(allocator(combined_map, display_name))
+        return legacy_id(existing), False
+    generated_id = legacy_id(allocator(combined_map, display_name))
     payload["cvId"] = generated_id
     payload["missevanCvId"] = generated_id
     payload.setdefault("manboCvId", None)
@@ -468,6 +500,11 @@ def ensure_generated_missevan_cv_entry(combined_map: dict, display_name: object,
     payload["source"] = "missevan_generated"
     payload["updatedAt"] = utc_now()
     payload["notes"] = f"猫耳搜索未命中，使用自动生成 CVID {generated_id}"
+    if is_uuid(generated_id):
+        payload["cvKey"] = payload.get("cvKey") or f"person:{generated_id}"
+        if not payload.get("manboCvId"):
+            payload["manboCvId"] = generated_id
+            payload["manboIdSource"] = "generated"
     combined_map[target_key] = payload
     return generated_id, True
 
@@ -486,10 +523,10 @@ def ensure_generated_manbo_cv_entry(combined_map: dict, display_name: object, *,
     row = dict(combined_map.get(key) or {})
     existing = row.get("manboCvId")
     if existing not in (None, ""):
-        return int(existing), False
+        return legacy_id(existing), False
     canonical = normalize(row.get("displayName") or key)
-    cv_id = int(allocator(combined_map, canonical))
-    if not is_generated_manbo_cvid(cv_id):
+    cv_id = legacy_id(allocator(combined_map, canonical))
+    if not (is_generated_manbo_cvid(cv_id) or is_uuid(cv_id)):
         raise RuntimeError(f"Invalid generated Manbo CVID: {cv_id}")
     row.update(manboCvId=cv_id, manboIdSource="generated", displayName=canonical, updatedAt=utc_now())
     for field in ("cvId", "missevanCvId"):
@@ -499,6 +536,10 @@ def ensure_generated_manbo_cv_entry(combined_map: dict, display_name: object, *,
     row.setdefault("source", "observed")
     note = f"漫播搜索未命中，使用自动生成 CVID {cv_id}"
     row["notes"] = "；".join(filter(None, [normalize(row.get("notes")), note]))
+    if is_uuid(cv_id):
+        row["cvKey"] = row.get("cvKey") or f"person:{cv_id}"
+        if not (row.get("missevanCvId") or row.get("cvId")):
+            row["cvId"] = row["missevanCvId"] = cv_id
     combined_map[key] = row
     return cv_id, True
 
@@ -506,7 +547,7 @@ def ensure_generated_manbo_cv_entry(combined_map: dict, display_name: object, *,
 def persist_generated_manbo_cvid_replacements(replacements: dict[int, int], *, upstash) -> None:
     if not replacements:
         return
-    args = [value for old, new in sorted(replacements.items()) for value in (f"upgrade:{old}", str(new))]
+    args = [value for old, new in sorted(replacements.items(), key=lambda pair: str(pair[0])) for value in (f"upgrade:{old}", str(new))]
     result = upstash(["EVAL", """
 for i = 1, #ARGV, 2 do
   local existing = redis.call('HGET', KEYS[1], ARGV[i])
@@ -515,7 +556,7 @@ end
 for i = 1, #ARGV, 2 do redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1]) end
 return 1
 """, 1, GENERATED_MANBO_CVID_REGISTRY_KEY, *args])
-    if int(result or 0) != 1:
+    if legacy_id(result or 0) != 1:
         raise RuntimeError("Conflicting generated Manbo CVID replacement registry")
 
 
@@ -539,26 +580,26 @@ def _reconcile_generated_manbo_ids(current: dict, replacements: dict[int, int], 
         if item.platform != "漫播" or real_id is None:
             continue
         names = {normalize_match(name) for name in [item.display_name, *item.aliases] if normalize(name)}
-        if is_generated_manbo_cvid(real_id):
-            targets = {int(row["manboCvId"]) for key, row in current.items()
-                       if row.get("manboCvId") not in (None, "") and not is_generated_manbo_cvid(row["manboCvId"])
+        if is_virtual_manbo_cvid(real_id):
+            targets = {legacy_id(row["manboCvId"]) for key, row in current.items()
+                       if row.get("manboCvId") not in (None, "") and not is_virtual_manbo_cvid(row["manboCvId"])
                        and names & {normalize_match(name) for name in [key, row.get("displayName"), *(row.get("aliases") or [])] if normalize(name)}}
             if len(targets) == 1:
-                propose(int(real_id), targets.pop(), item.display_name)
+                propose(legacy_id(real_id), targets.pop(), item.display_name)
             continue
-        sources = [row for key, row in current.items() if is_generated_manbo_cvid(row.get("manboCvId")) and names & {
+        sources = [row for key, row in current.items() if is_virtual_manbo_cvid(row.get("manboCvId")) and names & {
             normalize_match(name) for name in [key, row.get("displayName"), *(row.get("aliases") or [])] if normalize(name)
         }]
         if len(sources) == 1:
-            old_id = int(sources[0]["manboCvId"])
-            propose(old_id, int(real_id), item.display_name)
+            old_id = legacy_id(sources[0]["manboCvId"])
+            propose(old_id, legacy_id(real_id), item.display_name)
     accepted: dict[int, int] = {}
     changed = 0
     for old_id, real_id in desired.items():
-        if not is_generated_manbo_cvid(old_id) or int(real_id) <= 0 or is_generated_manbo_cvid(real_id):
+        if not is_virtual_manbo_cvid(old_id) or not isinstance(legacy_id(real_id), int) or legacy_id(real_id) <= 0 or is_virtual_manbo_cvid(real_id):
             raise ValueError(f"Invalid Manbo CVID replacement: {old_id} -> {real_id}")
-        source_keys = [key for key, row in current.items() if row.get("manboCvId") not in (None, "") and int(row["manboCvId"]) == old_id]
-        target_keys = [key for key, row in current.items() if row.get("manboCvId") not in (None, "") and int(row["manboCvId"]) == real_id]
+        source_keys = [key for key, row in current.items() if row.get("manboCvId") not in (None, "") and legacy_id(row["manboCvId"]) == old_id]
+        target_keys = [key for key, row in current.items() if row.get("manboCvId") not in (None, "") and legacy_id(row["manboCvId"]) == real_id]
         if not source_keys and len(target_keys) == 1:
             accepted[old_id] = real_id  # Retry migration after an earlier successful map publication.
             continue
@@ -571,17 +612,17 @@ def _reconcile_generated_manbo_ids(current: dict, replacements: dict[int, int], 
         target = dict(current[target_key])
         source_cat = source.get("missevanCvId") or source.get("cvId")
         target_cat = target.get("missevanCvId") or target.get("cvId")
-        if source_cat and target_cat and int(source_cat) != int(target_cat):
+        if source_cat and target_cat and legacy_id(source_cat) != legacy_id(target_cat):
             ambiguous.append(f"漫播:{source_key}:missevan-conflict={target_key}")
             continue
         canonical = normalize(target.get("displayName") or target_key)
         aliases = [*(target.get("aliases") or []), *(source.get("aliases") or []), source_key, source.get("displayName")]
         target["aliases"] = list(dict.fromkeys(normalize(alias) for alias in aliases
                                                 if normalize(alias) and normalize_match(alias) != normalize_match(canonical)))
-        for field in ("cvId", "missevanCvId", "avatar"):
+        for field in ("cvId", "missevanCvId", "avatar", "cvKey"):
             if not target.get(field) and source.get(field):
                 target[field] = source[field]
-        target.update(manboCvId=int(real_id), manboIdSource="platform", updatedAt=utc_now())
+        target.update(manboCvId=legacy_id(real_id), manboIdSource="platform", updatedAt=utc_now())
         note = f"自动生成漫播 CVID {old_id} 已升级为真实漫播 CVID {real_id}"
         target["notes"] = "；".join(dict.fromkeys(filter(None, [normalize(target.get("notes")), normalize(source.get("notes")), note])))
         current[target_key] = target
@@ -614,6 +655,7 @@ def load_combined_map() -> dict[str, dict]:
 
 
 def save_combined_map(data: dict[str, dict]) -> None:
+    ensure_cv_identities(data, load_json(COMBINED_CVID_MAP_PATH, {}))
     save_json(COMBINED_CVID_MAP_PATH, data)
 
 
@@ -684,17 +726,17 @@ def update_combined_cvid_map(
     for key, existing_payload in list(current.items()):
         payload = dict(existing_payload)
         existing_id = payload.get("missevanCvId") or payload.get("cvId")
-        upgrade_source_id: int | None = int(existing_id) if is_generated_missevan_cvid(existing_id) else None
+        upgrade_source_id: int | None = legacy_id(existing_id) if is_virtual_missevan_cvid(existing_id) else None
         retry_converted_upgrade = False
         if upgrade_source_id is None and existing_id not in (None, ""):
             notes = normalize(payload.get("notes"))
             matching_sources = [
-                int(old_id)
+                legacy_id(old_id)
                 for old_id, replacement_id in generated_replacements.items()
-                if int(replacement_id) == int(existing_id)
+                if legacy_id(replacement_id) == legacy_id(existing_id)
                 and (
-                    f"自动生成 CVID {int(old_id)} 已升级为真实猫耳 CVID "
-                    f"{int(replacement_id)}"
+                    f"自动生成 CVID {legacy_id(old_id)} 已升级为真实猫耳 CVID "
+                    f"{legacy_id(replacement_id)}"
                 )
                 in notes
             ]
@@ -711,7 +753,7 @@ def update_combined_cvid_map(
             for candidate_key, candidate_payload in current.items()
             if str(candidate_key) != str(key)
             and (candidate_payload.get("missevanCvId") or candidate_payload.get("cvId")) not in (None, "")
-            and int(candidate_payload.get("missevanCvId") or candidate_payload.get("cvId")) == int(real_id)
+            and legacy_id(candidate_payload.get("missevanCvId") or candidate_payload.get("cvId")) == legacy_id(real_id)
         ]
         if len(real_id_keys) > 1:
             ambiguous.append(f"猫耳:{key}:upgrade-targets={','.join(sorted(real_id_keys))}")
@@ -727,6 +769,9 @@ def update_combined_cvid_map(
                     f"猫耳:{key}:manbo-conflict={target_key}"
                 )
                 continue
+            target.setdefault("cvKey", payload.get("cvKey"))
+            if target.get("cvKey") is None:
+                target.pop("cvKey", None)
             target_name = normalize(target.get("displayName") or target_key)
             aliases = [
                 *(target.get("aliases") or []),
@@ -745,9 +790,9 @@ def update_combined_cvid_map(
                 target["avatar"] = payload.get("avatar")
             if target.get("manboCvId") in (None, "") and payload.get("manboCvId") not in (None, ""):
                 target["manboCvId"] = payload.get("manboCvId")
-                target["manboIdSource"] = "generated" if is_generated_manbo_cvid(target["manboCvId"]) else "platform"
+                target["manboIdSource"] = "generated" if is_virtual_manbo_cvid(target["manboCvId"]) else "platform"
             target["updatedAt"] = now
-            upgrade_note = f"自动生成 CVID {upgrade_source_id} 已合并到真实猫耳 CVID {int(real_id)}"
+            upgrade_note = f"自动生成 CVID {upgrade_source_id} 已合并到真实猫耳 CVID {legacy_id(real_id)}"
             current_notes = normalize(target.get("notes"))
             if upgrade_note not in current_notes:
                 target["notes"] = f"{current_notes}；{upgrade_note}" if current_notes else upgrade_note
@@ -757,10 +802,10 @@ def update_combined_cvid_map(
             continue
         if retry_converted_upgrade:
             continue
-        payload["cvId"] = int(real_id)
-        payload["missevanCvId"] = int(real_id)
+        payload["cvId"] = legacy_id(real_id)
+        payload["missevanCvId"] = legacy_id(real_id)
         payload["source"] = "observed"
-        payload["notes"] = f"自动生成 CVID {upgrade_source_id} 已升级为真实猫耳 CVID {int(real_id)}"
+        payload["notes"] = f"自动生成 CVID {upgrade_source_id} 已升级为真实猫耳 CVID {legacy_id(real_id)}"
         payload["updatedAt"] = now
         current[key] = payload
         updated += 1
@@ -777,9 +822,9 @@ def update_combined_cvid_map(
         missevan_id = payload.get("missevanCvId", payload.get("cvId"))
         manbo_id = payload.get("manboCvId")
         if missevan_id not in (None, ""):
-            missevan_id_index.setdefault(int(missevan_id), set()).add(key)
+            missevan_id_index.setdefault(legacy_id(missevan_id), set()).add(key)
         if manbo_id not in (None, ""):
-            manbo_id_index.setdefault(int(manbo_id), set()).add(key)
+            manbo_id_index.setdefault(legacy_id(manbo_id), set()).add(key)
 
     for key, payload in current.items():
         if normalize(key):
@@ -791,7 +836,7 @@ def update_combined_cvid_map(
         candidate_keys: set[str] = set()
         if item.platform_cv_id is not None:
             id_index = missevan_id_index if item.platform == "猫耳" else manbo_id_index
-            candidate_keys.update(id_index.get(int(item.platform_cv_id), set()))
+            candidate_keys.update(id_index.get(legacy_id(item.platform_cv_id), set()))
         for candidate in [item.display_name, *item.aliases]:
             candidate_keys.update(name_index.get(normalize_match(candidate), set()))
 
@@ -805,14 +850,14 @@ def update_combined_cvid_map(
             generated_metadata_changed = False
             if item.platform == "猫耳":
                 existing = payload.get("missevanCvId", payload.get("cvId"))
-                observed_id = int(item.platform_cv_id) if item.platform_cv_id is not None else None
+                observed_id = legacy_id(item.platform_cv_id) if item.platform_cv_id is not None else None
                 replaced_generated_id: int | None = None
-                if observed_id is not None and existing not in (None, "") and int(existing) != observed_id:
-                    existing_id = int(existing)
-                    if is_generated_missevan_cvid(existing_id) and not is_generated_missevan_cvid(observed_id):
+                if observed_id is not None and existing not in (None, "") and legacy_id(existing) != observed_id:
+                    existing_id = legacy_id(existing)
+                    if is_virtual_missevan_cvid(existing_id) and not is_virtual_missevan_cvid(observed_id):
                         generated_replacements[existing_id] = observed_id
                         replaced_generated_id = existing_id
-                    elif not is_generated_missevan_cvid(existing_id) and is_generated_missevan_cvid(observed_id):
+                    elif not is_virtual_missevan_cvid(existing_id) and is_virtual_missevan_cvid(observed_id):
                         generated_replacements[observed_id] = existing_id
                         observed_id = existing_id
                     else:
@@ -820,15 +865,18 @@ def update_combined_cvid_map(
                         continue
                 next_cv_id = observed_id if observed_id is not None else payload.get("cvId")
                 next_missevan_cv_id = observed_id if observed_id is not None else payload.get("missevanCvId")
-                id_changed = payload.get("cvId") != next_cv_id or payload.get("missevanCvId") != next_missevan_cv_id
+                id_changed = (
+                    account_id(payload.get("cvId")) != account_id(next_cv_id)
+                    or account_id(payload.get("missevanCvId")) != account_id(next_missevan_cv_id)
+                )
                 payload["cvId"] = next_cv_id
                 payload["missevanCvId"] = next_missevan_cv_id
                 if replaced_generated_id is not None:
                     payload["source"] = "observed"
                     payload["notes"] = (
-                        f"自动生成 CVID {replaced_generated_id} 已升级为真实猫耳 CVID {int(observed_id)}"
+                        f"自动生成 CVID {replaced_generated_id} 已升级为真实猫耳 CVID {legacy_id(observed_id)}"
                     )
-                elif observed_id is not None and is_generated_missevan_cvid(observed_id):
+                elif observed_id is not None and is_virtual_missevan_cvid(observed_id):
                     generated_note = f"猫耳搜索未命中，使用自动生成 CVID {observed_id}"
                     generated_metadata_changed = (
                         payload.get("source") != "missevan_generated" or payload.get("notes") != generated_note
@@ -837,14 +885,14 @@ def update_combined_cvid_map(
                     payload["notes"] = generated_note
             else:
                 existing = payload.get("manboCvId")
-                if item.platform_cv_id is not None and existing not in (None, "") and int(existing) != int(item.platform_cv_id):
+                if item.platform_cv_id is not None and existing not in (None, "") and legacy_id(existing) != legacy_id(item.platform_cv_id):
                     ambiguous.append(f"{item.platform}:{item.display_name}")
                     continue
-                next_manbo_cv_id = int(item.platform_cv_id) if item.platform_cv_id is not None else payload.get("manboCvId")
-                id_changed = payload.get("manboCvId") != next_manbo_cv_id
+                next_manbo_cv_id = legacy_id(item.platform_cv_id) if item.platform_cv_id is not None else payload.get("manboCvId")
+                id_changed = account_id(payload.get("manboCvId")) != account_id(next_manbo_cv_id)
                 payload["manboCvId"] = next_manbo_cv_id
                 if next_manbo_cv_id is not None:
-                    source = "generated" if is_generated_manbo_cvid(next_manbo_cv_id) else "platform"
+                    source = "generated" if is_virtual_manbo_cvid(next_manbo_cv_id) else "platform"
                     generated_metadata_changed = payload.get("manboIdSource") != source
                     payload["manboIdSource"] = source
             aliases = []
@@ -880,9 +928,9 @@ def update_combined_cvid_map(
             ambiguous.append(f"{item.platform}:{item.display_name}")
             continue
         payload = {
-            "cvId": int(item.platform_cv_id) if item.platform == "猫耳" and item.platform_cv_id is not None else None,
-            "missevanCvId": int(item.platform_cv_id) if item.platform == "猫耳" and item.platform_cv_id is not None else None,
-            "manboCvId": int(item.platform_cv_id) if item.platform == "漫播" and item.platform_cv_id is not None else None,
+            "cvId": legacy_id(item.platform_cv_id) if item.platform == "猫耳" and item.platform_cv_id is not None else None,
+            "missevanCvId": legacy_id(item.platform_cv_id) if item.platform == "猫耳" and item.platform_cv_id is not None else None,
+            "manboCvId": legacy_id(item.platform_cv_id) if item.platform == "漫播" and item.platform_cv_id is not None else None,
             "displayName": key,
             "aliases": [alias for alias in item.aliases if normalize(alias) and normalize(alias) != key],
             "avatar": "",
@@ -890,9 +938,12 @@ def update_combined_cvid_map(
             "updatedAt": now,
             "notes": "猫耳搜索未命中，以显示名称识别" if item.platform == "猫耳" and item.platform_cv_id is None else "",
         }
+        if is_uuid(item.platform_cv_id):
+            payload["cvKey"] = f"person:{item.platform_cv_id}"
+            payload["cvId"] = payload["missevanCvId"] = payload["manboCvId"] = str(item.platform_cv_id)
         payload["avatar"] = payload_avatar(payload, avatar_lookup=avatar_lookup, force=force_avatar)
         if payload.get("manboCvId") is not None:
-            payload["manboIdSource"] = "generated" if is_generated_manbo_cvid(payload["manboCvId"]) else "platform"
+            payload["manboIdSource"] = "generated" if is_virtual_manbo_cvid(payload["manboCvId"]) else "platform"
         current[key] = payload
         register_indexes(key, payload)
         created += 1

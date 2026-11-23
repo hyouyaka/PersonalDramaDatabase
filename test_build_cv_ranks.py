@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import build_cv_ranks
+from cv_identity import ensure_cv_identities
 from test_upstash_v2 import FakeUpstash
 
 
@@ -209,7 +210,8 @@ class BuildCvRanksTests(unittest.TestCase):
                     "avatar": "https://avatar.test/canonical.jpg",
                 }
             }
-            remote: dict[str, str] = {}
+            ensure_cv_identities(remote_map)
+            remote: dict[str, str] = {"cvid-map:v1": json.dumps(remote_map)}
 
             def upstash(command: list[object]) -> object:
                 if command[0] == "GET":
@@ -232,7 +234,7 @@ class BuildCvRanksTests(unittest.TestCase):
                 }),
                 patch.object(build_cv_ranks, "sync_remote_rank_inputs", return_value=remote_map),
                 patch.object(build_cv_ranks, "sync_remote_watchcount_inputs"),
-                patch.object(build_cv_ranks, "publish_trend_v2_best_effort"),
+                patch.object(build_cv_ranks, "publish_cv_trend_v3"),
             ):
                 payload = build_cv_ranks.build_and_publish_cv_ranks(
                     missevan_info_path=missevan_info,
@@ -376,101 +378,6 @@ class BuildCvRanksTests(unittest.TestCase):
             ["201", "202"],
         )
 
-    def test_build_cv_trend_payload_keeps_latest_works_and_prunes_to_50_dates(self) -> None:
-        old_dates = [f"2026-04-{day:02d}" for day in range(1, 51)]
-        current = {
-            "version": 1,
-            "kind": "cv",
-            "platform": "missevan",
-            "updated_at": "2026-05-20T00:00:00+00:00",
-            "dates": old_dates,
-            "cvs": {
-                "同一CV": {
-                    "cvName": "同一CV",
-                    "avatar": "old-avatar",
-                    "works": [{"dramaId": "old", "viewCount": 1}],
-                    "samples": {
-                        date: {
-                            "generated_at": f"{date}T00:00:00+00:00",
-                            "publicationId": f"historical-{date}",
-                            "metrics": {"totalViewCount": idx, "paidViewCount": idx // 2},
-                            "ranks": {"total": idx},
-                            "works": [{"dramaId": "must-not-survive"}],
-                        }
-                        for idx, date in enumerate(old_dates, 1)
-                    },
-                },
-                "过期CV": {
-                    "cvName": "过期CV",
-                    "samples": {
-                        "2026-04-01": {
-                            "metrics": {"totalViewCount": 1, "paidViewCount": 0},
-                            "ranks": {"total": 2},
-                        }
-                    },
-                },
-            },
-        }
-        total_ranking = [
-            {
-                "cvName": "同一CV",
-                "avatar": "new-avatar",
-                "totalViewCount": 300,
-                "rank": 1,
-                "workCount": 2,
-                "works": [
-                    {"platform": "missevan", "dramaId": "101", "title": "新剧", "viewCount": 200, "isPaid": True},
-                    {"platform": "missevan", "dramaId": "100", "title": "免费剧", "viewCount": 100, "isPaid": False},
-                ],
-            },
-            {
-                "cvName": "新CV",
-                "avatar": "",
-                "totalViewCount": 50,
-                "rank": 2,
-                "workCount": 1,
-                "works": [
-                    {"platform": "missevan", "dramaId": "102", "title": "新CV剧", "viewCount": 50, "isPaid": False}
-                ],
-            },
-        ]
-        paid_ranking = [
-            {
-                "cvName": "同一CV",
-                "avatar": "new-avatar",
-                "totalViewCount": 200,
-                "rank": 1,
-                "workCount": 1,
-                "works": [
-                    {"platform": "missevan", "dramaId": "101", "title": "新剧", "viewCount": 200, "isPaid": True}
-                ],
-            }
-        ]
-
-        payload = build_cv_ranks.build_cv_trend_payload(
-            current,
-            "missevan",
-            "2026-06-10",
-            total_ranking,
-            paid_ranking,
-            generated_at="2026-06-10T12:00:00+00:00",
-            publication_id="current-publication",
-        )
-
-        self.assertEqual(len(payload["dates"]), 50)
-        self.assertNotIn("2026-04-01", payload["dates"])
-        self.assertIn("2026-06-10", payload["dates"])
-        self.assertNotIn("过期CV", payload["cvs"])
-        cv = payload["cvs"]["同一CV"]
-        self.assertEqual(cv["avatar"], "new-avatar")
-        self.assertEqual([work["dramaId"] for work in cv["works"]], ["101", "100"])
-        self.assertEqual(cv["samples"]["2026-06-10"]["metrics"], {"totalViewCount": 300, "paidViewCount": 200})
-        self.assertEqual(cv["samples"]["2026-06-10"]["ranks"], {"total": 1, "paid": 1})
-        self.assertEqual(cv["samples"]["2026-06-10"]["publicationId"], "current-publication")
-        older_sample = cv["samples"]["2026-04-50"]
-        self.assertEqual(older_sample["metrics"], {"totalViewCount": 50, "paidViewCount": 25})
-        self.assertNotIn("works", older_sample)
-        self.assertEqual(older_sample["publicationId"], "historical-2026-04-50")
 
     def test_build_and_publish_uploads_cv_trends_after_rank_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -509,6 +416,7 @@ class BuildCvRanksTests(unittest.TestCase):
             manbo_counts = self.write_json(tmp, "manbo-counts.json", {"_meta": {}, "counts": {"200": {"view_count": 60}}})
             cvid_map = self.write_json(tmp, "map.json", {})
             fake_upstash = FakeUpstash()
+            fake_upstash.strings["cvid-map:v1"] = "{}"
 
             with (
                 patch.object(build_cv_ranks, "fetch_remote_series_info", return_value={}),
@@ -534,7 +442,8 @@ class BuildCvRanksTests(unittest.TestCase):
                     publication_ids.append(publication_id)
                     self.assertEqual(json.loads(fake_upstash.strings["ranks:cv:latest"]), payload)
                     self.assertEqual(json.loads((Path(tmp) / "ranks-cv.json").read_text(encoding="utf-8")), payload)
-                    trend = fake_upstash.hashes[build_cv_ranks.CV_TREND_V2_KEY]
+                    trend = fake_upstash.hashes[build_cv_ranks.CV_TREND_V3_KEY]
+                    self.assertEqual(json.loads(trend["__meta__"])["version"], 3)
                     self.assertEqual(json.loads(trend["__meta__"])["publicationId"], publication_id)
                     for field, raw in trend.items():
                         if field != "__meta__":
@@ -542,16 +451,18 @@ class BuildCvRanksTests(unittest.TestCase):
                             self.assertEqual(sample["publicationId"], publication_id)
                             self.assertEqual(sample["generated_at"], payload["generated_at"])
 
+                    self.assertNotIn("ranks:trend:cv:v2", fake_upstash.hashes)
+
             self.assertNotEqual(*publication_ids)
             commands = fake_upstash.commands
             rank_publish = next(i for i, command in enumerate(commands) if command[0] == "EVAL")
             trend_stage = next(i for i, command in enumerate(commands) if command[0] == "HSET")
             self.assertLess(rank_publish, trend_stage)
 
-    def test_upload_cv_trends_propagates_v2_publish_failure(self) -> None:
+    def test_upload_cv_trends_propagates_v3_publish_failure(self) -> None:
         with (
-            patch.object(build_cv_ranks, "publish_trend_v2_best_effort", side_effect=RuntimeError("v2 unavailable")),
-            self.assertRaisesRegex(RuntimeError, "v2 unavailable"),
+            patch.object(build_cv_ranks, "publish_cv_trend_v3", side_effect=RuntimeError("v3 unavailable")),
+            self.assertRaisesRegex(RuntimeError, "v3 unavailable"),
         ):
             build_cv_ranks.upload_cv_trends(
                 history_date="2026-06-10",
@@ -694,7 +605,10 @@ class BuildCvRanksTests(unittest.TestCase):
             self.assertEqual(payload["seriesCountRankings"]["missevan"][0]["works"][0]["seriesKey"], "猫耳:系列")
             self.assertEqual(json.loads(manbo_info.read_text(encoding="utf-8")), remote_manbo)
             self.assertEqual(json.loads(missevan_info.read_text(encoding="utf-8")), remote_missevan)
-            self.assertEqual(json.loads(cvid_map.read_text(encoding="utf-8")), remote_map)
+            local_map = json.loads(cvid_map.read_text(encoding="utf-8"))
+            self.assertEqual(local_map["Remote CV"]["missevanCvId"], "11")
+            self.assertEqual(local_map["Remote CV"]["manboCvId"], "22")
+            self.assertTrue(local_map["Remote CV"]["cvKey"].startswith("person:"))
             self.assertEqual(payload["rankings"]["missevan"][0]["works"][0]["title"], "远端猫耳剧")
             self.assertEqual(payload["rankings"]["manbo"][0]["works"][0]["title"], "远端漫播剧")
 
@@ -937,11 +851,11 @@ class BuildCvRanksTests(unittest.TestCase):
         self.assertEqual(cleaned_twice, cleaned)
         self.assertEqual(second_stats, {"removed_samples": 0, "removed_cvs": 0})
 
-    def test_remote_cleanup_updates_only_the_v2_hash(self) -> None:
+    def test_remote_cleanup_updates_only_the_v3_hash(self) -> None:
         incident = "2026-07-11T22:18:05+00:00"
         state = {
             "__meta__": json.dumps({
-                "version": 2,
+                "version": 3,
                 "kind": "cv",
                 "platforms": {
                     "missevan": {"dates": ["2026-07-10", "2026-07-11"], "updated_at": incident},
@@ -960,7 +874,7 @@ class BuildCvRanksTests(unittest.TestCase):
 
         def fake_upstash(command):
             commands.append(command)
-            if command[:2] == ["HGETALL", build_cv_ranks.CV_TREND_V2_KEY]:
+            if command[:2] == ["HGETALL", build_cv_ranks.CV_TREND_V3_KEY]:
                 return [value for pair in state.items() for value in pair]
             raise AssertionError(command)
 
@@ -979,6 +893,7 @@ class BuildCvRanksTests(unittest.TestCase):
         self.assertEqual(results["missevan"]["removed_samples"], 1)
         self.assertEqual(results["manbo"]["removed_samples"], 1)
         publish_mock.assert_called_once()
+        self.assertEqual(publish_mock.call_args.args[0], build_cv_ranks.CV_TREND_V3_KEY)
         self.assertTrue(all(command[0] == "HGETALL" for command in commands))
         verified_meta = json.loads(state["__meta__"])
         self.assertEqual(verified_meta["platforms"]["missevan"]["entityCount"], 1)

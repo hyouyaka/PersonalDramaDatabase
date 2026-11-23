@@ -214,7 +214,7 @@ class GeneratedMissevanCvIdTests(unittest.TestCase):
                 )
                 saved = cvid_map_tools.load_json(map_path, {})
 
-        self.assertEqual(saved["林风"]["missevanCvId"], 1234)
+        self.assertEqual(saved["林风"]["missevanCvId"], "1234")
         self.assertEqual(saved["林风"]["source"], "observed")
         self.assertIn("331111", saved["林风"]["notes"])
         self.assertEqual(stats["missevan_generated_replacements"], {331111: 1234})
@@ -234,7 +234,7 @@ class GeneratedMissevanCvIdTests(unittest.TestCase):
                 )
                 saved = cvid_map_tools.load_json(map_path, {})
 
-        self.assertEqual(saved["林风"]["missevanCvId"], 1234)
+        self.assertEqual(saved["林风"]["missevanCvId"], "1234")
         self.assertEqual(stats["missevan_generated_replacements"], {331111: 1234})
 
     def test_persisted_upgrade_merges_generated_key_into_existing_real_key(self) -> None:
@@ -274,8 +274,8 @@ class GeneratedMissevanCvIdTests(unittest.TestCase):
                 saved = cvid_map_tools.load_json(map_path, {})
 
         self.assertEqual(set(saved), {"心念多个心"})
-        self.assertEqual(saved["心念多个心"]["missevanCvId"], 3853)
-        self.assertEqual(saved["心念多个心"]["manboCvId"], 2948274737182)
+        self.assertEqual(saved["心念多个心"]["missevanCvId"], "3853")
+        self.assertEqual(saved["心念多个心"]["manboCvId"], "2948274737182")
         self.assertEqual(saved["心念多个心"]["avatar"], "real-avatar")
         self.assertIn("心念", saved["心念多个心"]["aliases"])
         self.assertIn("人工确认记录", saved["心念多个心"]["notes"])
@@ -300,6 +300,7 @@ class GeneratedMissevanCvIdTests(unittest.TestCase):
                     "aliases": [],
                 },
             }
+            cvid_map_tools.ensure_cv_identities(original)
             map_path.write_text(json.dumps(original, ensure_ascii=False), encoding="utf-8")
             with patch.object(cvid_map_tools, "COMBINED_CVID_MAP_PATH", map_path):
                 stats = cvid_map_tools.update_combined_cvid_map(
@@ -362,6 +363,7 @@ class GeneratedMissevanCvIdTests(unittest.TestCase):
                     "notes": "人工确认记录；自动生成 CVID 337329 已合并到真实猫耳 CVID 3853",
                 }
             }
+            cvid_map_tools.ensure_cv_identities(original)
             map_path.write_text(json.dumps(original, ensure_ascii=False), encoding="utf-8")
             with patch.object(cvid_map_tools, "COMBINED_CVID_MAP_PATH", map_path):
                 first = cvid_map_tools.update_combined_cvid_map(
@@ -394,6 +396,7 @@ class GeneratedMissevanCvIdTests(unittest.TestCase):
                     "notes": "自动生成 CVID 331111 已升级为真实猫耳 CVID 1234",
                 }
             }
+            cvid_map_tools.ensure_cv_identities(original)
             map_path.write_text(json.dumps(original, ensure_ascii=False), encoding="utf-8")
             with patch.object(cvid_map_tools, "COMBINED_CVID_MAP_PATH", map_path):
                 stats = cvid_map_tools.update_combined_cvid_map(
@@ -405,6 +408,72 @@ class GeneratedMissevanCvIdTests(unittest.TestCase):
 
         self.assertEqual(saved, original)
         self.assertEqual(stats["updated"], 0)
+
+
+class UpdateCombinedMapIdempotencyTests(unittest.TestCase):
+    ORIGINAL_TIME = "2026-11-20T00:00:00+00:00"
+    NEXT_TIME = "2026-11-23T00:00:00+00:00"
+
+    @staticmethod
+    def stores(platform, cv_id):
+        if platform == "missevan":
+            return {
+                "100": {"dramaId": "100", "maincvs": [cv_id], "cvnames": {str(cv_id): "CV A"}},
+            }, {"records": []}
+        return {}, {"records": [{"dramaId": "200", "mainCvIds": [cv_id], "mainCvNames": ["CV A"]}]}
+
+    def profile(self):
+        return {
+            "cvKey": "person:161c78e0-e441-48dc-8db2-a0ec1266cd0c",
+            "cvId": "12", "missevanCvId": "12", "manboCvId": "90071992547409931234",
+            "displayName": "CV A", "aliases": [], "avatar": "", "notes": "manual",
+            "source": "observed", "manboIdSource": "platform", "updatedAt": self.ORIGINAL_TIME,
+        }
+
+    def test_same_numeric_id_observations_preserve_updated_at_and_map_bytes(self):
+        for platform in ("missevan", "manbo"):
+            for observation_type in (str, int):
+                with self.subTest(platform=platform, observation_type=observation_type), tempfile.TemporaryDirectory() as tmp:
+                    original = {"CV A": self.profile()}
+                    stored_id = original["CV A"][f"{platform}CvId"]
+                    stores = self.stores(platform, observation_type(stored_id))
+                    path = Path(tmp) / "map.json"
+                    cvid_map_tools.save_json(path, original)
+                    original_bytes = path.read_bytes()
+                    with (
+                        patch.object(cvid_map_tools, "COMBINED_CVID_MAP_PATH", path),
+                        patch.object(cvid_map_tools, "utc_now", side_effect=[self.NEXT_TIME, "2026-11-24T00:00:00+00:00"]),
+                    ):
+                        for _ in range(2):
+                            result = cvid_map_tools.update_combined_cvid_map(*stores)
+                            self.assertEqual((result["created"], result["updated"], result["unchanged"], result["ambiguous_count"]), (0, 0, 1, 0))
+                            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), original)
+                            self.assertEqual(path.read_bytes(), original_bytes)
+
+    def test_new_platform_id_updates_once_then_preserves_updated_at(self):
+        for platform in ("missevan", "manbo"):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as tmp:
+                profile = self.profile()
+                observed_id = profile[f"{platform}CvId"]
+                profile[f"{platform}CvId"] = None
+                if platform == "missevan":
+                    profile["cvId"] = None
+                path = Path(tmp) / "map.json"
+                cvid_map_tools.save_json(path, {"CV A": profile})
+                stores = self.stores(platform, int(observed_id))
+                with (
+                    patch.object(cvid_map_tools, "COMBINED_CVID_MAP_PATH", path),
+                    patch.object(cvid_map_tools, "utc_now", side_effect=[self.NEXT_TIME, "2026-11-24T00:00:00+00:00"]),
+                ):
+                    first = cvid_map_tools.update_combined_cvid_map(*stores)
+                    after_first = path.read_bytes()
+                    second = cvid_map_tools.update_combined_cvid_map(*stores)
+                saved = json.loads(path.read_text(encoding="utf-8"))["CV A"]
+                self.assertEqual((first["updated"], first["unchanged"]), (1, 0))
+                self.assertEqual((second["updated"], second["unchanged"]), (0, 1))
+                self.assertEqual(saved[f"{platform}CvId"], observed_id)
+                self.assertEqual(saved["updatedAt"], self.NEXT_TIME)
+                self.assertEqual(path.read_bytes(), after_first)
 
 
 class UpdateCombinedMapAvatarTests(unittest.TestCase):
@@ -448,7 +517,7 @@ class UpdateCombinedMapAvatarTests(unittest.TestCase):
         self.assertEqual(first["created"], 1)
         self.assertEqual(second["unchanged"], 1)
         self.assertEqual(upgraded["updated"], 1)
-        self.assertEqual(saved["林风"]["missevanCvId"], 777)
+        self.assertEqual(saved["林风"]["missevanCvId"], "777")
 
     def test_created_missevan_cv_gets_avatar(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

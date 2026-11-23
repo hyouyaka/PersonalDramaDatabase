@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from cv_identity import legacy_id
+
 import argparse
 import re
 import sqlite3
@@ -150,9 +152,9 @@ def build_map_indexes(cvid_map: dict) -> tuple[dict[int, set[str]], dict[int, se
         missevan_id = payload.get("missevanCvId", payload.get("cvId"))
         manbo_id = payload.get("manboCvId")
         if missevan_id not in (None, ""):
-            missevan_ids.setdefault(int(missevan_id), set()).add(canonical)
+            missevan_ids.setdefault(legacy_id(missevan_id), set()).add(canonical)
         if manbo_id not in (None, ""):
-            manbo_ids.setdefault(int(manbo_id), set()).add(canonical)
+            manbo_ids.setdefault(legacy_id(manbo_id), set()).add(canonical)
     return missevan_ids, manbo_ids, names
 
 
@@ -160,7 +162,7 @@ def resolve_cv_name(raw_name: str, cv_id: int | None, *, platform: str, missevan
     candidates: set[str] = set()
     if cv_id is not None:
         by_id = missevan_ids if platform == "猫耳" else manbo_ids
-        candidates.update(by_id.get(int(cv_id), set()))
+        candidates.update(by_id.get(legacy_id(cv_id), set()))
     if len(candidates) == 1:
         return next(iter(candidates))
     for candidate in [raw_name]:

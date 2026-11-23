@@ -147,7 +147,7 @@ PURGE_MANBO_PODCAST_IDS = {
 }
 CV_REMOTE_KEYS = (
     "ranks:cv:latest",
-    "ranks:trend:cv:v2",
+    "ranks:trend:cv:v3",
 )
 
 

@@ -39,6 +39,8 @@ from PySide6.QtWidgets import (
     QFileDialog,
 )
 
+from cv_identity import trend_key
+
 from upstash_editor import (
     RESOURCE_SPECS,
     CollectionRef,
@@ -1420,8 +1422,8 @@ class UpstashEditorPage(QWidget):
                 expected_field = "id"
             elif self.loaded.spec.kind == "trend_peak":
                 expected_field = "name"
-            elif self.loaded.spec.kind == "trend_cv":
-                expected_field = "cvName"
+            elif self.loaded.spec.kind == "trend_cv_v3":
+                expected_field = "cvKey"
                 expected_value = str(self.current_identity).partition(":")[2]
             elif self.loaded.spec.kind == "ranks_latest" and collection.name.endswith("/ 剧目"):
                 expected_field = "dramaId" if "dramaId" in new_item else None
@@ -1493,12 +1495,12 @@ class UpstashEditorPage(QWidget):
                 new_item = {"version": 2, "id": identity, "name": identity, "samples": {}}
             elif self.loaded and self.loaded.spec.kind == "trend_peak":
                 new_item = {"version": 2, "name": identity, "samples": {}}
-            elif self.loaded and self.loaded.spec.kind == "trend_cv":
-                platform, separator, cv_name = identity.partition(":")
-                if separator != ":" or platform not in ("missevan", "manbo") or not cv_name:
-                    QMessageBox.warning(self, "标识无效", "CV trend 标识必须为 missevan:CV名 或 manbo:CV名。")
+            elif self.loaded and self.loaded.spec.kind == "trend_cv_v3":
+                platform, separator, cv_key = identity.partition(":")
+                if separator != ":" or platform not in ("missevan", "manbo") or not trend_key(cv_key) or not (cv_key.startswith("person:") or cv_key.startswith(f"{platform}:id:")):
+                    QMessageBox.warning(self, "标识无效", "CV trend 标识必须为 <平台>:<cvKey>，使用个人 UUID 或该平台的 ID 键。")
                     return
-                new_item = {"version": 2, "cvName": cv_name, "samples": {}}
+                new_item = {"version": 3, "cvKey": cv_key, "cvName": cv_key, "works": [], "samples": {}}
             else:
                 new_item = {}
             collection.container[identity] = new_item

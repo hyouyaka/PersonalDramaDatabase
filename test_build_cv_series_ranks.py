@@ -135,7 +135,7 @@ class SeriesCountMetadataTests(unittest.TestCase):
                     patch.object(cv, "upload_cv_trends") as trends,
                 ):
                     payload = cv.build_and_publish_cv_ranks(
-                        output_path=output, upload=True, upstash=Mock(return_value=None), generated_at=override,
+                        output_path=output, upload=True, upstash=Mock(return_value=json.dumps(inputs["cvid_map"])), generated_at=override,
                     )
                 expected_sample_time = override or self.WATCHCOUNT_TIME
                 self.assertEqual(payload["generated_at"], expected_sample_time)

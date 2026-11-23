@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from cv_identity import is_uuid
+
 import argparse
 import copy
 import json
@@ -179,7 +181,7 @@ def read_drama_records(manbo: dict, missevan: dict) -> list[Drama]:
             cv_ids = set()
             for index, cv_id in enumerate(raw_ids):
                 cv_id = str(cv_id)
-                if not cv_id.isdigit() or int(cv_id) <= 0:
+                if not is_uuid(cv_id) and (not cv_id.isdigit() or int(cv_id) <= 0):
                     continue
                 if platform == "漫播":
                     raw_names = row.get("mainCvNames") or []
@@ -191,7 +193,7 @@ def read_drama_records(manbo: dict, missevan: dict) -> list[Drama]:
                     name = (row.get("cvnames") or {}).get(cv_id, "")
                 if is_unknown_main_cv(name) or name == "暂无":
                     continue
-                cv_id = str(int(cv_id))
+                cv_id = cv_id if is_uuid(cv_id) else str(int(cv_id))
                 cv_ids.add(cv_id)
                 if isinstance(name, str) and name.strip():
                     names[cv_id] = name.strip()
