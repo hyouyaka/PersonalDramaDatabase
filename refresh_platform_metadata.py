@@ -466,6 +466,11 @@ def is_missevan_intro_staff_role(role_name: object) -> bool:
     return any(normalize_match(keyword) in role for keyword in MISSEVAN_INTRO_STAFF_ROLE_NAMES)
 
 
+def has_missevan_intro_credit_text(value: str) -> bool:
+    """Require Unicode letters or numbers; decorative separators are not credits."""
+    return any(char.isalnum() for char in value)
+
+
 def extract_missevan_intro_cv_candidates(intro: object, *, limit: int = 2) -> list[dict]:
     lines = missevan_intro_text_lines(intro)
     candidates: list[dict] = []
@@ -487,10 +492,12 @@ def extract_missevan_intro_cv_candidates(intro: object, *, limit: int = 2) -> li
         if not match:
             continue
         role_name = normalize(match.group("role"))
+        if not has_missevan_intro_credit_text(role_name):
+            continue
         if is_missevan_intro_narrator_role(role_name) or is_missevan_intro_staff_role(role_name):
             continue
         display_name, account_name = extract_missevan_intro_cv_identity(match.group("cv"))
-        if not display_name:
+        if not has_missevan_intro_credit_text(display_name):
             continue
         if any(item["display_name"] == display_name for item in candidates):
             continue
@@ -693,7 +700,9 @@ def apply_missevan_intro_cv_fallback(
         display_name = normalize(candidate.get("display_name"))
         account_name = normalize(candidate.get("account_name"))
         role_name = normalize(candidate.get("role_name"))
-        if not display_name:
+        if not has_missevan_intro_credit_text(display_name):
+            continue
+        if role_name and not has_missevan_intro_credit_text(role_name):
             continue
         existing_matches = existing_by_name.get(normalize_match(display_name), [])
         display_map_matches = _missevan_cv_entries_from_combined_map(display_name, active_map)

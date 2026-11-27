@@ -793,6 +793,29 @@ class MissevanCoverTests(unittest.TestCase):
 
 
 class MissevanCvMapEntryTests(unittest.TestCase):
+    def test_symbol_only_intro_candidates_never_search_or_allocate_cv_ids(self) -> None:
+        candidates = [
+            {"role_name": "« ✦", "display_name": "⋆—————⋆— ✦ »"},
+            {"role_name": "郁飞尘", "display_name": "⋆✦"},
+            {"role_name": "⋆✦", "display_name": "苏尚卿"},
+        ]
+        combined_map = {}
+        search = Mock(return_value=None)
+        allocator = Mock(return_value="ffa2483f-ee29-4349-a2ef-87c7a21a3140")
+        with patch.object(refresh_platform_metadata, "save_combined_map") as save_map:
+            updated = refresh_platform_metadata.apply_missevan_intro_cv_fallback(
+                {"type": 4, "maincvs": []}, "97523", candidates,
+                combined_map=combined_map, search_cv=search,
+                generated_cv_id_allocator=allocator,
+            )
+
+        search.assert_not_called()
+        allocator.assert_not_called()
+        save_map.assert_not_called()
+        self.assertEqual(combined_map, {})
+        self.assertEqual(updated["maincvs"], [])
+        self.assertNotIn("fallbackCvNames", updated)
+
     def test_upsert_missevan_cv_map_entry_initializes_avatar(self) -> None:
         combined_map = {}
 
@@ -1418,6 +1441,34 @@ class MissevanCvMapEntryTests(unittest.TestCase):
 
 
 class MissevanIntroCvCandidateTests(unittest.TestCase):
+    def test_97523_decorative_separator_does_not_displace_second_main_cv(self) -> None:
+        intro = (
+            "<p>❁配音组❁</p><p>配音导演：夏初临@夏初Lin-</p>"
+            "<p>配音团队：729声工场@729声工场</p><p>录音师：阿凝、苗苗</p>"
+            "<p>« ✦ —⋆—————⋆— ✦ »</p>"
+            "<p>郁飞尘：张福正@小张福正了</p>"
+            "<p>安菲尔：苏尚卿@西呱双</p><p>⋆✦</p><p>白　松：兰陶倚@兰陶倚729</p>"
+        )
+        rows = [{"sound_id": 13936865, "title": "方尖碑 第二季 · 定档预告", "intro": intro}]
+        self.assertEqual(
+            refresh_platform_metadata.collect_missevan_episode_intro_candidates(rows, method="preview"),
+            [{"role_name": "郁飞尘", "display_name": "张福正", "account_name": "小张福正了"},
+             {"role_name": "安菲尔", "display_name": "苏尚卿", "account_name": "西呱双"}],
+        )
+
+    def test_skips_symbol_only_fields_but_keeps_decorated_unicode_names(self) -> None:
+        intro = (
+            "<p>CAST</p><p>✦：苏尚卿</p><p>郁飞尘：⋆✦</p>"
+            "<p>« ✦ —⋆—————⋆— ✦ »</p>"
+            "<p>角色Ａ：✦声优Ｂ✦</p><p>役２：𝑪𝑽２</p><p>役３：山田・太郎</p>"
+        )
+        self.assertEqual(
+            refresh_platform_metadata.extract_missevan_intro_cv_candidates(intro, limit=100),
+            [{"role_name": "角色Ａ", "display_name": "✦声优Ｂ✦"},
+             {"role_name": "役２", "display_name": "𝑪𝑽２"},
+             {"role_name": "役３", "display_name": "山田・太郎"}],
+        )
+
     def test_extracts_social_account_and_truncates_following_text(self) -> None:
         self.assertEqual(
             refresh_platform_metadata.extract_missevan_intro_cv_identity("心念@心念多个心 其他内容"),
