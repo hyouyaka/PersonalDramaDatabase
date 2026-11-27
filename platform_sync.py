@@ -794,9 +794,13 @@ def build_missevan_main_cv_entries(info: dict) -> list[dict]:
 def build_manbo_cv_entries(payload: dict) -> list[dict]:
     entries: list[dict] = []
     for idx, item in enumerate(payload.get("cvRespList") or []):
+        if not isinstance(item, dict):
+            continue
         if safe_int(item.get("dramaRoleType")) != 2:
             continue
         cv_resp = item.get("cvResp") or {}
+        if not isinstance(cv_resp, dict):
+            cv_resp = {}
         cv_id = cv_resp.get("id")
         if cv_id in (None, ""):
             cv_id = item.get("platUid")
@@ -804,10 +808,13 @@ def build_manbo_cv_entries(payload: dict) -> list[dict]:
             cv_id = item.get("cvId")
         if cv_id in (None, ""):
             continue
+        cv_id = safe_int(cv_id)
+        if cv_id <= 0:
+            continue
         entries.append(
             {
                 "index": idx,
-                "cv_id": int(cv_id),
+                "cv_id": cv_id,
                 "display_name": normalize(item.get("cvNickname") or cv_resp.get("nickname")),
                 "role_name": clean_role_name(item.get("role")),
                 "raw_role_name": normalize(item.get("role")),

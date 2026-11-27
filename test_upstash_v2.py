@@ -6,12 +6,14 @@ import unittest
 from pathlib import Path
 
 import upstash_v2
+from manbo_cv_review import MANBO_CV_REVIEW_KEY, MANBO_INFO_WITH_CV_REVIEW_SCRIPT
 
 
 class FakeUpstash:
     def __init__(self) -> None:
         self.strings: dict[str, str] = {}
         self.hashes: dict[str, dict[str, str]] = {}
+        self.sets: dict[str, set[str]] = {}
         self.ttls: dict[str, int] = {}
         self.commands: list[list[object]] = []
 
@@ -32,6 +34,23 @@ class FakeUpstash:
                 result.extend([field, value])
             return result
         if operation == "EVAL":
+            if command[1] == MANBO_INFO_WITH_CV_REVIEW_SCRIPT:
+                info_key, meta_key, queue_key = map(str, command[3:6])
+                expected, encoded, meta, decisions = map(str, command[6:10])
+                current = self.strings.get(info_key)
+                token = hashlib.sha1(current.encode("utf-8")).hexdigest() if current is not None else "__missing__"
+                if token != expected:
+                    return 0
+                if queue_key in self.strings or queue_key in self.hashes:
+                    raise RuntimeError("CV review queue must be a Redis Set")
+                self.strings[info_key] = encoded
+                self.strings[meta_key] = meta
+                for drama_id, required in json.loads(decisions).items():
+                    if required:
+                        self.sets.setdefault(queue_key, set()).add(drama_id)
+                    else:
+                        self.sets.get(queue_key, set()).discard(drama_id)
+                return 1
             if command[1] == upstash_v2.REPAIR_RANK_ACTIVATE_SCRIPT:
                 source, target, rank_key, latest_key = map(str, command[3:7])
                 expected_trend, expected_rank, new_rank, expected_latest, new_latest = map(str, command[7:12])

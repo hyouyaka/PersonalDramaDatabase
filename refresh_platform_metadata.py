@@ -143,6 +143,20 @@ MISSEVAN_INTRO_STAFF_ROLE_NAMES = {
     "rap",
 }
 MANBO_MAINCV_OVERRIDES = {
+    "1875551878436094023": {  # 重生之记忆裂痕 第一季：用户确认主役，接口前两位为配角。
+        "ids": [1825104379909, 1867638054916],
+        "extras": {
+            1825104379909: {"display_name": "景向谁依", "role_name": "封亦"},
+            1867638054916: {"display_name": "顾辰", "role_name": "席恙"},
+        },
+    },
+    "2098564984379277328": {  # 重生之记忆裂痕 · 第二季：与第一季相同主役，保持归档。
+        "ids": [1825104379909, 1867638054916],
+        "extras": {
+            1825104379909: {"display_name": "景向谁依", "role_name": "封亦"},
+            1867638054916: {"display_name": "顾辰", "role_name": "席恙"},
+        },
+    },
     "1653464054477357115": {
         "ids": [1793456226309, 1942055112768, 2664739041286],  # 宫墙柳 + 魏超
         "extras": {
@@ -1554,7 +1568,8 @@ def build_manbo_record(
     generated_cv_id_allocator=None,
 ) -> dict:
     data = payload.get("data") or {}
-    manual_unknown_main_cv = manbo_has_unknown_main_cv(record)
+    # ID-based manual rules must participate in the first refresh decision too.
+    manual_unknown_main_cv = manbo_has_unknown_main_cv(apply_manbo_record_field_overrides(record))
     catalog = data.get("catelog")
     if catalog is None:
         catalog = data.get("category")
@@ -1562,10 +1577,21 @@ def build_manbo_record(
     labels = data.get("categoryLabels") or []
     drama_type = infer_type_from_labels(labels)
     entries = build_manbo_cv_entries(data)
-    main_entries = select_main_cv_entries(entries, drama_type)
+    main_entries = []
     override_main = MANBO_MAINCV_OVERRIDES.get(str(record.get("dramaId") or ""))
+    primary_entries = []
+    seen_primary_ids = set()
+    primary_rows = data.get("cvPerformMainRespList")
+    if isinstance(primary_rows, list):
+        for entry in build_manbo_cv_entries({"cvRespList": primary_rows}):
+            if entry["cv_id"] not in seen_primary_ids:
+                primary_entries.append(entry)
+                seen_primary_ids.add(entry["cv_id"])
+    preserve_main_cvs = False
+    review_required = False
+    cv_source = "manual"
     if override_main:
-        indexed = {legacy_id(entry["cv_id"]): entry for entry in entries}
+        indexed = {legacy_id(entry["cv_id"]): entry for entry in [*entries, *primary_entries]}
         extras = override_main.get("extras") or {}
         main_entries = []
         for cv_id in override_main.get("ids") or []:
@@ -1583,6 +1609,18 @@ def build_manbo_record(
                         "raw_role_name": normalize(extra.get("role_name")),
                     }
                 )
+    elif manual_unknown_main_cv:
+        preserve_main_cvs = True
+    elif primary_entries:
+        main_entries = primary_entries
+        cv_source = "api_main"
+    else:
+        review_required = True
+        preserve_main_cvs = bool(manbo_main_cv_entries(record))
+        cv_source = "preserved" if preserve_main_cvs else "legacy"
+        if not preserve_main_cvs:
+            # Temporary fallback for a new drama: two actors, regardless of genre.
+            main_entries = select_main_cv_entries(entries, 4)
     override = MANBO_CATALOG_OVERRIDES.get(normalize(record.get("normalizedName") or record.get("name") or data.get("title")))
     if override is not None:
         final_catalog = int(override["catalog"])
@@ -1601,19 +1639,22 @@ def build_manbo_record(
     updated["catalogName"] = catalog_name
     updated["type"] = drama_type
     updated["genre"] = GENRE_BY_TYPE.get(drama_type, "")
-    updated["mainCvIds"] = [legacy_id(entry["cv_id"]) for entry in main_entries]
-    updated["mainCvNicknames"] = [entry["display_name"] for entry in main_entries]
-    updated["mainCvNames"] = [
-        normalize((manbo_cv_name_map or {}).get(cv_id)) or updated["mainCvNicknames"][idx]
-        for idx, cv_id in enumerate(updated["mainCvIds"])
-    ]
-    updated["mainCvRoleNames"] = [entry["role_name"] for entry in main_entries]
-    updated.pop("mainCvMissevanIds", None)
-    if manual_unknown_main_cv:
+    if not preserve_main_cvs:
+        updated["mainCvIds"] = [legacy_id(entry["cv_id"]) for entry in main_entries]
+        updated["mainCvNicknames"] = [entry["display_name"] for entry in main_entries]
+        updated["mainCvNames"] = [
+            normalize((manbo_cv_name_map or {}).get(cv_id)) or updated["mainCvNicknames"][idx]
+            for idx, cv_id in enumerate(updated["mainCvIds"])
+        ]
+        updated["mainCvRoleNames"] = [entry["role_name"] for entry in main_entries]
+        updated.pop("mainCvMissevanIds", None)
+    if manual_unknown_main_cv and not override_main:
         updated["mainCvIds"] = []
         updated["mainCvNicknames"] = [UNKNOWN_MAIN_CV_MARKER]
         updated["mainCvNames"] = [UNKNOWN_MAIN_CV_MARKER]
         updated["mainCvRoleNames"] = []
+    updated["mainCvReviewRequired"] = review_required
+    updated["mainCvSource"] = cv_source
     updated["createTime"] = pick_first_episode_month(data.get("setRespList") or [], title_key="setTitle", time_key="createTime", milliseconds=True)
     if not normalize(record.get("author")):
         updated["author"] = extract_manbo_author(data.get("desc"))
@@ -1622,6 +1663,8 @@ def build_manbo_record(
     updated["needpay"] = drama_id in MANBO_PRICING_EXCLUSIONS or pricing_category not in {"free", "100_redbean"}
     updated["vipFree"] = manbo_vip_free_from_payload(payload)
     updated = apply_manbo_record_field_overrides(updated)
+    if cv_source != "legacy":
+        return updated
     return apply_manbo_intro_cv_fallback(
         updated, data.get("desc"), combined_map=combined_map if combined_map is not None else {}, search_cv=search_cv,
         generated_cv_id_allocator=generated_cv_id_allocator,

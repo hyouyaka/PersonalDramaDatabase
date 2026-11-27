@@ -9,6 +9,9 @@ from typing import Callable
 from cv_identity import CvIdentityIndex, confirmed_key, ensure_cv_identities, trend_key
 
 from platform_sync import is_excluded_drama
+from manbo_cv_review import (
+    MANBO_CV_REVIEW_KEY, MANBO_INFO_WITH_CV_REVIEW_SCRIPT, manbo_cv_review_decisions,
+)
 from upstash_editor import (
     RANK_META_KEY,
     build_rank_meta_update,
@@ -368,8 +371,15 @@ def publish_info_v2(
     else:
         expected = hashlib.sha1(source_encoded.encode("utf-8")).hexdigest()
     meta = build_info_v2_meta(v2_key, encoded, normalized)
-    result = upstash(
-        [
+    decisions = manbo_cv_review_decisions(normalized) if v2_key == "manbo:info:v2" else {}
+    if decisions:
+        command = [
+            "EVAL", MANBO_INFO_WITH_CV_REVIEW_SCRIPT, 3,
+            v2_key, meta_key, MANBO_CV_REVIEW_KEY,
+            expected, encoded, compact_json(meta), compact_json(decisions),
+        ]
+    else:
+        command = [
             "EVAL",
             INFO_SOURCE_COMPARE_AND_PUBLISH_SCRIPT,
             2,
@@ -379,7 +389,7 @@ def publish_info_v2(
             encoded,
             compact_json(meta),
         ]
-    )
+    result = upstash(command)
     if int(result or 0) != 1:
         raise RuntimeError(f"Refusing to overwrite concurrently changed info v2: {v2_key}")
     if upstash(["GET", v2_key]) != encoded:

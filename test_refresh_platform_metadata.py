@@ -475,6 +475,51 @@ class MissevanAuthorTests(unittest.TestCase):
 
 
 class ManboCvFallbackTests(unittest.TestCase):
+    def test_memory_rift_manual_leads_survive_api_order_and_missing_actors(self) -> None:
+        identities = [
+            (1825104379909, "景向谁依", "景向谁依『scc7000』", "封亦"),
+            (1867638054916, "顾辰", "顾辰№♪浮声绘梦", "席恙"),
+        ]
+        leads = [
+            {"dramaRoleType": 2, "cvResp": {"id": cv_id, "nickname": nickname},
+             "role": f"饰:{role}"}
+            for cv_id, _name, nickname, role in identities
+        ]
+        supporting = [
+            {"dramaRoleType": 2, "cvResp": {"id": 2064972075026, "nickname": "用户2064972075026"}, "role": "饰:夏衍"},
+            {"dramaRoleType": 2, "cvResp": {"id": 2407198445576, "nickname": "艺海佳音_齐杰"}, "role": "饰:封老爷子"},
+        ]
+        for drama_id in ("1875551878436094023", "2098564984379277328"):
+            for actors in (supporting + leads, list(reversed(leads)) + supporting,
+                           supporting + leads[:1], supporting, []):
+                with self.subTest(drama_id=drama_id, actors=actors):
+                    payload = {"data": {
+                        "title": "重生之记忆裂痕", "category": 1,
+                        "categoryLabels": [{"name": "纯爱"}], "cvRespList": actors,
+                        "desc": "主役：夏衍-用户2064972075026、封老爷子-齐杰",
+                    }}
+                    record = {"dramaId": drama_id, "mainCvIds": [2064972075026, 2407198445576]}
+                    with patch.object(refresh_platform_metadata, "extract_manbo_intro_cv_candidates") as fallback:
+                        for _ in range(2):
+                            record = refresh_platform_metadata.build_manbo_record(
+                                record, payload, {row[0]: row[1] for row in identities},
+                            )
+                            self.assertEqual(record["mainCvIds"], [row[0] for row in identities])
+                            self.assertEqual(record["mainCvNames"], [row[1] for row in identities])
+                            self.assertEqual(record["mainCvRoleNames"], [row[3] for row in identities])
+                            self.assertEqual(len(record["mainCvNicknames"]), 2)
+                        fallback.assert_not_called()
+
+    def test_memory_rift_manual_leads_have_canonical_names_without_api_or_map(self) -> None:
+        for drama_id in ("1875551878436094023", "2098564984379277328"):
+            with self.subTest(drama_id=drama_id):
+                record = refresh_platform_metadata.build_manbo_record(
+                    {"dramaId": drama_id}, {"data": {"category": 1}}, {},
+                )
+                self.assertEqual(record["mainCvIds"], [1825104379909, 1867638054916])
+                self.assertEqual(record["mainCvNames"], ["景向谁依", "顾辰"])
+                self.assertEqual(record["mainCvRoleNames"], ["封亦", "席恙"])
+
     def test_fixed_audio_dramas_keep_unknown_cvs_across_repeated_refreshes(self) -> None:
         payload = {"data": {
             "title": "平台改名后的作品", "category": 1,
@@ -491,6 +536,8 @@ class ManboCvFallbackTests(unittest.TestCase):
                     self.assertEqual(record["mainCvIds"], [])
                     self.assertEqual(record["mainCvRoleNames"], [])
                     self.assertEqual(platform_sync.manbo_main_cv_display_names(record), ["暂无"])
+                    self.assertEqual(record["mainCvSource"], "manual")
+                    self.assertFalse(record["mainCvReviewRequired"])
 
     def test_hongloumeng_preserves_three_canonical_cvs_across_repeated_refreshes(self) -> None:
         identities = [
@@ -513,6 +560,7 @@ class ManboCvFallbackTests(unittest.TestCase):
             ],
         }}
         record = {"dramaId": "2274226385121706088"}
+        payload["data"]["cvPerformMainRespList"] = deepcopy(payload["data"]["cvRespList"])
         with patch.object(refresh_platform_metadata, "load_combined_map", return_value=combined_map):
             name_map = refresh_platform_metadata.build_manbo_cv_name_map()
         for _ in range(2):
